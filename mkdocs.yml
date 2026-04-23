@@ -1,0 +1,37 @@
+site_name: bt_api_risk Documentation
+site_description: Risk management module for bt_api ecosystem
+site_author: cloudQuant
+site_url: https://cloudquant.github.io/bt_api_risk/
+
+repo_name: cloudQuant/bt_api
+repo_url: https://github.com/cloudquant/bt_api
+
+theme:
+  name: material
+  language: en
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+nav:
+  - Home: index.md
+
+markdown_extensions:
+  - admonition
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.highlight
+  - pymdownx.superfences
