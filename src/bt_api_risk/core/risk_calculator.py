@@ -416,7 +416,7 @@ class RiskCalculator:
         if statistics.stdev(market_returns) == 0:
             return Decimal("1.0")
 
-        covariance = statistics.covariance(asset_returns, market_returns)
+        covariance = np.cov(asset_returns, market_returns)[0, 1]
         market_variance = statistics.variance(market_returns)
 
         if market_variance == 0:
