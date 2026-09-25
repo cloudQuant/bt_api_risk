@@ -5,6 +5,25 @@
 
 from __future__ import annotations
 
+from .admission import (
+    AccountScope,
+    DurableRiskGate,
+    IntentAction,
+    PermitInvalidError,
+    RiskDeniedError,
+    RiskGateError,
+    RiskIntent,
+    RiskPermit,
+    RiskPolicy,
+)
+from .instrument import (
+    INSTRUMENT_METADATA_DIGEST_TAG,
+    InstrumentRiskAdmissionMapper,
+    InstrumentRiskAssessment,
+    InstrumentRiskMetadata,
+    InstrumentRiskOrder,
+    InstrumentRiskRegistry,
+)
 from .limits_manager import LimitsManager
 from .policy_engine import PolicyEngine
 from .risk_assessor import RiskAssessor
@@ -17,4 +36,19 @@ __all__ = [
     "RiskCalculator",
     "LimitsManager",
     "PolicyEngine",
+    "AccountScope",
+    "DurableRiskGate",
+    "IntentAction",
+    "PermitInvalidError",
+    "RiskDeniedError",
+    "RiskGateError",
+    "RiskIntent",
+    "RiskPermit",
+    "RiskPolicy",
+    "INSTRUMENT_METADATA_DIGEST_TAG",
+    "InstrumentRiskAdmissionMapper",
+    "InstrumentRiskAssessment",
+    "InstrumentRiskMetadata",
+    "InstrumentRiskOrder",
+    "InstrumentRiskRegistry",
 ]

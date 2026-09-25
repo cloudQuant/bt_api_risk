@@ -21,6 +21,14 @@ Intelligent risk management and compliance monitoring system for 73+ exchanges. 
 - **RiskLevel** — Enum of risk levels (LOW, MEDIUM, HIGH, CRITICAL)
 - **RiskMetrics** — Container for aggregated risk metrics
 
+### Provider-independent admission primitives
+
+`DurableRiskGate` and the instrument admission types provide deterministic,
+local contracts for offline fake-client smoke tests. They do not source trusted
+account, position, exchange metadata, or policy facts, and do not constitute a
+real-account risk approval or enable a provider write route. A production
+composition must independently supply and verify those authorities.
+
 ### Compliance Standards
 - Market Manipulation Detection (spoofing, layering, front-running)
 - Anti-Money Laundering (AML) and Know Your Customer (KYC)
