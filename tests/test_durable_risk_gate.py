@@ -7,6 +7,7 @@ import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
+from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
 from threading import Barrier, Lock
@@ -169,6 +170,29 @@ class BareBooleanJournalAuthority:
     @contextmanager
     def dispatch_resolution_guard(self, proof, *, claim):
         yield True
+
+
+class TamperedReceiptJournalAuthority:
+    """Yield one well-typed but incorrectly bound resolution receipt."""
+
+    def __init__(self, inner, field):
+        self.inner = inner
+        self.field = field
+
+    @contextmanager
+    def dispatch_resolution_guard(self, proof, *, claim):
+        with self.inner.dispatch_resolution_guard(proof, claim=claim) as attestation:
+            if not isinstance(attestation, VerifiedDispatchResolution):
+                yield attestation
+                return
+            replacements = {
+                "scope": AccountScope("fake", "other-account", "sandbox"),
+                "claim_digest": _digest("wrong-claim"),
+                "journal_revision": attestation.journal_revision + 1,
+                "journal_record_sha256": _digest("wrong-journal-row"),
+                "writer_fence_sha256": _digest("wrong-writer-fence"),
+            }
+            yield replace(attestation, **{self.field: replacements[self.field]})
 
 
 def _claimed_gate(tmp_path, scope, policy, authority=None, name="resolve"):
@@ -408,6 +432,30 @@ def test_bare_boolean_authority_is_not_a_dispatch_attestation(tmp_path, scope, p
 
     assert rejected.value.code == "DISPATCH_RESOLUTION_PROOF_REJECTED"
     assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+
+
+@pytest.mark.parametrize(
+    "field",
+    ["scope", "claim_digest", "journal_revision", "journal_record_sha256", "writer_fence_sha256"],
+)
+def test_well_typed_but_mismatched_resolution_receipt_keeps_dispatch_latch(
+    tmp_path, scope, policy, field
+):
+    journal = FakeVerifiedExecutionJournalAuthority()
+    authority = TamperedReceiptJournalAuthority(journal, field)
+    gate, _, _, binding = _claimed_gate(
+        tmp_path, scope, policy, authority, name="tampered-receipt-" + field
+    )
+    proof = _terminal_proof(binding)
+    journal.register(proof)
+
+    with pytest.raises(PermitInvalidError) as rejected:
+        gate.resolve_dispatch_freeze(proof)
+
+    assert rejected.value.code == "DISPATCH_RESOLUTION_PROOF_REJECTED"
+    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+    assert gate.snapshot(scope)["increase_count"] == 1
+    assert gate.snapshot(scope)["increase_notional"] == Decimal("40")
 
 
 @pytest.mark.parametrize(
