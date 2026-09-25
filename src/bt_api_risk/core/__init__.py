@@ -7,6 +7,12 @@ from __future__ import annotations
 
 from .admission import (
     AccountScope,
+    DispatchClaimBinding,
+    DispatchEvidenceClass,
+    DispatchResolutionProof,
+    DispatchTerminalProof,
+    DispatchTerminalState,
+    DispatchTrackedOrderProof,
     DurableRiskGate,
     IntentAction,
     PermitInvalidError,
@@ -15,6 +21,7 @@ from .admission import (
     RiskIntent,
     RiskPermit,
     RiskPolicy,
+    VerifiedExecutionJournalAuthority,
 )
 from .instrument import (
     INSTRUMENT_METADATA_DIGEST_TAG,
@@ -37,6 +44,12 @@ __all__ = [
     "LimitsManager",
     "PolicyEngine",
     "AccountScope",
+    "DispatchClaimBinding",
+    "DispatchEvidenceClass",
+    "DispatchResolutionProof",
+    "DispatchTerminalProof",
+    "DispatchTerminalState",
+    "DispatchTrackedOrderProof",
     "DurableRiskGate",
     "IntentAction",
     "PermitInvalidError",
@@ -45,6 +58,7 @@ __all__ = [
     "RiskIntent",
     "RiskPermit",
     "RiskPolicy",
+    "VerifiedExecutionJournalAuthority",
     "INSTRUMENT_METADATA_DIGEST_TAG",
     "InstrumentRiskAdmissionMapper",
     "InstrumentRiskAssessment",

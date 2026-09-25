@@ -32,6 +32,12 @@ from .containers.risk_events import RiskEvent, RiskEventType, RiskLevel
 from .containers.risk_metrics import RiskMetrics
 from .core.admission import (
     AccountScope,
+    DispatchClaimBinding,
+    DispatchEvidenceClass,
+    DispatchResolutionProof,
+    DispatchTerminalProof,
+    DispatchTerminalState,
+    DispatchTrackedOrderProof,
     DurableRiskGate,
     IntentAction,
     PermitInvalidError,
@@ -40,6 +46,7 @@ from .core.admission import (
     RiskIntent,
     RiskPermit,
     RiskPolicy,
+    VerifiedExecutionJournalAuthority,
 )
 from .core.instrument import (
     INSTRUMENT_METADATA_DIGEST_TAG,
@@ -68,6 +75,12 @@ __all__ = [
     "RiskLevel",
     # Durable execution-boundary admission
     "AccountScope",
+    "DispatchClaimBinding",
+    "DispatchEvidenceClass",
+    "DispatchResolutionProof",
+    "DispatchTerminalProof",
+    "DispatchTerminalState",
+    "DispatchTrackedOrderProof",
     "DurableRiskGate",
     "IntentAction",
     "PermitInvalidError",
@@ -76,6 +89,7 @@ __all__ = [
     "RiskIntent",
     "RiskPermit",
     "RiskPolicy",
+    "VerifiedExecutionJournalAuthority",
     "INSTRUMENT_METADATA_DIGEST_TAG",
     "InstrumentRiskAdmissionMapper",
     "InstrumentRiskAssessment",

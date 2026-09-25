@@ -18,15 +18,16 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import re
 import sqlite3
 import uuid
 from collections.abc import Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from enum import Enum
 from pathlib import Path
-from typing import Callable, Optional, Union
+from typing import Callable, Optional, Protocol, Union
 
 
 class RiskGateError(RuntimeError):
@@ -47,6 +48,15 @@ class PermitInvalidError(RiskGateError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+_SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
+
+
+def _require_sha256(value: object, name: str) -> str:
+    if type(value) is not str or not _SHA256_HEX.fullmatch(value):
+        raise ValueError("invalid " + name)
+    return value
 
 
 class IntentAction(str, Enum):
@@ -191,17 +201,216 @@ class RiskPermit:
     expires_at: float
 
 
+class DispatchTerminalState(str, Enum):
+    """Only no-fill terminal outcomes that can release a dispatch latch."""
+
+    REJECTED_NO_FILL = "REJECTED_NO_FILL"
+    CANCELED_NO_FILL = "CANCELED_NO_FILL"
+
+
+class DispatchEvidenceClass(str, Enum):
+    """Distinguish local simulation evidence from native provider evidence."""
+
+    SIMULATION_JOURNAL = "SIMULATION_JOURNAL"
+    NATIVE_PROVIDER_JOURNAL = "NATIVE_PROVIDER_JOURNAL"
+
+
+def _validate_dispatch_evidence_class(
+    scope: AccountScope, evidence_class: DispatchEvidenceClass
+) -> None:
+    if type(evidence_class) is not DispatchEvidenceClass:
+        raise ValueError("invalid dispatch evidence class")
+    simulation_providers = {"fake", "fixture"}
+    if evidence_class is DispatchEvidenceClass.SIMULATION_JOURNAL:
+        if scope.provider not in simulation_providers:
+            raise ValueError("simulation evidence cannot bind a non-simulation provider scope")
+    elif scope.provider in simulation_providers:
+        raise ValueError("native evidence cannot bind a fake or fixture provider scope")
+
+
+@dataclass(frozen=True)
+class DispatchClaimBinding:
+    """Read-only identity of one durable dispatch claim."""
+
+    scope: AccountScope
+    permit_id: str
+    intent_id: str
+    intent_hash: str
+    cause_id: str
+    claimed_at: float
+    claim_digest: str
+
+    def __post_init__(self) -> None:
+        if type(self.scope) is not AccountScope:
+            raise ValueError("invalid dispatch claim scope")
+        for name in ("permit_id", "intent_id", "cause_id"):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError("invalid dispatch claim " + name)
+        if self.cause_id != "dispatch-inflight:" + self.intent_id:
+            raise ValueError("dispatch claim cause does not match intent")
+        _require_sha256(self.intent_hash, "intent_hash")
+        _require_sha256(self.claim_digest, "claim_digest")
+        if not isinstance(self.claimed_at, (int, float)) or not math.isfinite(self.claimed_at):
+            raise ValueError("invalid dispatch claim timestamp")
+
+
+@dataclass(frozen=True)
+class DispatchTerminalProof:
+    """Immutable journal evidence proposed for one no-fill dispatch resolution.
+
+    Constructing this value does not make it authoritative. The injected
+    journal authority must verify its immutable row and hold the account-wide
+    writer fence while the risk gate records the one-time resolution.
+    """
+
+    scope: AccountScope
+    permit_id: str
+    intent_id: str
+    intent_hash: str
+    cause_id: str
+    claim_digest: str
+    evidence_class: DispatchEvidenceClass
+    terminal_state: DispatchTerminalState
+    dispatch_attempt_count: int
+    journal_revision: int
+    journal_record_sha256: str
+    reconciliation_evidence_sha256: str
+    writer_fence_sha256: str
+    filled_quantity: int = 0
+    trade_count: int = 0
+
+    def __post_init__(self) -> None:
+        if type(self.scope) is not AccountScope:
+            raise ValueError("invalid terminal proof scope")
+        _validate_dispatch_evidence_class(self.scope, self.evidence_class)
+        for name in ("permit_id", "intent_id", "cause_id"):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError("invalid terminal proof " + name)
+        if self.cause_id != "dispatch-inflight:" + self.intent_id:
+            raise ValueError("terminal proof cause does not match intent")
+        for name in (
+            "intent_hash",
+            "claim_digest",
+            "journal_record_sha256",
+            "reconciliation_evidence_sha256",
+            "writer_fence_sha256",
+        ):
+            _require_sha256(getattr(self, name), name)
+        if type(self.terminal_state) is not DispatchTerminalState:
+            raise ValueError("terminal proof must name an allowed no-fill terminal state")
+        if type(self.dispatch_attempt_count) is not int or self.dispatch_attempt_count != 1:
+            raise ValueError("terminal proof must establish exactly one dispatch attempt")
+        if type(self.journal_revision) is not int or self.journal_revision <= 0:
+            raise ValueError("invalid terminal proof journal revision")
+        if type(self.filled_quantity) is not int or self.filled_quantity != 0:
+            raise ValueError("terminal proof requires zero filled quantity")
+        if type(self.trade_count) is not int or self.trade_count != 0:
+            raise ValueError("terminal proof requires zero verified trades")
+
+
+@dataclass(frozen=True)
+class DispatchTrackedOrderProof:
+    """Proof that an ACKED order moved into a durable exposure reservation.
+
+    This clears dispatch uncertainty only. The settled risk reservation stays
+    counted until a separate reviewed exposure lifecycle can account for later
+    fills and terminal order state.
+    """
+
+    scope: AccountScope
+    permit_id: str
+    intent_id: str
+    intent_hash: str
+    cause_id: str
+    claim_digest: str
+    evidence_class: DispatchEvidenceClass
+    dispatch_attempt_count: int
+    journal_revision: int
+    journal_record_sha256: str
+    reconciliation_evidence_sha256: str
+    writer_fence_sha256: str
+    provider_order_id: str
+    accepted_request_sha256: str
+    exposure_reservation_id: str
+    exposure_reservation_sha256: str
+    filled_quantity: int = 0
+    trade_count: int = 0
+
+    def __post_init__(self) -> None:
+        if type(self.scope) is not AccountScope:
+            raise ValueError("invalid tracked-order proof scope")
+        _validate_dispatch_evidence_class(self.scope, self.evidence_class)
+        for name in ("permit_id", "intent_id", "cause_id", "provider_order_id"):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError("invalid tracked-order proof " + name)
+        if self.cause_id != "dispatch-inflight:" + self.intent_id:
+            raise ValueError("tracked-order proof cause does not match intent")
+        if (
+            type(self.exposure_reservation_id) is not str
+            or not self.exposure_reservation_id
+            or self.exposure_reservation_id != self.exposure_reservation_id.strip()
+        ):
+            raise ValueError("invalid tracked-order exposure reservation id")
+        for name in (
+            "intent_hash",
+            "claim_digest",
+            "journal_record_sha256",
+            "reconciliation_evidence_sha256",
+            "writer_fence_sha256",
+            "accepted_request_sha256",
+            "exposure_reservation_sha256",
+        ):
+            _require_sha256(getattr(self, name), name)
+        if type(self.dispatch_attempt_count) is not int or self.dispatch_attempt_count != 1:
+            raise ValueError("tracked-order proof must establish exactly one dispatch attempt")
+        if type(self.journal_revision) is not int or self.journal_revision <= 0:
+            raise ValueError("invalid tracked-order journal revision")
+        if type(self.filled_quantity) is not int or self.filled_quantity != 0:
+            raise ValueError("tracked-order transfer cannot use synthetic or partial fills")
+        if type(self.trade_count) is not int or self.trade_count != 0:
+            raise ValueError("tracked-order transfer requires zero verified trades")
+
+
+DispatchResolutionProof = Union[DispatchTerminalProof, DispatchTrackedOrderProof]
+
+
+class VerifiedExecutionJournalAuthority(Protocol):
+    """Trusted application authority for a current dispatch resolution row.
+
+    The context manager must verify the exact immutable journal row, prove one
+    dispatch attempt and either a zero-fill terminal result or an ACKED order
+    transferred to a durable per-order exposure reservation. It must hold the
+    external account-wide writer fence for the entire context and reject stale
+    or unknown revisions, duplicate attempts, ambiguous native query evidence,
+    missing exposure reservations, and any scope mismatch.
+    """
+
+    def terminal_resolution_guard(
+        self,
+        proof: DispatchResolutionProof,
+        *,
+        claim: DispatchClaimBinding,
+    ) -> AbstractContextManager[bool]: ...
+
+
 class DurableRiskGate:
     """SQLite-backed account admission gate with fail-closed semantics.
 
     The gate intentionally has no provider client and never performs network
     I/O.  Callers own the provider dispatch, but must call
-    :meth:`validate_permit` immediately before it.  The gate does not allow a
+    :meth:`validate_permit` immediately before it. The gate does not allow a
     previously issued increase permit to bypass a subsequently raised freeze.
+    Dispatch latches can be cleared only through an injected execution-journal
+    authority that holds the account writer fence and proves an exact no-fill
+    terminal result. No authority is installed by default.
     """
 
     _ACTIVE = "active"
     _SETTLED = "settled"
+    _NO_FILL = "no_fill_terminal"
     _RELEASED = "released"
     _EXPIRED = "expired"
 
@@ -211,11 +420,14 @@ class DurableRiskGate:
         policy: RiskPolicy,
         clock: Optional[Callable[[], float]] = None,  # noqa: UP045 -- Python 3.9 is supported.
         timeout_seconds: float = 5.0,
+        *,
+        execution_journal_authority: Optional[VerifiedExecutionJournalAuthority] = None,  # noqa: UP045 -- Python 3.9 is supported.
     ) -> None:
         self._database_path = Path(database_path)
         self._policy = policy
         self._clock = clock or _wall_clock
         self._timeout_seconds = timeout_seconds
+        self._execution_journal_authority = execution_journal_authority
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_schema()
 
@@ -339,10 +551,11 @@ class DurableRiskGate:
         persists ``dispatch-inflight:<intent_id>`` before the provider may be
         called.
 
-        The durable claim is idempotent only for the same immutable permit,
-        intent, scope and latch.  It intentionally does not clear a latch
-        when a caller later releases a permit: release only proves a local
-        admission failure, while an independent reconciliation/control path
+        A dispatch claim is single-use.  Repeating it is rejected even when
+        the arguments match, so callers cannot mistake an idempotent claim
+        result for permission to make another provider attempt.  The latch is
+        not cleared when a caller later releases a permit: release only proves
+        a local admission failure, while an independent reconciliation path
         owns any safety-latch resolution.
         """
 
@@ -352,14 +565,15 @@ class DurableRiskGate:
         now = self._clock()
         with self._transaction() as connection:
             self._expire_active(connection, now)
-            permit = self._validate_active_permit(connection, permit_id, intent)
             claim = connection.execute(
-                "SELECT intent_id, scope_key, cause_id FROM risk_dispatch_claims WHERE permit_id = ?",
+                "SELECT intent_id, intent_hash, scope_key, cause_id "
+                "FROM risk_dispatch_claims WHERE permit_id = ?",
                 (permit_id,),
             ).fetchone()
             if claim is not None:
                 if (
                     claim["intent_id"] != intent.intent_id
+                    or claim["intent_hash"] != intent.fingerprint
                     or claim["scope_key"] != intent.scope.key
                     or claim["cause_id"] != cause_id
                 ):
@@ -367,9 +581,12 @@ class DurableRiskGate:
                         "DISPATCH_CLAIM_CONFLICT",
                         "permit is already bound to another dispatch claim",
                     )
-                # A duplicate call cannot create a second provider permission.
-                # The execution ledger still owns the single provider attempt.
-                return permit
+                raise PermitInvalidError(
+                    "DISPATCH_CLAIM_ALREADY_ISSUED",
+                    "a dispatch claim is single-use and cannot authorize a retry",
+                )
+
+            permit = self._validate_active_permit(connection, permit_id, intent)
 
             if permit.action is IntentAction.INCREASE:
                 self._assert_not_frozen(connection, permit.scope)
@@ -390,6 +607,22 @@ class DurableRiskGate:
             )
             self._freeze_in_transaction(connection, permit.scope, cause_id, cause_id, now)
             return permit
+
+    def dispatch_claim_binding(self, permit_id: str) -> DispatchClaimBinding:
+        """Return the exact durable claim identity while its latch is active.
+
+        This read-only value helps an injected journal authority bind its
+        evidence to the claim.  It grants no dispatch permission and becomes
+        unusable for resolution if the claim, permit, or active latch differs.
+        """
+        with self._connection() as connection:
+            reservation = connection.execute(
+                "SELECT * FROM risk_reservations WHERE permit_id = ?", (permit_id,)
+            ).fetchone()
+            if reservation is None:
+                raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+            claim = self._require_dispatch_claim(connection, reservation)
+            return self._dispatch_claim_binding(reservation, claim)
 
     def settle(self, permit_id: str) -> RiskPermit:
         """Consume a dispatch-claimed permit after its outcome is durably known."""
@@ -498,6 +731,158 @@ class DurableRiskGate:
                 (self._clock(), scope.key, cause_id),
             )
 
+    def resolve_dispatch_freeze(self, proof: DispatchResolutionProof) -> None:
+        """Resolve dispatch uncertainty under a verified execution-journal fence.
+
+        The injected authority must hold its account-wide writer fence while
+        this method rechecks the risk claim and commits the one-time proof ID.
+        It may attest either a zero-fill terminal rejection/cancellation or an
+        ACKED order transferred to a durable exposure reservation. The latter
+        clears only the uncertainty latch: the settled permit remains counted.
+        Filled/partial callbacks, open orders without tracked exposure, unknown
+        or ambiguous evidence are not accepted.
+        """
+        if type(proof) not in (DispatchTerminalProof, DispatchTrackedOrderProof):
+            raise PermitInvalidError(
+                "DISPATCH_RESOLUTION_PROOF_REQUIRED",
+                "dispatch-latch resolution requires a typed journal proof",
+            )
+        authority = self._execution_journal_authority
+        guard_factory = getattr(authority, "terminal_resolution_guard", None)
+        if not callable(guard_factory):
+            raise PermitInvalidError(
+                "DISPATCH_TERMINAL_AUTHORITY_REQUIRED",
+                "a verified execution-journal authority is required",
+            )
+
+        binding = self._load_dispatch_claim_binding(proof.permit_id, proof.journal_record_sha256)
+        self._assert_dispatch_proof_matches_claim(proof, binding)
+        try:
+            guard = guard_factory(proof, claim=binding)
+            with guard as verified:
+                if verified is not True:
+                    raise PermitInvalidError(
+                        "DISPATCH_TERMINAL_PROOF_REJECTED",
+                        "the current journal authority rejected terminal evidence",
+                    )
+                with self._transaction() as connection:
+                    prior = connection.execute(
+                        "SELECT permit_id FROM risk_dispatch_resolutions "
+                        "WHERE journal_record_sha256 = ?",
+                        (proof.journal_record_sha256,),
+                    ).fetchone()
+                    if prior is not None:
+                        raise PermitInvalidError(
+                            "DISPATCH_PROOF_REPLAYED",
+                            "this immutable journal proof was already consumed",
+                        )
+                    prior = connection.execute(
+                        "SELECT journal_record_sha256 FROM risk_dispatch_resolutions "
+                        "WHERE permit_id = ?",
+                        (proof.permit_id,),
+                    ).fetchone()
+                    if prior is not None:
+                        raise PermitInvalidError(
+                            "DISPATCH_ALREADY_RECONCILED",
+                            "this dispatch claim already has a terminal resolution",
+                        )
+                    reservation = connection.execute(
+                        "SELECT * FROM risk_reservations WHERE permit_id = ?",
+                        (proof.permit_id,),
+                    ).fetchone()
+                    if reservation is None:
+                        raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+                    claim = self._require_dispatch_claim(connection, reservation)
+                    current_binding = self._dispatch_claim_binding(reservation, claim)
+                    self._assert_dispatch_proof_matches_claim(proof, current_binding)
+                    if reservation["status"] != self._SETTLED:
+                        raise PermitInvalidError(
+                            "PERMIT_NOT_SETTLED",
+                            "dispatch proof requires a settled reservation",
+                        )
+                    if type(proof) is DispatchTerminalProof:
+                        proof_kind = proof.terminal_state.value
+                        provider_order_id = None
+                        accepted_request_sha256 = None
+                        exposure_reservation_id = None
+                        exposure_reservation_sha256 = None
+                        filled_quantity = proof.filled_quantity
+                        trade_count = proof.trade_count
+                    else:
+                        proof_kind = "ACKED_TRACKED"
+                        provider_order_id = proof.provider_order_id
+                        accepted_request_sha256 = proof.accepted_request_sha256
+                        exposure_reservation_id = proof.exposure_reservation_id
+                        exposure_reservation_sha256 = proof.exposure_reservation_sha256
+                        filled_quantity = proof.filled_quantity
+                        trade_count = proof.trade_count
+                    connection.execute(
+                        """
+                        INSERT INTO risk_dispatch_resolutions (
+                            permit_id, scope_key, intent_id, intent_hash, cause_id,
+                            claim_digest, proof_kind, evidence_class,
+                            dispatch_attempt_count, journal_revision,
+                            journal_record_sha256,
+                            reconciliation_evidence_sha256, writer_fence_sha256,
+                            provider_order_id, accepted_request_sha256,
+                            exposure_reservation_id, exposure_reservation_sha256,
+                            filled_quantity, trade_count, resolved_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            proof.permit_id,
+                            current_binding.scope.key,
+                            proof.intent_id,
+                            proof.intent_hash,
+                            proof.cause_id,
+                            proof.claim_digest,
+                            proof_kind,
+                            proof.evidence_class.value,
+                            proof.dispatch_attempt_count,
+                            proof.journal_revision,
+                            proof.journal_record_sha256,
+                            proof.reconciliation_evidence_sha256,
+                            proof.writer_fence_sha256,
+                            provider_order_id,
+                            accepted_request_sha256,
+                            exposure_reservation_id,
+                            exposure_reservation_sha256,
+                            filled_quantity,
+                            trade_count,
+                            self._clock(),
+                        ),
+                    )
+                    if type(proof) is DispatchTerminalProof:
+                        settled = connection.execute(
+                            "UPDATE risk_reservations SET status = ?, reason = ? "
+                            "WHERE permit_id = ? AND status = ?",
+                            (self._NO_FILL, proof_kind, proof.permit_id, self._SETTLED),
+                        )
+                        if settled.rowcount != 1:
+                            raise PermitInvalidError(
+                                "PERMIT_NOT_SETTLED",
+                                "no-fill proof did not consume the settled reservation",
+                            )
+                    result = connection.execute(
+                        """
+                        UPDATE risk_freezes SET active = 0, updated_at = ?
+                        WHERE scope_key = ? AND cause_id = ? AND active = 1
+                        """,
+                        (self._clock(), current_binding.scope.key, proof.cause_id),
+                    )
+                    if result.rowcount != 1:
+                        raise PermitInvalidError(
+                            "DISPATCH_FREEZE_MISSING",
+                            "the exact dispatch latch was not active at commit",
+                        )
+        except PermitInvalidError:
+            raise
+        except Exception as exc:
+            raise PermitInvalidError(
+                "DISPATCH_TERMINAL_PROOF_REJECTED",
+                "the execution-journal authority could not verify this proof",
+            ) from exc
+
     def active_freeze_reasons(self, scope: AccountScope) -> list[str]:
         """Return current independent freeze causes for the scope."""
         with self._connection() as connection:
@@ -600,6 +985,30 @@ class DurableRiskGate:
         return "dispatch-inflight:" + intent_id
 
     @staticmethod
+    def _dispatch_claim_digest(
+        *,
+        permit_id: str,
+        intent_id: str,
+        intent_hash: str,
+        scope_key: str,
+        cause_id: str,
+        claimed_at: float,
+    ) -> str:
+        return _sha256(
+            _canonical_json(
+                {
+                    "cause_id": cause_id,
+                    "claimed_at": format(float(claimed_at), ".17g"),
+                    "intent_hash": intent_hash,
+                    "intent_id": intent_id,
+                    "permit_id": permit_id,
+                    "scope_key": scope_key,
+                    "schema": "bt-api-risk-dispatch-claim-v1",
+                }
+            )
+        )
+
+    @staticmethod
     def _is_dispatch_freeze_cause(cause_id: str) -> bool:
         return isinstance(cause_id, str) and cause_id.startswith("dispatch-inflight:")
 
@@ -632,6 +1041,111 @@ class DurableRiskGate:
                 "the dispatch claim is missing its active safety latch",
             )
         return claim
+
+    def _dispatch_claim_binding(
+        self, reservation: sqlite3.Row, claim: sqlite3.Row
+    ) -> DispatchClaimBinding:
+        scope = AccountScope(
+            provider=str(reservation["provider"]),
+            account_id=str(reservation["account_id"]),
+            environment=str(reservation["environment"]),
+        )
+        claimed_at = float(claim["claimed_at"])
+        return DispatchClaimBinding(
+            scope=scope,
+            permit_id=str(reservation["permit_id"]),
+            intent_id=str(reservation["intent_id"]),
+            intent_hash=str(reservation["intent_hash"]),
+            cause_id=str(claim["cause_id"]),
+            claimed_at=claimed_at,
+            claim_digest=self._dispatch_claim_digest(
+                permit_id=str(reservation["permit_id"]),
+                intent_id=str(reservation["intent_id"]),
+                intent_hash=str(reservation["intent_hash"]),
+                scope_key=str(reservation["scope_key"]),
+                cause_id=str(claim["cause_id"]),
+                claimed_at=claimed_at,
+            ),
+        )
+
+    def _load_dispatch_claim_binding(
+        self, permit_id: str, journal_record_sha256: str
+    ) -> DispatchClaimBinding:
+        with self._connection() as connection:
+            prior_proof = connection.execute(
+                "SELECT permit_id FROM risk_dispatch_resolutions WHERE journal_record_sha256 = ?",
+                (journal_record_sha256,),
+            ).fetchone()
+            if prior_proof is not None:
+                raise PermitInvalidError(
+                    "DISPATCH_PROOF_REPLAYED",
+                    "this immutable journal proof was already consumed",
+                )
+            reservation = connection.execute(
+                "SELECT * FROM risk_reservations WHERE permit_id = ?", (permit_id,)
+            ).fetchone()
+            if reservation is None:
+                raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+            claim = connection.execute(
+                "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?", (permit_id,)
+            ).fetchone()
+            if claim is None:
+                raise PermitInvalidError(
+                    "PERMIT_NOT_DISPATCH_CLAIMED",
+                    "terminal proof requires a durable dispatch claim",
+                )
+            expected_cause = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+            if (
+                claim["intent_id"] != reservation["intent_id"]
+                or claim["intent_hash"] != reservation["intent_hash"]
+                or claim["scope_key"] != reservation["scope_key"]
+                or claim["cause_id"] != expected_cause
+            ):
+                raise PermitInvalidError(
+                    "DISPATCH_CLAIM_CONFLICT",
+                    "the durable dispatch claim no longer matches its reservation",
+                )
+            prior = connection.execute(
+                "SELECT journal_record_sha256 FROM risk_dispatch_resolutions WHERE permit_id = ?",
+                (permit_id,),
+            ).fetchone()
+            if prior is not None:
+                raise PermitInvalidError(
+                    "DISPATCH_ALREADY_RECONCILED",
+                    "this dispatch claim already has a terminal resolution",
+                )
+            freeze = connection.execute(
+                "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+                (reservation["scope_key"], expected_cause),
+            ).fetchone()
+            if freeze is None or freeze["active"] != 1:
+                raise PermitInvalidError(
+                    "DISPATCH_FREEZE_MISSING",
+                    "the exact dispatch latch is not active",
+                )
+            if reservation["status"] != self._SETTLED:
+                raise PermitInvalidError(
+                    "PERMIT_NOT_SETTLED",
+                    "dispatch proof requires a settled reservation",
+                )
+            return self._dispatch_claim_binding(reservation, claim)
+
+    @staticmethod
+    def _assert_dispatch_proof_matches_claim(
+        proof: DispatchResolutionProof, claim: DispatchClaimBinding
+    ) -> None:
+        if (
+            proof.scope != claim.scope
+            or proof.permit_id != claim.permit_id
+            or proof.intent_id != claim.intent_id
+            or proof.intent_hash != claim.intent_hash
+            or proof.cause_id != claim.cause_id
+            or proof.claim_digest != claim.claim_digest
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_TERMINAL_PROOF_SCOPE_MISMATCH",
+                "terminal proof does not match the exact account, intent, permit and claim",
+            )
 
     @staticmethod
     def _freeze_in_transaction(
@@ -750,6 +1264,29 @@ class DurableRiskGate:
                 );
                 CREATE INDEX IF NOT EXISTS idx_risk_dispatch_claims_scope
                     ON risk_dispatch_claims(scope_key, intent_id);
+                CREATE TABLE IF NOT EXISTS risk_dispatch_resolutions (
+                    permit_id TEXT PRIMARY KEY,
+                    scope_key TEXT NOT NULL,
+                    intent_id TEXT NOT NULL,
+                    intent_hash TEXT NOT NULL,
+                    cause_id TEXT NOT NULL,
+                    claim_digest TEXT NOT NULL,
+                    proof_kind TEXT NOT NULL,
+                    evidence_class TEXT NOT NULL,
+                    dispatch_attempt_count INTEGER NOT NULL,
+                    journal_revision INTEGER NOT NULL,
+                    journal_record_sha256 TEXT NOT NULL UNIQUE,
+                    reconciliation_evidence_sha256 TEXT NOT NULL,
+                    writer_fence_sha256 TEXT NOT NULL,
+                    provider_order_id TEXT,
+                    accepted_request_sha256 TEXT,
+                    exposure_reservation_id TEXT,
+                    exposure_reservation_sha256 TEXT,
+                    filled_quantity INTEGER NOT NULL,
+                    trade_count INTEGER NOT NULL,
+                    resolved_at REAL NOT NULL,
+                    FOREIGN KEY(permit_id) REFERENCES risk_reservations(permit_id)
+                );
                 CREATE TABLE IF NOT EXISTS risk_generations (
                     scope_key TEXT PRIMARY KEY,
                     generation INTEGER NOT NULL

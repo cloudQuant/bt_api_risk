@@ -32,8 +32,19 @@ composition must independently supply and verify those authorities.
 A successful dispatch claim leaves a `dispatch-inflight:<intent_id>` account
 freeze. `settle` and `ensure_settled` require the matching durable claim and do
 not clear that latch. The generic `resolve_freeze` method refuses dispatch
-latches; this candidate has no evidence-bound reconciliation API, so an
-unresolved dispatch keeps the account blocked.
+latches. `resolve_dispatch_freeze` requires an injected journal authority that
+holds the account-wide writer fence while it verifies an exact current journal
+row, the single dispatch attempt, and the account/intent/permit/claim binding.
+The allowed resolutions are a rejected or canceled zero-fill terminal, or an
+`ACKED_TRACKED` transfer to an exact durable order exposure reservation. The
+tracked order's settled notional remains counted as risk capacity; this API
+does not clear positions, margins, fills, or later order lifecycle state.
+No authority is installed by default. The Iteration 41 CTP reconciliation
+observation alone is not sufficient: its independent native queries do not
+prove a common atomic snapshot or an account-wide writer fence. A verifier
+that cannot prove those facts must keep the latch active. Fake simulation
+evidence is restricted to `fake`/`fixture` scopes and cannot bind a native CTP
+scope.
 
 ### Compliance Standards
 - Market Manipulation Detection (spoofing, layering, front-running)
