@@ -392,13 +392,14 @@ class DurableRiskGate:
             return permit
 
     def settle(self, permit_id: str) -> RiskPermit:
-        """Consume an active permit after a dispatch outcome is durably known."""
+        """Consume a dispatch-claimed permit after its outcome is durably known."""
         with self._transaction() as connection:
             row = connection.execute(
                 "SELECT * FROM risk_reservations WHERE permit_id = ?", (permit_id,)
             ).fetchone()
             if row is None:
                 raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+            self._require_dispatch_claim(connection, row)
             if row["status"] != self._ACTIVE:
                 raise PermitInvalidError("PERMIT_NOT_ACTIVE", "only an active permit can settle")
             connection.execute(
@@ -416,7 +417,9 @@ class DurableRiskGate:
         failure, while allowing an expired or released permit would hide a
         risk-accounting gap.  This recovery-only primitive accepts exactly an
         active or already settled reservation; every other status remains a
-        fail-closed error.
+        fail-closed error. It also requires the original active dispatch latch;
+        settling the reservation does not clear that latch. This package does
+        not yet expose an evidence-bound reconciliation operation.
         """
 
         with self._transaction() as connection:
@@ -425,6 +428,7 @@ class DurableRiskGate:
             ).fetchone()
             if row is None:
                 raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+            self._require_dispatch_claim(connection, row)
             status = str(row["status"])
             if status == self._ACTIVE:
                 connection.execute(
@@ -473,11 +477,18 @@ class DurableRiskGate:
         """Persist one independent freeze cause for a scope."""
         if not cause_id.strip() or not reason.strip():
             raise ValueError("freeze cause_id and reason are required")
+        if self._is_dispatch_freeze_cause(cause_id):
+            raise ValueError("dispatch-inflight freeze causes are reserved for dispatch claims")
         with self._transaction() as connection:
             self._freeze_in_transaction(connection, scope, cause_id, reason, self._clock())
 
     def resolve_freeze(self, scope: AccountScope, cause_id: str) -> None:
-        """Resolve only the named freeze cause; other causes remain effective."""
+        """Resolve an ordinary freeze; dispatch latches need reconciliation."""
+        if self._is_dispatch_freeze_cause(cause_id):
+            raise PermitInvalidError(
+                "DISPATCH_FREEZE_REQUIRES_RECONCILIATION",
+                "a dispatch-inflight freeze cannot be cleared by the generic resolver",
+            )
         with self._transaction() as connection:
             connection.execute(
                 """
@@ -589,6 +600,40 @@ class DurableRiskGate:
         return "dispatch-inflight:" + intent_id
 
     @staticmethod
+    def _is_dispatch_freeze_cause(cause_id: str) -> bool:
+        return isinstance(cause_id, str) and cause_id.startswith("dispatch-inflight:")
+
+    def _require_dispatch_claim(
+        self, connection: sqlite3.Connection, row: sqlite3.Row
+    ) -> sqlite3.Row:
+        """Require the exact durable claim and still-active safety latch."""
+        claim = connection.execute(
+            "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?", (row["permit_id"],)
+        ).fetchone()
+        expected_cause = self._dispatch_freeze_cause(str(row["intent_id"]))
+        if (
+            claim is None
+            or claim["intent_id"] != row["intent_id"]
+            or claim["intent_hash"] != row["intent_hash"]
+            or claim["scope_key"] != row["scope_key"]
+            or claim["cause_id"] != expected_cause
+        ):
+            raise PermitInvalidError(
+                "PERMIT_NOT_DISPATCH_CLAIMED",
+                "settlement requires the exact durable dispatch claim",
+            )
+        freeze = connection.execute(
+            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+            (row["scope_key"], expected_cause),
+        ).fetchone()
+        if freeze is None or freeze["active"] != 1:
+            raise PermitInvalidError(
+                "DISPATCH_FREEZE_MISSING",
+                "the dispatch claim is missing its active safety latch",
+            )
+        return claim
+
+    @staticmethod
     def _freeze_in_transaction(
         connection: sqlite3.Connection,
         scope: AccountScope,
@@ -665,7 +710,6 @@ class DurableRiskGate:
     def _initialize_schema(self) -> None:
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
-            connection.execute("PRAGMA foreign_keys = ON")
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS risk_reservations (
@@ -720,6 +764,8 @@ class DurableRiskGate:
         )
         connection.row_factory = sqlite3.Row
         try:
+            # SQLite foreign-key enforcement is connection-local.
+            connection.execute("PRAGMA foreign_keys = ON")
             connection.execute("PRAGMA synchronous = FULL")
             yield connection
         finally:

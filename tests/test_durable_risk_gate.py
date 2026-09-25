@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 import subprocess
 import sys
 from concurrent.futures import ThreadPoolExecutor
@@ -153,11 +154,16 @@ def test_settle_and_release_only_allow_pending_permits(
 ) -> None:
     gate = DurableRiskGate(tmp_path / "risk.db", policy)
     settled = gate.reserve(make_intent(scope, "settle"))
+    with pytest.raises(PermitInvalidError) as unclaimed:
+        gate.settle(settled.permit_id)
+    assert unclaimed.value.code == "PERMIT_NOT_DISPATCH_CLAIMED"
+    gate.claim_for_dispatch(settled.permit_id, make_intent(scope, "settle"))
     gate.settle(settled.permit_id)
     with pytest.raises(PermitInvalidError):
         gate.release(settled.permit_id, "cannot release dispatched request")
 
-    released = gate.reserve(make_intent(scope, "release"))
+    release_scope = AccountScope("fake", "account-release", "sandbox")
+    released = gate.reserve(make_intent(release_scope, "release"))
     gate.release(released.permit_id, "provider was never contacted")
     with pytest.raises(PermitInvalidError):
         gate.validate_permit(released.permit_id)
@@ -176,6 +182,72 @@ def test_dispatch_claimed_permit_cannot_be_released(tmp_path, scope, policy):
     snapshot = gate.snapshot(scope)
     assert snapshot["increase_count"] == 1
     assert snapshot["increase_notional"] == Decimal("40")
+
+
+def test_ensure_settled_requires_exact_dispatch_claim_and_keeps_latch(tmp_path, scope, policy):
+    gate = DurableRiskGate(tmp_path / "risk.db", policy)
+    intent = make_intent(scope, "ensure-settled")
+    permit = gate.reserve(intent)
+
+    with pytest.raises(PermitInvalidError) as unclaimed:
+        gate.ensure_settled(permit.permit_id)
+    assert unclaimed.value.code == "PERMIT_NOT_DISPATCH_CLAIMED"
+
+    gate.claim_for_dispatch(permit.permit_id, intent)
+    first = gate.ensure_settled(permit.permit_id)
+    second = gate.ensure_settled(permit.permit_id)
+
+    assert first.permit_id == second.permit_id == permit.permit_id
+    assert gate.active_freeze_reasons(scope) == ["dispatch-inflight:ensure-settled"]
+    with pytest.raises(PermitInvalidError) as blocked:
+        gate.resolve_freeze(scope, "dispatch-inflight:ensure-settled")
+    assert blocked.value.code == "DISPATCH_FREEZE_REQUIRES_RECONCILIATION"
+
+
+def test_dispatch_latch_namespace_cannot_be_created_or_cleared_generically(tmp_path, scope, policy):
+    gate = DurableRiskGate(tmp_path / "risk.db", policy)
+    with pytest.raises(ValueError, match="reserved"):
+        gate.freeze(scope, "dispatch-inflight:forged", "forged reason")
+    with pytest.raises(PermitInvalidError) as blocked:
+        gate.resolve_freeze(scope, "dispatch-inflight:forged")
+    assert blocked.value.code == "DISPATCH_FREEZE_REQUIRES_RECONCILIATION"
+
+
+def test_dispatch_claim_rolls_back_claim_and_latch_after_partial_failure(
+    tmp_path, scope, policy, monkeypatch
+):
+    gate = DurableRiskGate(tmp_path / "risk.db", policy)
+    intent = make_intent(scope, "rollback-claim")
+    permit = gate.reserve(intent)
+    freeze = gate._freeze_in_transaction
+
+    def fail_after_freeze(connection, claim_scope, cause_id, reason, updated_at):
+        freeze(connection, claim_scope, cause_id, reason, updated_at)
+        raise RuntimeError("injected failure after both claim mutations")
+
+    monkeypatch.setattr(gate, "_freeze_in_transaction", fail_after_freeze)
+    with pytest.raises(RuntimeError, match="injected failure"):
+        gate.claim_for_dispatch(permit.permit_id, intent)
+    assert gate.active_freeze_reasons(scope) == []
+
+    monkeypatch.setattr(gate, "_freeze_in_transaction", freeze)
+    gate.claim_for_dispatch(permit.permit_id, intent)
+    assert gate.active_freeze_reasons(scope) == ["dispatch-inflight:rollback-claim"]
+
+
+def test_foreign_keys_are_enabled_on_every_connection(tmp_path, scope, policy):
+    gate = DurableRiskGate(tmp_path / "risk.db", policy)
+    with gate._connection() as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        with pytest.raises(sqlite3.IntegrityError):
+            connection.execute(
+                """
+                INSERT INTO risk_dispatch_claims
+                    (permit_id, intent_id, intent_hash, scope_key, cause_id, claimed_at)
+                VALUES ('missing-permit', 'intent', 'hash', ?, 'cause', 0)
+                """,
+                (scope.key,),
+            )
 
 
 @pytest.mark.parametrize("value", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity"), True])

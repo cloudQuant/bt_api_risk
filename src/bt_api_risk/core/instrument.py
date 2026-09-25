@@ -275,8 +275,10 @@ class InstrumentRiskAssessment:
         object.__setattr__(
             self,
             "worst_case_fee",
-            _decimal(self.worst_case_fee, "worst_case_fee"),
+            _decimal(self.worst_case_fee, "worst_case_fee", nonnegative=True),
         )
+        if self.gross_notional != self.worst_case_notional + self.worst_case_fee:
+            raise ValueError("gross_notional must equal worst_case_notional plus worst_case_fee")
 
     def bound_payload_fingerprint(self, intent_fingerprint: str) -> str:
         """Bind trusted metadata and all risk amounts to an execution intent hash."""

@@ -13,6 +13,7 @@ from bt_api_risk import (
     AccountScope,
     DurableRiskGate,
     InstrumentRiskAdmissionMapper,
+    InstrumentRiskAssessment,
     InstrumentRiskMetadata,
     InstrumentRiskOrder,
     InstrumentRiskRegistry,
@@ -80,6 +81,32 @@ def test_assessment_enforces_lattices_multiplier_slippage_and_fee() -> None:
     assert assessment.worst_case_notional == Decimal("603.0")
     assert assessment.worst_case_fee == Decimal("0.8030")
     assert assessment.gross_notional == Decimal("603.8030")
+
+
+def test_exported_assessment_rejects_negative_fee_and_inconsistent_gross() -> None:
+    metadata = _metadata()
+    assessment = InstrumentRiskRegistry((metadata,)).assess(_order(metadata), now_ns=1_500)
+
+    with pytest.raises(ValueError, match="worst_case_fee"):
+        InstrumentRiskAssessment(
+            metadata,
+            assessment.order,
+            assessment.worst_case_price,
+            assessment.quoted_notional,
+            assessment.worst_case_notional,
+            Decimal("-0.01"),
+            assessment.gross_notional - Decimal("0.813"),
+        )
+    with pytest.raises(ValueError, match="gross_notional"):
+        InstrumentRiskAssessment(
+            metadata,
+            assessment.order,
+            assessment.worst_case_price,
+            assessment.quoted_notional,
+            assessment.worst_case_notional,
+            assessment.worst_case_fee,
+            assessment.gross_notional + Decimal("1"),
+        )
 
 
 @pytest.mark.parametrize(

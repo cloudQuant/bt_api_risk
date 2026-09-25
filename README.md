@@ -29,6 +29,12 @@ account, position, exchange metadata, or policy facts, and do not constitute a
 real-account risk approval or enable a provider write route. A production
 composition must independently supply and verify those authorities.
 
+A successful dispatch claim leaves a `dispatch-inflight:<intent_id>` account
+freeze. `settle` and `ensure_settled` require the matching durable claim and do
+not clear that latch. The generic `resolve_freeze` method refuses dispatch
+latches; this candidate has no evidence-bound reconciliation API, so an
+unresolved dispatch keeps the account blocked.
+
 ### Compliance Standards
 - Market Manipulation Detection (spoofing, layering, front-running)
 - Anti-Money Laundering (AML) and Know Your Customer (KYC)
