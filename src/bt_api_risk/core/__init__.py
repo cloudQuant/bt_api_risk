@@ -21,6 +21,7 @@ from .admission import (
     RiskIntent,
     RiskPermit,
     RiskPolicy,
+    VerifiedDispatchResolution,
     VerifiedExecutionJournalAuthority,
 )
 from .instrument import (
@@ -50,6 +51,7 @@ __all__ = [
     "DispatchTerminalProof",
     "DispatchTerminalState",
     "DispatchTrackedOrderProof",
+    "VerifiedDispatchResolution",
     "DurableRiskGate",
     "IntentAction",
     "PermitInvalidError",

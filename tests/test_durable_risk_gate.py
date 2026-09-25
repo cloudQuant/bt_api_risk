@@ -25,6 +25,7 @@ from bt_api_risk import (
     RiskDeniedError,
     RiskIntent,
     RiskPolicy,
+    VerifiedDispatchResolution,
 )
 
 
@@ -110,7 +111,7 @@ class FakeVerifiedExecutionJournalAuthority:
         self._rows[proof.journal_record_sha256] = row
 
     @contextmanager
-    def terminal_resolution_guard(self, proof, *, claim):
+    def dispatch_resolution_guard(self, proof, *, claim):
         # Holding this lock across `yield` models holding an external account
         # writer fence for the complete risk database commit.
         with self._lock:
@@ -146,7 +147,28 @@ class FakeVerifiedExecutionJournalAuthority:
                         row["exposure_reservation_sha256"] == proof.exposure_reservation_sha256,
                     )
                 )
-            yield valid is True
+            if valid is True:
+                yield VerifiedDispatchResolution(
+                    scope=claim.scope,
+                    permit_id=claim.permit_id,
+                    intent_id=claim.intent_id,
+                    intent_hash=claim.intent_hash,
+                    claim_digest=claim.claim_digest,
+                    proof_sha256=proof.fingerprint,
+                    journal_revision=proof.journal_revision,
+                    journal_record_sha256=proof.journal_record_sha256,
+                    writer_fence_sha256=proof.writer_fence_sha256,
+                )
+            else:
+                yield None
+
+
+class BareBooleanJournalAuthority:
+    """A naked boolean cannot stand in for an exact typed journal attestation."""
+
+    @contextmanager
+    def dispatch_resolution_guard(self, proof, *, claim):
+        yield True
 
 
 def _claimed_gate(tmp_path, scope, policy, authority=None, name="resolve"):
@@ -370,9 +392,22 @@ def test_dispatch_resolution_requires_injected_authority_and_exact_no_fill_proof
 
     with pytest.raises(PermitInvalidError) as missing:
         gate.resolve_dispatch_freeze(proof)
-    assert missing.value.code == "DISPATCH_TERMINAL_AUTHORITY_REQUIRED"
+    assert missing.value.code == "DISPATCH_RESOLUTION_AUTHORITY_REQUIRED"
     assert gate.active_freeze_reasons(scope) == [binding.cause_id]
     assert gate.snapshot(scope)["increase_notional"] == permit.notional
+
+
+def test_bare_boolean_authority_is_not_a_dispatch_attestation(tmp_path, scope, policy):
+    gate, _, _, binding = _claimed_gate(
+        tmp_path, scope, policy, BareBooleanJournalAuthority(), name="bare-boolean"
+    )
+    proof = _terminal_proof(binding)
+
+    with pytest.raises(PermitInvalidError) as rejected:
+        gate.resolve_dispatch_freeze(proof)
+
+    assert rejected.value.code == "DISPATCH_RESOLUTION_PROOF_REJECTED"
+    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
 
 
 @pytest.mark.parametrize(
@@ -438,7 +473,7 @@ def test_acked_tracked_transfer_requires_exact_durable_exposure_and_no_synthetic
     with pytest.raises(PermitInvalidError) as rejected:
         gate.resolve_dispatch_freeze(proof)
 
-    assert rejected.value.code == "DISPATCH_TERMINAL_PROOF_REJECTED"
+    assert rejected.value.code == "DISPATCH_RESOLUTION_PROOF_REJECTED"
     assert gate.active_freeze_reasons(scope) == [binding.cause_id]
     assert gate.snapshot(scope)["increase_notional"] == Decimal("40")
 
@@ -467,7 +502,7 @@ def test_dispatch_proof_wrong_account_or_intent_is_rejected_before_authority(
     with pytest.raises(PermitInvalidError) as caught:
         gate.resolve_dispatch_freeze(proof)
 
-    assert caught.value.code == "DISPATCH_TERMINAL_PROOF_SCOPE_MISMATCH"
+    assert caught.value.code == "DISPATCH_RESOLUTION_PROOF_SCOPE_MISMATCH"
     assert authority.guard_calls == 0
     assert gate.active_freeze_reasons(scope) == [binding.cause_id]
 
@@ -491,7 +526,7 @@ def test_dispatch_proof_unknown_stale_or_duplicate_attempt_stays_frozen(
     with pytest.raises(PermitInvalidError) as rejected:
         gate.resolve_dispatch_freeze(proof)
 
-    assert rejected.value.code == "DISPATCH_TERMINAL_PROOF_REJECTED"
+    assert rejected.value.code == "DISPATCH_RESOLUTION_PROOF_REJECTED"
     assert gate.active_freeze_reasons(scope) == [binding.cause_id]
 
 
@@ -516,7 +551,7 @@ def test_dispatch_proof_rejects_fills_unknown_state_and_simulation_ctp_scope(
     proof = _terminal_proof(binding)
     with pytest.raises(PermitInvalidError) as unknown:
         gate.resolve_dispatch_freeze(proof)
-    assert unknown.value.code == "DISPATCH_TERMINAL_PROOF_REJECTED"
+    assert unknown.value.code == "DISPATCH_RESOLUTION_PROOF_REJECTED"
     assert gate.active_freeze_reasons(scope) == [binding.cause_id]
 
 

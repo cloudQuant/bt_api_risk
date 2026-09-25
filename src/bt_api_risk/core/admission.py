@@ -309,6 +309,11 @@ class DispatchTerminalProof:
         if type(self.trade_count) is not int or self.trade_count != 0:
             raise ValueError("terminal proof requires zero verified trades")
 
+    @property
+    def fingerprint(self) -> str:
+        """Stable digest of every immutable terminal-proof field."""
+        return _dispatch_resolution_proof_sha256(self)
+
 
 @dataclass(frozen=True)
 class DispatchTrackedOrderProof:
@@ -373,8 +378,81 @@ class DispatchTrackedOrderProof:
         if type(self.trade_count) is not int or self.trade_count != 0:
             raise ValueError("tracked-order transfer requires zero verified trades")
 
+    @property
+    def fingerprint(self) -> str:
+        """Stable digest of every immutable tracked-order proof field."""
+        return _dispatch_resolution_proof_sha256(self)
+
 
 DispatchResolutionProof = Union[DispatchTerminalProof, DispatchTrackedOrderProof]
+
+
+def _dispatch_resolution_proof_sha256(proof: DispatchResolutionProof) -> str:
+    payload: dict[str, object] = {
+        "cause_id": proof.cause_id,
+        "claim_digest": proof.claim_digest,
+        "dispatch_attempt_count": proof.dispatch_attempt_count,
+        "evidence_class": proof.evidence_class.value,
+        "filled_quantity": proof.filled_quantity,
+        "intent_hash": proof.intent_hash,
+        "intent_id": proof.intent_id,
+        "journal_record_sha256": proof.journal_record_sha256,
+        "journal_revision": proof.journal_revision,
+        "permit_id": proof.permit_id,
+        "reconciliation_evidence_sha256": proof.reconciliation_evidence_sha256,
+        "scope_key": proof.scope.key,
+        "trade_count": proof.trade_count,
+        "writer_fence_sha256": proof.writer_fence_sha256,
+    }
+    if type(proof) is DispatchTerminalProof:
+        payload.update(kind="TERMINAL", terminal_state=proof.terminal_state.value)
+    else:
+        payload.update(
+            kind="ACKED_TRACKED",
+            accepted_request_sha256=proof.accepted_request_sha256,
+            exposure_reservation_id=proof.exposure_reservation_id,
+            exposure_reservation_sha256=proof.exposure_reservation_sha256,
+            provider_order_id=proof.provider_order_id,
+        )
+    return _sha256(_canonical_json(payload))
+
+
+@dataclass(frozen=True)
+class VerifiedDispatchResolution:
+    """Typed attestation yielded while the trusted account writer fence is held.
+
+    The risk gate compares this receipt with the exact proof and durable claim.
+    It is not a signature and cannot establish journal truth by itself; only the
+    injected authority can yield one after verifying its journal and fence.
+    """
+
+    scope: AccountScope
+    permit_id: str
+    intent_id: str
+    intent_hash: str
+    claim_digest: str
+    proof_sha256: str
+    journal_revision: int
+    journal_record_sha256: str
+    writer_fence_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.scope) is not AccountScope:
+            raise ValueError("invalid verified dispatch resolution scope")
+        for name in ("permit_id", "intent_id"):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError("invalid verified dispatch resolution " + name)
+        for name in (
+            "intent_hash",
+            "claim_digest",
+            "proof_sha256",
+            "journal_record_sha256",
+            "writer_fence_sha256",
+        ):
+            _require_sha256(getattr(self, name), name)
+        if type(self.journal_revision) is not int or self.journal_revision <= 0:
+            raise ValueError("invalid verified dispatch resolution revision")
 
 
 class VerifiedExecutionJournalAuthority(Protocol):
@@ -388,12 +466,12 @@ class VerifiedExecutionJournalAuthority(Protocol):
     missing exposure reservations, and any scope mismatch.
     """
 
-    def terminal_resolution_guard(
+    def dispatch_resolution_guard(
         self,
         proof: DispatchResolutionProof,
         *,
         claim: DispatchClaimBinding,
-    ) -> AbstractContextManager[bool]: ...
+    ) -> AbstractContextManager[Optional[VerifiedDispatchResolution]]: ...  # noqa: UP045 -- Python 3.9 is supported.
 
 
 class DurableRiskGate:
@@ -748,10 +826,10 @@ class DurableRiskGate:
                 "dispatch-latch resolution requires a typed journal proof",
             )
         authority = self._execution_journal_authority
-        guard_factory = getattr(authority, "terminal_resolution_guard", None)
+        guard_factory = getattr(authority, "dispatch_resolution_guard", None)
         if not callable(guard_factory):
             raise PermitInvalidError(
-                "DISPATCH_TERMINAL_AUTHORITY_REQUIRED",
+                "DISPATCH_RESOLUTION_AUTHORITY_REQUIRED",
                 "a verified execution-journal authority is required",
             )
 
@@ -759,11 +837,21 @@ class DurableRiskGate:
         self._assert_dispatch_proof_matches_claim(proof, binding)
         try:
             guard = guard_factory(proof, claim=binding)
-            with guard as verified:
-                if verified is not True:
+            with guard as attestation:
+                if type(attestation) is not VerifiedDispatchResolution or not (
+                    attestation.scope == binding.scope == proof.scope
+                    and attestation.permit_id == binding.permit_id == proof.permit_id
+                    and attestation.intent_id == binding.intent_id == proof.intent_id
+                    and attestation.intent_hash == binding.intent_hash == proof.intent_hash
+                    and attestation.claim_digest == binding.claim_digest == proof.claim_digest
+                    and attestation.proof_sha256 == proof.fingerprint
+                    and attestation.journal_revision == proof.journal_revision
+                    and attestation.journal_record_sha256 == proof.journal_record_sha256
+                    and attestation.writer_fence_sha256 == proof.writer_fence_sha256
+                ):
                     raise PermitInvalidError(
-                        "DISPATCH_TERMINAL_PROOF_REJECTED",
-                        "the current journal authority rejected terminal evidence",
+                        "DISPATCH_RESOLUTION_PROOF_REJECTED",
+                        "the journal authority did not attest this exact proof and claim",
                     )
                 with self._transaction() as connection:
                     prior = connection.execute(
@@ -879,7 +967,7 @@ class DurableRiskGate:
             raise
         except Exception as exc:
             raise PermitInvalidError(
-                "DISPATCH_TERMINAL_PROOF_REJECTED",
+                "DISPATCH_RESOLUTION_PROOF_REJECTED",
                 "the execution-journal authority could not verify this proof",
             ) from exc
 
@@ -1092,7 +1180,7 @@ class DurableRiskGate:
             if claim is None:
                 raise PermitInvalidError(
                     "PERMIT_NOT_DISPATCH_CLAIMED",
-                    "terminal proof requires a durable dispatch claim",
+                    "dispatch resolution requires a durable dispatch claim",
                 )
             expected_cause = self._dispatch_freeze_cause(str(reservation["intent_id"]))
             if (
@@ -1143,8 +1231,8 @@ class DurableRiskGate:
             or proof.claim_digest != claim.claim_digest
         ):
             raise PermitInvalidError(
-                "DISPATCH_TERMINAL_PROOF_SCOPE_MISMATCH",
-                "terminal proof does not match the exact account, intent, permit and claim",
+                "DISPATCH_RESOLUTION_PROOF_SCOPE_MISMATCH",
+                "dispatch proof does not match the exact account, intent, permit and claim",
             )
 
     @staticmethod

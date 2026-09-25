@@ -34,7 +34,10 @@ freeze. `settle` and `ensure_settled` require the matching durable claim and do
 not clear that latch. The generic `resolve_freeze` method refuses dispatch
 latches. `resolve_dispatch_freeze` requires an injected journal authority that
 holds the account-wide writer fence while it verifies an exact current journal
-row, the single dispatch attempt, and the account/intent/permit/claim binding.
+row, the single dispatch attempt, and the account/intent/permit/claim binding,
+then yields a typed `VerifiedDispatchResolution` bound to the proof digest. A
+bare boolean cannot clear the latch; the receipt itself is not a signature or
+proof of provider truth outside that injected authority.
 The allowed resolutions are a rejected or canceled zero-fill terminal, or an
 `ACKED_TRACKED` transfer to an exact durable order exposure reservation. The
 tracked order's settled notional remains counted as risk capacity; this API
