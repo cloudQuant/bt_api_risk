@@ -30,6 +30,33 @@ from __future__ import annotations
 
 from .containers.risk_events import RiskEvent, RiskEventType, RiskLevel
 from .containers.risk_metrics import RiskMetrics
+from .core.admission import (
+    AccountScope,
+    DispatchClaimBinding,
+    DispatchEvidenceClass,
+    DispatchResolutionProof,
+    DispatchTerminalProof,
+    DispatchTerminalState,
+    DispatchTrackedOrderProof,
+    DurableRiskGate,
+    IntentAction,
+    PermitInvalidError,
+    RiskDeniedError,
+    RiskGateError,
+    RiskIntent,
+    RiskPermit,
+    RiskPolicy,
+    VerifiedDispatchResolution,
+    VerifiedExecutionJournalAuthority,
+)
+from .core.instrument import (
+    INSTRUMENT_METADATA_DIGEST_TAG,
+    InstrumentRiskAdmissionMapper,
+    InstrumentRiskAssessment,
+    InstrumentRiskMetadata,
+    InstrumentRiskOrder,
+    InstrumentRiskRegistry,
+)
 from .core.risk_assessor import RiskAssessor
 from .core.risk_manager import RiskManager
 from .ml_models.anomaly_detector import AnomalyDetector
@@ -47,30 +74,34 @@ __all__ = [
     "RiskEvent",
     "RiskEventType",
     "RiskLevel",
-]
-
-__all__ = [
-    # Core Risk Management
-    "RiskManager",
-    "RiskAssessor",
-    # ML Models
-    "RiskEnsembleModel",
-    "AnomalyDetector",
-    # Monitoring
-    "RealTimeMonitor",
-    "AlertSystem",
-    # Compliance
-    "ComplianceEngine",
-    "MarketManipulationDetector",
-    # Data Containers
-    "RiskMetrics",
-    "RiskEvent",
-    "RiskEventType",
-    "RiskLevel",
+    # Durable execution-boundary admission
+    "AccountScope",
+    "DispatchClaimBinding",
+    "DispatchEvidenceClass",
+    "DispatchResolutionProof",
+    "DispatchTerminalProof",
+    "DispatchTerminalState",
+    "DispatchTrackedOrderProof",
+    "VerifiedDispatchResolution",
+    "DurableRiskGate",
+    "IntentAction",
+    "PermitInvalidError",
+    "RiskDeniedError",
+    "RiskGateError",
+    "RiskIntent",
+    "RiskPermit",
+    "RiskPolicy",
+    "VerifiedExecutionJournalAuthority",
+    "INSTRUMENT_METADATA_DIGEST_TAG",
+    "InstrumentRiskAdmissionMapper",
+    "InstrumentRiskAssessment",
+    "InstrumentRiskMetadata",
+    "InstrumentRiskOrder",
+    "InstrumentRiskRegistry",
 ]
 
 # 版本信息
-__version__ = "1.0.0"
+__version__ = "0.1.0"
 __compliance_standards__ = [
     "MiFID II",
     "SEC Rule 606",

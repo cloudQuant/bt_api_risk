@@ -5,6 +5,33 @@
 
 from __future__ import annotations
 
+from .admission import (
+    AccountScope,
+    DispatchClaimBinding,
+    DispatchEvidenceClass,
+    DispatchResolutionProof,
+    DispatchTerminalProof,
+    DispatchTerminalState,
+    DispatchTrackedOrderProof,
+    DurableRiskGate,
+    IntentAction,
+    PermitInvalidError,
+    RiskDeniedError,
+    RiskGateError,
+    RiskIntent,
+    RiskPermit,
+    RiskPolicy,
+    VerifiedDispatchResolution,
+    VerifiedExecutionJournalAuthority,
+)
+from .instrument import (
+    INSTRUMENT_METADATA_DIGEST_TAG,
+    InstrumentRiskAdmissionMapper,
+    InstrumentRiskAssessment,
+    InstrumentRiskMetadata,
+    InstrumentRiskOrder,
+    InstrumentRiskRegistry,
+)
 from .limits_manager import LimitsManager
 from .policy_engine import PolicyEngine
 from .risk_assessor import RiskAssessor
@@ -17,4 +44,27 @@ __all__ = [
     "RiskCalculator",
     "LimitsManager",
     "PolicyEngine",
+    "AccountScope",
+    "DispatchClaimBinding",
+    "DispatchEvidenceClass",
+    "DispatchResolutionProof",
+    "DispatchTerminalProof",
+    "DispatchTerminalState",
+    "DispatchTrackedOrderProof",
+    "VerifiedDispatchResolution",
+    "DurableRiskGate",
+    "IntentAction",
+    "PermitInvalidError",
+    "RiskDeniedError",
+    "RiskGateError",
+    "RiskIntent",
+    "RiskPermit",
+    "RiskPolicy",
+    "VerifiedExecutionJournalAuthority",
+    "INSTRUMENT_METADATA_DIGEST_TAG",
+    "InstrumentRiskAdmissionMapper",
+    "InstrumentRiskAssessment",
+    "InstrumentRiskMetadata",
+    "InstrumentRiskOrder",
+    "InstrumentRiskRegistry",
 ]

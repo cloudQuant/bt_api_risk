@@ -21,6 +21,34 @@ Intelligent risk management and compliance monitoring system for 73+ exchanges. 
 - **RiskLevel** — Enum of risk levels (LOW, MEDIUM, HIGH, CRITICAL)
 - **RiskMetrics** — Container for aggregated risk metrics
 
+### Provider-independent admission primitives
+
+`DurableRiskGate` and the instrument admission types provide deterministic,
+local contracts for offline fake-client smoke tests. They do not source trusted
+account, position, exchange metadata, or policy facts, and do not constitute a
+real-account risk approval or enable a provider write route. A production
+composition must independently supply and verify those authorities.
+
+A successful dispatch claim leaves a `dispatch-inflight:<intent_id>` account
+freeze. `settle` and `ensure_settled` require the matching durable claim and do
+not clear that latch. The generic `resolve_freeze` method refuses dispatch
+latches. `resolve_dispatch_freeze` requires an injected journal authority that
+holds the account-wide writer fence while it verifies an exact current journal
+row, the single dispatch attempt, and the account/intent/permit/claim binding,
+then yields a typed `VerifiedDispatchResolution` bound to the proof digest. A
+bare boolean cannot clear the latch; the receipt itself is not a signature or
+proof of provider truth outside that injected authority.
+The allowed resolutions are a rejected or canceled zero-fill terminal, or an
+`ACKED_TRACKED` transfer to an exact durable order exposure reservation. The
+tracked order's settled notional remains counted as risk capacity; this API
+does not clear positions, margins, fills, or later order lifecycle state.
+No authority is installed by default. The Iteration 41 CTP reconciliation
+observation alone is not sufficient: its independent native queries do not
+prove a common atomic snapshot or an account-wide writer fence. A verifier
+that cannot prove those facts must keep the latch active. Fake simulation
+evidence is restricted to `fake`/`fixture` scopes and cannot bind a native CTP
+scope.
+
 ### Compliance Standards
 - Market Manipulation Detection (spoofing, layering, front-running)
 - Anti-Money Laundering (AML) and Know Your Customer (KYC)
