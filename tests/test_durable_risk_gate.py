@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import sqlite3
 import subprocess
 import sys
@@ -10,6 +11,7 @@ from contextlib import contextmanager
 from dataclasses import replace
 from decimal import Decimal
 from hashlib import sha256
+from pathlib import Path
 from threading import Barrier, Lock
 
 import pytest
@@ -760,6 +762,17 @@ def test_public_exports_are_defined():
 
     assert all(hasattr(bt_api_risk, name) for name in bt_api_risk.__all__)
     assert "DurableRiskGate" in bt_api_risk.__all__
+
+
+def test_public_version_matches_project_metadata():
+    import bt_api_risk
+
+    project_root = Path(__file__).resolve().parents[1]
+    metadata = (project_root / "pyproject.toml").read_text(encoding="utf-8")
+    version = re.search(r'(?m)^version\s*=\s*"([^"]+)"\s*$', metadata)
+
+    assert version is not None
+    assert bt_api_risk.__version__ == version.group(1)
 
 
 def test_risk_payload_binding_is_immutable(scope):

@@ -101,7 +101,7 @@ __all__ = [
 ]
 
 # 版本信息
-__version__ = "1.0.0"
+__version__ = "0.1.0"
 __compliance_standards__ = [
     "MiFID II",
     "SEC Rule 606",
