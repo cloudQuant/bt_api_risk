@@ -324,6 +324,27 @@ class DispatchEvidenceClass(str, Enum):
     NATIVE_PROVIDER_JOURNAL = "NATIVE_PROVIDER_JOURNAL"
 
 
+class CancelDispatchTerminalState(str, Enum):
+    """Terminal outcome of one cancellation action, not of its target order."""
+
+    CANCELLED = "CANCELLED"
+    REJECTED = "REJECTED"
+
+
+class CancelDispatchSource(str, Enum):
+    """Source label on the immutable cancellation observation."""
+
+    PROVIDER = "provider"
+    RECONCILE = "reconcile"
+
+
+class CancelTargetPostcondition(str, Enum):
+    """What the exact target-order snapshot says after the cancel action."""
+
+    TARGET_TERMINAL = "TARGET_TERMINAL"
+    TARGET_REMAINS_OPEN = "TARGET_REMAINS_OPEN"
+
+
 def _validate_dispatch_evidence_class(
     scope: AccountScope, evidence_class: DispatchEvidenceClass
 ) -> None:
@@ -512,6 +533,238 @@ class DispatchTrackedOrderProof:
 
 
 DispatchResolutionProof = Union[DispatchTerminalProof, DispatchTrackedOrderProof]
+
+
+@dataclass(frozen=True)
+class CancelDispatchResolutionProof:
+    """Typed evidence for resolving only a cancellation-action dispatch latch.
+
+    This is intentionally separate from :class:`DispatchTerminalProof`: a
+    cancelled order may already have partial fills, and a rejected cancel
+    leaves the target exposure open.  The configured journal authority must
+    reread and attest the immutable cancel event, exact target postcondition,
+    and current account writer fence before the gate consumes this proof.
+    Constructing this value alone never authorizes resolution.
+    """
+
+    scope: AccountScope
+    permit_id: str
+    intent_id: str
+    intent_hash: str
+    cause_id: str
+    claim_digest: str
+    evidence_class: DispatchEvidenceClass
+    dispatch_attempt_count: int
+    cancel_intent_fingerprint: str
+    execution_scope_key: str
+    cancel_id: str
+    target_intent_id: str
+    provider_order_id: str
+    terminal_state: CancelDispatchTerminalState
+    cancel_event_id: str
+    cancel_event_sequence: int
+    cancel_event_sha256: str
+    cancel_source: CancelDispatchSource
+    source_evidence_sha256: str
+    target_postcondition: CancelTargetPostcondition
+    target_state: str
+    target_filled_quantity: str
+    target_updated_at_ns: int
+    target_record_sha256: str
+    target_event_id: str
+    target_event_sequence: int
+    target_event_type: str
+    target_event_sha256: str
+    writer_owner_id: str
+    writer_fencing_token: int
+    writer_fence_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.scope) is not AccountScope:
+            raise ValueError("invalid cancellation proof risk scope")
+        _validate_dispatch_evidence_class(self.scope, self.evidence_class)
+        for name in (
+            "permit_id",
+            "intent_id",
+            "cause_id",
+            "execution_scope_key",
+            "cancel_id",
+            "target_intent_id",
+            "provider_order_id",
+            "cancel_event_id",
+            "target_event_id",
+            "target_event_type",
+            "writer_owner_id",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError("invalid cancellation proof " + name)
+        if self.intent_id != (
+            "cancel-admission:" + self.execution_scope_key + ":" + self.cancel_id
+        ):
+            raise ValueError("cancellation proof risk intent does not match cancel identity")
+        if self.cause_id != "dispatch-inflight:" + self.intent_id:
+            raise ValueError("cancellation proof cause does not match risk intent")
+        for name in (
+            "intent_hash",
+            "claim_digest",
+            "cancel_intent_fingerprint",
+            "cancel_event_sha256",
+            "source_evidence_sha256",
+            "target_record_sha256",
+            "target_event_sha256",
+            "writer_fence_sha256",
+        ):
+            _require_sha256(getattr(self, name), name)
+        if type(self.terminal_state) is not CancelDispatchTerminalState:
+            raise ValueError("invalid terminal cancellation-action state")
+        if type(self.cancel_source) is not CancelDispatchSource:
+            raise ValueError("invalid cancellation observation source")
+        if type(self.target_postcondition) is not CancelTargetPostcondition:
+            raise ValueError("invalid cancellation target postcondition")
+        if type(self.dispatch_attempt_count) is not int or self.dispatch_attempt_count != 1:
+            raise ValueError("cancellation resolution requires exactly one dispatch attempt")
+        for name in ("cancel_event_sequence", "target_event_sequence", "target_updated_at_ns"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError("invalid cancellation proof " + name)
+        if type(self.writer_fencing_token) is not int or self.writer_fencing_token <= 0:
+            raise ValueError("invalid cancellation proof writer fencing token")
+        if type(self.target_state) is not str or not self.target_state:
+            raise ValueError("invalid cancellation target state")
+        if type(self.target_filled_quantity) is not str:
+            raise ValueError("invalid cancellation target filled quantity")
+        try:
+            filled_quantity = _as_decimal(self.target_filled_quantity)
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("invalid cancellation target filled quantity") from exc
+        if filled_quantity < Decimal("0") or _decimal_text(filled_quantity) != self.target_filled_quantity:
+            raise ValueError("cancellation target filled quantity is not canonical")
+        if self.terminal_state is CancelDispatchTerminalState.CANCELLED:
+            if (
+                self.target_postcondition is not CancelTargetPostcondition.TARGET_TERMINAL
+                or self.target_state != "CANCELLED"
+                or self.target_event_type != "cancelled_by_cancel_intent"
+            ):
+                raise ValueError("cancelled action requires its exact terminal target postcondition")
+        elif (
+            self.target_postcondition is not CancelTargetPostcondition.TARGET_REMAINS_OPEN
+            or self.target_state not in {"ACKED", "PARTIALLY_FILLED"}
+        ):
+            raise ValueError("rejected cancel action must retain a known open target")
+
+    @property
+    def fingerprint(self) -> str:
+        """Stable digest of every cancellation action and target binding."""
+        return _cancel_dispatch_resolution_proof_sha256(self)
+
+
+def _cancel_dispatch_resolution_proof_sha256(
+    proof: CancelDispatchResolutionProof,
+) -> str:
+    return _sha256(
+        _canonical_json(
+            {
+                "cancel_event_id": proof.cancel_event_id,
+                "cancel_event_sequence": proof.cancel_event_sequence,
+                "cancel_event_sha256": proof.cancel_event_sha256,
+                "cancel_id": proof.cancel_id,
+                "cancel_intent_fingerprint": proof.cancel_intent_fingerprint,
+                "cancel_source": proof.cancel_source.value,
+                "cause_id": proof.cause_id,
+                "claim_digest": proof.claim_digest,
+                "dispatch_attempt_count": proof.dispatch_attempt_count,
+                "evidence_class": proof.evidence_class.value,
+                "execution_scope_key": proof.execution_scope_key,
+                "intent_hash": proof.intent_hash,
+                "intent_id": proof.intent_id,
+                "permit_id": proof.permit_id,
+                "provider_order_id": proof.provider_order_id,
+                "scope_key": proof.scope.key,
+                "source_evidence_sha256": proof.source_evidence_sha256,
+                "target_event_id": proof.target_event_id,
+                "target_event_sequence": proof.target_event_sequence,
+                "target_event_sha256": proof.target_event_sha256,
+                "target_event_type": proof.target_event_type,
+                "target_filled_quantity": proof.target_filled_quantity,
+                "target_intent_id": proof.target_intent_id,
+                "target_postcondition": proof.target_postcondition.value,
+                "target_record_sha256": proof.target_record_sha256,
+                "target_state": proof.target_state,
+                "target_updated_at_ns": proof.target_updated_at_ns,
+                "terminal_state": proof.terminal_state.value,
+                "writer_fence_sha256": proof.writer_fence_sha256,
+                "writer_fencing_token": proof.writer_fencing_token,
+                "writer_owner_id": proof.writer_owner_id,
+                "schema": "bt-api-risk-cancel-dispatch-resolution-v1",
+            }
+        )
+    )
+
+
+@dataclass(frozen=True)
+class VerifiedCancelDispatchResolution:
+    """Exact cancellation evidence attested under the external writer fence."""
+
+    scope: AccountScope
+    permit_id: str
+    intent_id: str
+    intent_hash: str
+    claim_digest: str
+    proof_sha256: str
+    cancel_event_id: str
+    cancel_event_sequence: int
+    cancel_event_sha256: str
+    source_evidence_sha256: str
+    target_postcondition: CancelTargetPostcondition
+    target_record_sha256: str
+    target_event_id: str
+    target_event_sequence: int
+    target_event_sha256: str
+    writer_owner_id: str
+    writer_fencing_token: int
+    writer_fence_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.scope) is not AccountScope:
+            raise ValueError("invalid verified cancellation resolution scope")
+        for name in ("permit_id", "intent_id", "writer_owner_id"):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError("invalid verified cancellation resolution " + name)
+        for name in (
+            "intent_hash",
+            "claim_digest",
+            "proof_sha256",
+            "cancel_event_sha256",
+            "source_evidence_sha256",
+            "target_record_sha256",
+            "target_event_sha256",
+            "writer_fence_sha256",
+        ):
+            _require_sha256(getattr(self, name), name)
+        if type(self.target_postcondition) is not CancelTargetPostcondition:
+            raise ValueError("invalid verified cancellation target postcondition")
+        for name in ("cancel_event_sequence", "target_event_sequence"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError("invalid verified cancellation resolution " + name)
+        if type(self.writer_fencing_token) is not int or self.writer_fencing_token <= 0:
+            raise ValueError("invalid verified cancellation writer fencing token")
+
+
+class VerifiedCancellationJournalAuthority(Protocol):
+    """Authority that rereads a terminal cancel event and target under its fence."""
+
+    def cancel_dispatch_resolution_guard(
+        self,
+        proof: CancelDispatchResolutionProof,
+        *,
+        claim: DispatchClaimBinding,
+    ) -> AbstractContextManager[
+        Optional[VerifiedCancelDispatchResolution]  # noqa: UP045 -- Python 3.9 is supported.
+    ]:
+        ...
 
 
 def _dispatch_resolution_proof_sha256(proof: DispatchResolutionProof) -> str:
@@ -1409,6 +1662,376 @@ class DurableRiskGate:
                 (self._clock(), scope.key, cause_id),
             )
 
+    @staticmethod
+    def _assert_cancel_dispatch_proof_matches_claim(
+        proof: CancelDispatchResolutionProof, claim: DispatchClaimBinding
+    ) -> None:
+        expected_intent_hash = _sha256(
+            _canonical_json(
+                {
+                    "action": IntentAction.CANCEL.value,
+                    "notional": "0",
+                    "payload_fingerprint": proof.cancel_intent_fingerprint,
+                    "scope": proof.scope.key,
+                }
+            )
+        )
+        if (
+            proof.scope != claim.scope
+            or proof.permit_id != claim.permit_id
+            or proof.intent_id != claim.intent_id
+            or proof.intent_hash != claim.intent_hash
+            or proof.cause_id != claim.cause_id
+            or proof.claim_digest != claim.claim_digest
+            or proof.intent_hash != expected_intent_hash
+        ):
+            raise PermitInvalidError(
+                "CANCEL_DISPATCH_RESOLUTION_PROOF_SCOPE_MISMATCH",
+                "cancellation proof does not match its exact risk claim",
+            )
+
+    @staticmethod
+    def _cancel_dispatch_resolution_row_matches_proof(
+        row: sqlite3.Row, proof: CancelDispatchResolutionProof
+    ) -> bool:
+        expected: dict[str, object] = {
+            "permit_id": proof.permit_id,
+            "scope_key": proof.scope.key,
+            "intent_id": proof.intent_id,
+            "intent_hash": proof.intent_hash,
+            "cause_id": proof.cause_id,
+            "claim_digest": proof.claim_digest,
+            "cancel_intent_fingerprint": proof.cancel_intent_fingerprint,
+            "execution_scope_key": proof.execution_scope_key,
+            "cancel_id": proof.cancel_id,
+            "target_intent_id": proof.target_intent_id,
+            "provider_order_id": proof.provider_order_id,
+            "terminal_state": proof.terminal_state.value,
+            "evidence_class": proof.evidence_class.value,
+            "dispatch_attempt_count": proof.dispatch_attempt_count,
+            "cancel_event_id": proof.cancel_event_id,
+            "cancel_event_sequence": proof.cancel_event_sequence,
+            "cancel_event_sha256": proof.cancel_event_sha256,
+            "cancel_source": proof.cancel_source.value,
+            "source_evidence_sha256": proof.source_evidence_sha256,
+            "target_postcondition": proof.target_postcondition.value,
+            "target_state": proof.target_state,
+            "target_filled_quantity": proof.target_filled_quantity,
+            "target_updated_at_ns": proof.target_updated_at_ns,
+            "target_record_sha256": proof.target_record_sha256,
+            "target_event_id": proof.target_event_id,
+            "target_event_sequence": proof.target_event_sequence,
+            "target_event_type": proof.target_event_type,
+            "target_event_sha256": proof.target_event_sha256,
+            "writer_owner_id": proof.writer_owner_id,
+            "writer_fencing_token": proof.writer_fencing_token,
+            "writer_fence_sha256": proof.writer_fence_sha256,
+            "proof_sha256": proof.fingerprint,
+        }
+        return all(row[name] == value for name, value in expected.items())
+
+    def _load_cancel_dispatch_claim_binding(
+        self, proof: CancelDispatchResolutionProof
+    ) -> DispatchClaimBinding | None:
+        with self._connection() as connection:
+            prior = connection.execute(
+                "SELECT * FROM risk_cancel_dispatch_resolutions WHERE permit_id = ?",
+                (proof.permit_id,),
+            ).fetchone()
+            if prior is not None:
+                if not self._cancel_dispatch_resolution_row_matches_proof(prior, proof):
+                    raise PermitInvalidError(
+                        "CANCEL_DISPATCH_ALREADY_RESOLVED",
+                        "this cancellation claim has another immutable resolution",
+                    )
+                reservation = connection.execute(
+                    "SELECT * FROM risk_reservations WHERE permit_id = ?",
+                    (proof.permit_id,),
+                ).fetchone()
+                freeze = connection.execute(
+                    "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+                    (proof.scope.key, proof.cause_id),
+                ).fetchone()
+                if (
+                    reservation is None
+                    or reservation["status"] != self._SETTLED
+                    or reservation["scope_key"] != proof.scope.key
+                    or (freeze is not None and int(freeze["active"]) == 1)
+                ):
+                    raise PermitInvalidError(
+                        "CANCEL_DISPATCH_RESOLUTION_INCONSISTENT",
+                        "stored cancellation resolution conflicts with current risk state",
+                    )
+                if (
+                    reservation["action"] != IntentAction.CANCEL.value
+                    or _as_decimal(
+                        connection.execute(
+                            "SELECT notional FROM risk_reservations WHERE permit_id = ?",
+                            (proof.permit_id,),
+                        ).fetchone()["notional"]
+                    )
+                    != Decimal("0")
+                ):
+                    raise PermitInvalidError(
+                        "CANCEL_DISPATCH_RESOLUTION_NOT_CANCEL",
+                        "stored cancellation resolution is not bound to a zero-notional cancel",
+                    )
+                reservation_row = connection.execute(
+                    "SELECT * FROM risk_reservations WHERE permit_id = ?",
+                    (proof.permit_id,),
+                ).fetchone()
+                claim_row = connection.execute(
+                    "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?",
+                    (proof.permit_id,),
+                ).fetchone()
+                if reservation_row is None or claim_row is None:
+                    raise PermitInvalidError(
+                        "CANCEL_DISPATCH_RESOLUTION_INCONSISTENT",
+                        "stored cancellation resolution has no matching durable claim",
+                    )
+                binding = self._dispatch_claim_binding(reservation_row, claim_row)
+                self._assert_cancel_dispatch_proof_matches_claim(proof, binding)
+                return None
+
+            reservation = connection.execute(
+                "SELECT * FROM risk_reservations WHERE permit_id = ?",
+                (proof.permit_id,),
+            ).fetchone()
+            if reservation is None:
+                raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+            policy_error = self._policy_binding_read_error(
+                connection, str(reservation["scope_key"])
+            )
+            if policy_error is not None:
+                raise PermitInvalidError(
+                    policy_error, "risk database is bound to another or unknown policy"
+                )
+            if (
+                reservation["action"] != IntentAction.CANCEL.value
+                or _as_decimal(reservation["notional"]) != Decimal("0")
+                or reservation["scope_key"] != proof.scope.key
+            ):
+                raise PermitInvalidError(
+                    "CANCEL_DISPATCH_RESOLUTION_NOT_CANCEL",
+                    "cancel resolution requires a zero-notional cancellation permit",
+                )
+            claim = self._require_dispatch_claim(connection, reservation)
+            binding = self._dispatch_claim_binding(reservation, claim)
+            self._assert_cancel_dispatch_proof_matches_claim(proof, binding)
+            return binding
+
+    def resolve_cancel_dispatch_freeze(
+        self, proof: CancelDispatchResolutionProof
+    ) -> None:
+        """Resolve one cancel-action latch using an exact terminal cancel record.
+
+        This path never uses order-level ``CANCELED_NO_FILL`` evidence. A
+        CANCELLED action must bind its exact terminal target postcondition; a
+        REJECTED action leaves the target's open exposure snapshot intact. The
+        authority must hold the current external writer fence across the risk
+        transaction. An exact already-committed proof is a no-op on replay.
+        """
+
+        if type(proof) is not CancelDispatchResolutionProof:
+            raise PermitInvalidError(
+                "CANCEL_DISPATCH_RESOLUTION_PROOF_REQUIRED",
+                "cancel dispatch latch requires a typed cancellation-action proof",
+            )
+        authority = self._execution_journal_authority
+        guard_factory = getattr(authority, "cancel_dispatch_resolution_guard", None)
+        if not callable(guard_factory):
+            raise PermitInvalidError(
+                "CANCEL_DISPATCH_RESOLUTION_AUTHORITY_REQUIRED",
+                "a verified cancellation journal authority is required",
+            )
+
+        binding = self._load_cancel_dispatch_claim_binding(proof)
+        if binding is None:
+            return
+        self._assert_cancel_dispatch_proof_matches_claim(proof, binding)
+        try:
+            guard = guard_factory(proof, claim=binding)
+            with guard as attestation:
+                if type(attestation) is not VerifiedCancelDispatchResolution or not (
+                    attestation.scope == binding.scope == proof.scope
+                    and attestation.permit_id == binding.permit_id == proof.permit_id
+                    and attestation.intent_id == binding.intent_id == proof.intent_id
+                    and attestation.intent_hash == binding.intent_hash == proof.intent_hash
+                    and attestation.claim_digest == binding.claim_digest == proof.claim_digest
+                    and attestation.proof_sha256 == proof.fingerprint
+                    and attestation.cancel_event_id == proof.cancel_event_id
+                    and attestation.cancel_event_sequence == proof.cancel_event_sequence
+                    and attestation.cancel_event_sha256 == proof.cancel_event_sha256
+                    and attestation.source_evidence_sha256 == proof.source_evidence_sha256
+                    and attestation.target_postcondition is proof.target_postcondition
+                    and attestation.target_record_sha256 == proof.target_record_sha256
+                    and attestation.target_event_id == proof.target_event_id
+                    and attestation.target_event_sequence == proof.target_event_sequence
+                    and attestation.target_event_sha256 == proof.target_event_sha256
+                    and attestation.writer_owner_id == proof.writer_owner_id
+                    and attestation.writer_fencing_token == proof.writer_fencing_token
+                    and attestation.writer_fence_sha256 == proof.writer_fence_sha256
+                ):
+                    raise PermitInvalidError(
+                        "CANCEL_DISPATCH_RESOLUTION_PROOF_REJECTED",
+                        "the journal authority did not attest this exact cancellation proof",
+                    )
+
+                with self._transaction() as connection:
+                    existing = connection.execute(
+                        "SELECT * FROM risk_cancel_dispatch_resolutions WHERE permit_id = ?",
+                        (proof.permit_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        if not self._cancel_dispatch_resolution_row_matches_proof(
+                            existing, proof
+                        ):
+                            raise PermitInvalidError(
+                                "CANCEL_DISPATCH_ALREADY_RESOLVED",
+                                "this cancellation claim has another immutable resolution",
+                            )
+                        reservation = connection.execute(
+                            "SELECT status FROM risk_reservations WHERE permit_id = ?",
+                            (proof.permit_id,),
+                        ).fetchone()
+                        freeze = connection.execute(
+                            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+                            (proof.scope.key, proof.cause_id),
+                        ).fetchone()
+                        if (
+                            reservation is None
+                            or reservation["status"] != self._SETTLED
+                            or (freeze is not None and int(freeze["active"]) == 1)
+                        ):
+                            raise PermitInvalidError(
+                                "CANCEL_DISPATCH_RESOLUTION_INCONSISTENT",
+                                "stored cancellation resolution conflicts with current risk state",
+                            )
+                        return
+
+                    reservation = connection.execute(
+                        "SELECT * FROM risk_reservations WHERE permit_id = ?",
+                        (proof.permit_id,),
+                    ).fetchone()
+                    if reservation is None:
+                        raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+                    self._ensure_policy_binding(
+                        connection, str(reservation["scope_key"])
+                    )
+                    if (
+                        reservation["action"] != IntentAction.CANCEL.value
+                        or _as_decimal(reservation["notional"]) != Decimal("0")
+                        or reservation["scope_key"] != proof.scope.key
+                        or reservation["intent_id"] != proof.intent_id
+                        or reservation["intent_hash"] != proof.intent_hash
+                    ):
+                        raise PermitInvalidError(
+                            "CANCEL_DISPATCH_RESOLUTION_NOT_CANCEL",
+                            "cancel resolution no longer matches its zero-notional cancel permit",
+                        )
+                    claim = self._require_dispatch_claim(connection, reservation)
+                    current_binding = self._dispatch_claim_binding(reservation, claim)
+                    self._assert_cancel_dispatch_proof_matches_claim(
+                        proof, current_binding
+                    )
+                    if reservation["status"] not in {self._ACTIVE, self._SETTLED}:
+                        raise PermitInvalidError(
+                            "CANCEL_DISPATCH_PERMIT_NOT_SETTLEABLE",
+                            "terminal cancel evidence cannot settle this permit state",
+                        )
+                    prior_event = connection.execute(
+                        "SELECT permit_id FROM risk_cancel_dispatch_resolutions "
+                        "WHERE execution_scope_key = ? AND cancel_event_id = ?",
+                        (proof.execution_scope_key, proof.cancel_event_id),
+                    ).fetchone()
+                    if prior_event is not None:
+                        raise PermitInvalidError(
+                            "CANCEL_DISPATCH_EVENT_REPLAYED",
+                            "this immutable cancellation event already resolved another claim",
+                        )
+
+                    connection.execute(
+                        "UPDATE risk_reservations SET status = ?, reason = ? "
+                        "WHERE permit_id = ? AND status = ?",
+                        (
+                            self._SETTLED,
+                            "cancel_action_terminal:" + proof.terminal_state.value.lower(),
+                            proof.permit_id,
+                            self._ACTIVE,
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO risk_cancel_dispatch_resolutions (
+                            permit_id, scope_key, intent_id, intent_hash, cause_id,
+                            claim_digest, cancel_intent_fingerprint, execution_scope_key,
+                            cancel_id, target_intent_id, provider_order_id, terminal_state,
+                            evidence_class, dispatch_attempt_count, cancel_event_id,
+                            cancel_event_sequence, cancel_event_sha256, cancel_source,
+                            source_evidence_sha256, target_postcondition, target_state,
+                            target_filled_quantity, target_updated_at_ns,
+                            target_record_sha256, target_event_id, target_event_sequence,
+                            target_event_type, target_event_sha256, writer_owner_id,
+                            writer_fencing_token, writer_fence_sha256, proof_sha256, resolved_at
+                        ) VALUES (
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+                        )
+                        """,
+                        (
+                            proof.permit_id,
+                            current_binding.scope.key,
+                            proof.intent_id,
+                            proof.intent_hash,
+                            proof.cause_id,
+                            proof.claim_digest,
+                            proof.cancel_intent_fingerprint,
+                            proof.execution_scope_key,
+                            proof.cancel_id,
+                            proof.target_intent_id,
+                            proof.provider_order_id,
+                            proof.terminal_state.value,
+                            proof.evidence_class.value,
+                            proof.dispatch_attempt_count,
+                            proof.cancel_event_id,
+                            proof.cancel_event_sequence,
+                            proof.cancel_event_sha256,
+                            proof.cancel_source.value,
+                            proof.source_evidence_sha256,
+                            proof.target_postcondition.value,
+                            proof.target_state,
+                            proof.target_filled_quantity,
+                            proof.target_updated_at_ns,
+                            proof.target_record_sha256,
+                            proof.target_event_id,
+                            proof.target_event_sequence,
+                            proof.target_event_type,
+                            proof.target_event_sha256,
+                            proof.writer_owner_id,
+                            proof.writer_fencing_token,
+                            proof.writer_fence_sha256,
+                            proof.fingerprint,
+                            self._clock(),
+                        ),
+                    )
+                    resolved = connection.execute(
+                        "UPDATE risk_freezes SET active = 0, updated_at = ? "
+                        "WHERE scope_key = ? AND cause_id = ? AND active = 1",
+                        (self._clock(), current_binding.scope.key, proof.cause_id),
+                    )
+                    if resolved.rowcount != 1:
+                        raise PermitInvalidError(
+                            "DISPATCH_FREEZE_MISSING",
+                            "the exact cancellation dispatch latch was not active",
+                        )
+        except PermitInvalidError:
+            raise
+        except Exception as exc:
+            raise PermitInvalidError(
+                "CANCEL_DISPATCH_RESOLUTION_PROOF_REJECTED",
+                "the cancellation journal authority could not verify this proof",
+            ) from exc
+
     def resolve_dispatch_freeze(self, proof: DispatchResolutionProof) -> None:
         """Resolve dispatch uncertainty under a verified execution-journal fence.
 
@@ -1424,6 +2047,19 @@ class DurableRiskGate:
             raise PermitInvalidError(
                 "DISPATCH_RESOLUTION_PROOF_REQUIRED",
                 "dispatch-latch resolution requires a typed journal proof",
+            )
+        # Cancellation actions have their own terminal-action evidence model.
+        # An order-level no-fill proof cannot release a cancel latch: the
+        # target may have fills, and a rejected cancel leaves it exposed.
+        with self._connection() as connection:
+            reservation = connection.execute(
+                "SELECT action FROM risk_reservations WHERE permit_id = ?",
+                (proof.permit_id,),
+            ).fetchone()
+        if reservation is not None and reservation["action"] == IntentAction.CANCEL.value:
+            raise PermitInvalidError(
+                "CANCEL_DISPATCH_REQUIRES_CANCEL_PROOF",
+                "cancellation dispatch requires terminal cancellation-action evidence",
             )
         authority = self._execution_journal_authority
         guard_factory = getattr(authority, "dispatch_resolution_guard", None)
@@ -1487,6 +2123,11 @@ class DurableRiskGate:
                     if reservation is None:
                         raise PermitInvalidError(
                             "PERMIT_UNKNOWN", "permit does not exist"
+                        )
+                    if reservation["action"] == IntentAction.CANCEL.value:
+                        raise PermitInvalidError(
+                            "CANCEL_DISPATCH_REQUIRES_CANCEL_PROOF",
+                            "cancellation dispatch requires terminal cancellation-action evidence",
                         )
                     self._ensure_policy_binding(
                         connection, str(reservation["scope_key"])
@@ -2113,6 +2754,11 @@ class DurableRiskGate:
             ).fetchone()
             if reservation is None:
                 raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+            if reservation["action"] == IntentAction.CANCEL.value:
+                raise PermitInvalidError(
+                    "CANCEL_DISPATCH_REQUIRES_CANCEL_PROOF",
+                    "cancellation dispatch requires terminal cancellation-action evidence",
+                )
             policy_error = self._policy_binding_read_error(
                 connection, str(reservation["scope_key"])
             )
@@ -2335,6 +2981,56 @@ class DurableRiskGate:
                     resolved_at REAL NOT NULL,
                     FOREIGN KEY(permit_id) REFERENCES risk_reservations(permit_id)
                 );
+                CREATE TABLE IF NOT EXISTS risk_cancel_dispatch_resolutions (
+                    permit_id TEXT PRIMARY KEY,
+                    scope_key TEXT NOT NULL,
+                    intent_id TEXT NOT NULL,
+                    intent_hash TEXT NOT NULL,
+                    cause_id TEXT NOT NULL,
+                    claim_digest TEXT NOT NULL,
+                    cancel_intent_fingerprint TEXT NOT NULL,
+                    execution_scope_key TEXT NOT NULL,
+                    cancel_id TEXT NOT NULL,
+                    target_intent_id TEXT NOT NULL,
+                    provider_order_id TEXT NOT NULL,
+                    terminal_state TEXT NOT NULL
+                        CHECK(terminal_state IN ('CANCELLED', 'REJECTED')),
+                    evidence_class TEXT NOT NULL
+                        CHECK(evidence_class IN ('SIMULATION_JOURNAL', 'NATIVE_PROVIDER_JOURNAL')),
+                    dispatch_attempt_count INTEGER NOT NULL CHECK(dispatch_attempt_count = 1),
+                    cancel_event_id TEXT NOT NULL,
+                    cancel_event_sequence INTEGER NOT NULL CHECK(cancel_event_sequence > 0),
+                    cancel_event_sha256 TEXT NOT NULL,
+                    cancel_source TEXT NOT NULL CHECK(cancel_source IN ('provider', 'reconcile')),
+                    source_evidence_sha256 TEXT NOT NULL,
+                    target_postcondition TEXT NOT NULL
+                        CHECK(target_postcondition IN ('TARGET_TERMINAL', 'TARGET_REMAINS_OPEN')),
+                    target_state TEXT NOT NULL,
+                    target_filled_quantity TEXT NOT NULL,
+                    target_updated_at_ns INTEGER NOT NULL CHECK(target_updated_at_ns > 0),
+                    target_record_sha256 TEXT NOT NULL,
+                    target_event_id TEXT NOT NULL,
+                    target_event_sequence INTEGER NOT NULL CHECK(target_event_sequence > 0),
+                    target_event_type TEXT NOT NULL,
+                    target_event_sha256 TEXT NOT NULL,
+                    writer_owner_id TEXT NOT NULL,
+                    writer_fencing_token INTEGER NOT NULL CHECK(writer_fencing_token > 0),
+                    writer_fence_sha256 TEXT NOT NULL,
+                    proof_sha256 TEXT NOT NULL UNIQUE,
+                    resolved_at REAL NOT NULL,
+                    UNIQUE(execution_scope_key, cancel_event_id),
+                    FOREIGN KEY(permit_id) REFERENCES risk_reservations(permit_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS risk_cancel_dispatch_resolution_immutable_update
+                BEFORE UPDATE ON risk_cancel_dispatch_resolutions
+                BEGIN
+                    SELECT RAISE(ABORT, 'cancel dispatch resolution is immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS risk_cancel_dispatch_resolution_immutable_delete
+                BEFORE DELETE ON risk_cancel_dispatch_resolutions
+                BEGIN
+                    SELECT RAISE(ABORT, 'cancel dispatch resolution is immutable');
+                END;
                 CREATE TABLE IF NOT EXISTS risk_generations (
                     scope_key TEXT PRIMARY KEY,
                     generation INTEGER NOT NULL

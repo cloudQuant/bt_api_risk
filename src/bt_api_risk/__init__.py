@@ -34,6 +34,10 @@ from .containers.risk_events import RiskEvent, RiskEventType, RiskLevel
 from .containers.risk_metrics import RiskMetrics
 from .core.admission import (
     AccountScope,
+    CancelDispatchResolutionProof,
+    CancelDispatchSource,
+    CancelDispatchTerminalState,
+    CancelTargetPostcondition,
     DispatchClaimBinding,
     DispatchEvidenceClass,
     DispatchResolutionProof,
@@ -49,6 +53,8 @@ from .core.admission import (
     RiskPermit,
     RiskPolicy,
     StrategyAllocationSnapshot,
+    VerifiedCancelDispatchResolution,
+    VerifiedCancellationJournalAuthority,
     VerifiedDispatchResolution,
     VerifiedExecutionJournalAuthority,
 )
@@ -97,6 +103,10 @@ __all__ = [
     "RiskLevel",
     # Durable execution-boundary admission
     "AccountScope",
+    "CancelDispatchResolutionProof",
+    "CancelDispatchSource",
+    "CancelDispatchTerminalState",
+    "CancelTargetPostcondition",
     "DispatchClaimBinding",
     "DispatchEvidenceClass",
     "DispatchResolutionProof",
@@ -104,6 +114,8 @@ __all__ = [
     "DispatchTerminalState",
     "DispatchTrackedOrderProof",
     "VerifiedDispatchResolution",
+    "VerifiedCancelDispatchResolution",
+    "VerifiedCancellationJournalAuthority",
     "DurableRiskGate",
     "IntentAction",
     "PermitInvalidError",
