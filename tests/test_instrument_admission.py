@@ -44,7 +44,9 @@ def _metadata(**overrides: object) -> InstrumentRiskMetadata:
     return InstrumentRiskMetadata(**values)  # type: ignore[arg-type]
 
 
-def _order(metadata: InstrumentRiskMetadata, **overrides: object) -> InstrumentRiskOrder:
+def _order(
+    metadata: InstrumentRiskMetadata, **overrides: object
+) -> InstrumentRiskOrder:
     values: dict[str, object] = {
         "instrument": metadata.instrument,
         "quantity": Decimal("2"),
@@ -74,7 +76,9 @@ def _execution_shape(metadata: InstrumentRiskMetadata, **overrides: object) -> o
 def test_assessment_enforces_lattices_multiplier_slippage_and_fee() -> None:
     metadata = _metadata()
 
-    assessment = InstrumentRiskRegistry((metadata,)).assess(_order(metadata), now_ns=1_500)
+    assessment = InstrumentRiskRegistry((metadata,)).assess(
+        _order(metadata), now_ns=1_500
+    )
 
     assert assessment.quoted_notional == Decimal("600")
     assert assessment.worst_case_price == Decimal("100.5")
@@ -85,7 +89,9 @@ def test_assessment_enforces_lattices_multiplier_slippage_and_fee() -> None:
 
 def test_exported_assessment_rejects_negative_fee_and_inconsistent_gross() -> None:
     metadata = _metadata()
-    assessment = InstrumentRiskRegistry((metadata,)).assess(_order(metadata), now_ns=1_500)
+    assessment = InstrumentRiskRegistry((metadata,)).assess(
+        _order(metadata), now_ns=1_500
+    )
 
     with pytest.raises(ValueError, match="worst_case_fee"):
         InstrumentRiskAssessment(
@@ -124,14 +130,20 @@ def test_assessment_rejects_unprovable_quantity_or_price(
 ) -> None:
     metadata = _metadata()
     with pytest.raises(RiskDeniedError) as caught:
-        InstrumentRiskRegistry((metadata,)).assess(_order(metadata, **overrides), now_ns=1_500)
+        InstrumentRiskRegistry((metadata,)).assess(
+            _order(metadata, **overrides), now_ns=1_500
+        )
     assert caught.value.code == code
 
 
 @pytest.mark.parametrize(
     ("order_overrides", "now_ns", "code"),
     (
-        ({"metadata_version": "instrument-v2"}, 1_500, "INSTRUMENT_METADATA_VERSION_MISMATCH"),
+        (
+            {"metadata_version": "instrument-v2"},
+            1_500,
+            "INSTRUMENT_METADATA_VERSION_MISMATCH",
+        ),
         ({"metadata_digest": "b" * 64}, 1_500, "INSTRUMENT_METADATA_DIGEST_MISMATCH"),
         ({}, 999, "INSTRUMENT_METADATA_NOT_ACTIVE"),
         ({}, 2_000, "INSTRUMENT_METADATA_STALE"),
@@ -228,7 +240,9 @@ def test_mapper_requires_digest_and_proven_position_effect() -> None:
     assert missing_digest.value.code == "INSTRUMENT_METADATA_DIGEST_REQUIRED"
 
     with pytest.raises(RiskDeniedError) as unknown_effect:
-        mapper(_execution_shape(metadata, position_effect=SimpleNamespace(value="UNKNOWN")))
+        mapper(
+            _execution_shape(metadata, position_effect=SimpleNamespace(value="UNKNOWN"))
+        )
     assert unknown_effect.value.code == "INSTRUMENT_POSITION_EFFECT_UNPROVEN"
 
 
@@ -250,6 +264,181 @@ def test_mapper_keeps_a_proven_reduce_available_when_entry_metadata_is_stale() -
 
     assert mapped.action is IntentAction.REDUCE
     assert mapped.notional == Decimal("0")
+
+
+def test_mapper_binds_policy_unit_and_authoritative_strategy_revision(tmp_path) -> None:
+    metadata = _metadata(valuation_unit="USD", quantity_unit="contract")
+    scope = AccountScope("fixture", "account", "sandbox")
+    execution_scope = SimpleNamespace(
+        provider="fixture",
+        environment="sandbox",
+        account_ref="account",
+        strategy_id="strategy-1",
+        trading_day="2026-09-26",
+    )
+    allocation = SimpleNamespace(
+        scope=execution_scope,
+        allocation_version="revision-1",
+        max_notional=Decimal("1000"),
+        max_position=None,
+        notional_unit="USD",
+    )
+    mapper = InstrumentRiskAdmissionMapper(
+        scope,
+        InstrumentRiskRegistry((metadata,)),
+        clock_ns=lambda: 1_500,
+        allocation_reader=lambda requested_scope: allocation,
+    )
+    mapped = mapper(_execution_shape(metadata, scope=execution_scope))
+
+    assert mapped.strategy_id == "strategy-1"
+    assert mapped.allocation_version == "revision-1"
+    assert mapped.notional_unit == "USD"
+    assert mapped.instrument == metadata.instrument
+    assert mapped.quantity == Decimal("2")
+    assert mapped.quantity_unit == "contract"
+
+    gate = DurableRiskGate(
+        tmp_path / "mapper-allocation.db",
+        RiskPolicy(
+            "instrument-policy",
+            Decimal("2000"),
+            5,
+            require_strategy_allocation=True,
+            notional_unit="USD",
+        ),
+    )
+    gate.set_strategy_allocation(
+        scope, "strategy-1", "revision-1", max_notional=Decimal("1000")
+    )
+    permit = gate.reserve(mapped)
+    assert permit.notional_unit == "USD"
+
+
+def test_gate_snapshot_maps_into_reserve_and_validate(tmp_path) -> None:
+    metadata = _metadata(valuation_unit="USD", quantity_unit="contract")
+    scope = AccountScope("fixture", "account", "sandbox")
+    execution_scope = SimpleNamespace(
+        provider="fixture",
+        environment="sandbox",
+        account_ref="account",
+        strategy_id="strategy-1",
+        trading_day="2026-09-26",
+    )
+    gate = DurableRiskGate(
+        tmp_path / "snapshot-mapper.db",
+        RiskPolicy(
+            "instrument-policy",
+            Decimal("2000"),
+            5,
+            require_strategy_allocation=True,
+            notional_unit="USD",
+        ),
+    )
+    gate.set_strategy_allocation(
+        scope,
+        "strategy-1",
+        "revision-1",
+        max_notional=Decimal("1000"),
+        notional_unit="USD",
+    )
+    mapper = InstrumentRiskAdmissionMapper(
+        scope,
+        InstrumentRiskRegistry((metadata,)),
+        clock_ns=lambda: 1_500,
+        allocation_reader=lambda requested_scope: gate.get_strategy_allocation(
+            scope, requested_scope.strategy_id
+        ),
+    )
+    mapped = mapper(_execution_shape(metadata, scope=execution_scope))
+
+    assert mapped.strategy_id == "strategy-1"
+    assert mapped.allocation_version == "revision-1"
+    assert mapped.notional_unit == "USD"
+    permit = gate.reserve(mapped)
+    validated = gate.validate_permit(permit.permit_id, mapped)
+    assert validated.permit_id == permit.permit_id
+    assert validated.allocation_version == "revision-1"
+
+
+def test_complete_zero_budget_snapshot_reports_exhausted_without_permit(
+    tmp_path,
+) -> None:
+    metadata = _metadata(valuation_unit="USD", quantity_unit="contract")
+    scope = AccountScope("fixture", "account", "sandbox")
+    execution_scope = SimpleNamespace(
+        provider="fixture",
+        environment="sandbox",
+        account_ref="account",
+        strategy_id="strategy-zero",
+        trading_day="2026-09-26",
+    )
+    gate = DurableRiskGate(
+        tmp_path / "zero-snapshot-mapper.db",
+        RiskPolicy(
+            "instrument-policy",
+            Decimal("2000"),
+            5,
+            require_strategy_allocation=True,
+            notional_unit="USD",
+        ),
+    )
+    gate.set_strategy_allocation(
+        scope,
+        "strategy-zero",
+        "revision-zero",
+        max_notional=Decimal("0"),
+        notional_unit="USD",
+    )
+    snapshot = gate.get_strategy_allocation(scope, "strategy-zero")
+    assert snapshot.completeness == "LOCAL_LEDGER_COMPLETE"
+    assert snapshot.allocated_notional == Decimal("0")
+    assert snapshot.available_notional == Decimal("0")
+    mapper = InstrumentRiskAdmissionMapper(
+        scope,
+        InstrumentRiskRegistry((metadata,)),
+        clock_ns=lambda: 1_500,
+        allocation_reader=lambda requested_scope: gate.get_strategy_allocation(
+            scope, requested_scope.strategy_id
+        ),
+    )
+
+    with pytest.raises(RiskDeniedError) as exhausted:
+        mapper(_execution_shape(metadata, scope=execution_scope))
+
+    assert exhausted.value.code == "STRATEGY_ALLOCATION_EXHAUSTED"
+    with gate._connection() as connection:
+        assert (
+            connection.execute("SELECT COUNT(*) FROM risk_reservations").fetchone()[0]
+            == 0
+        )
+
+
+def test_mapper_refuses_position_limit_without_exact_allocation_unit() -> None:
+    metadata = _metadata(valuation_unit="USD", quantity_unit="contract")
+    scope = AccountScope("fixture", "account", "sandbox")
+    execution_scope = SimpleNamespace(
+        provider="fixture",
+        environment="sandbox",
+        account_ref="account",
+        strategy_id="strategy-1",
+    )
+    allocation = SimpleNamespace(
+        scope=execution_scope,
+        allocation_version="revision-1",
+        max_notional=None,
+        max_position=Decimal("5"),
+        notional_unit="USD",
+    )
+    mapper = InstrumentRiskAdmissionMapper(
+        scope,
+        InstrumentRiskRegistry((metadata,)),
+        clock_ns=lambda: 1_500,
+        allocation_reader=lambda requested_scope: allocation,
+    )
+    with pytest.raises(RiskDeniedError) as missing_unit:
+        mapper(_execution_shape(metadata, scope=execution_scope))
+    assert missing_unit.value.code == "STRATEGY_POSITION_SCOPE_UNAVAILABLE"
 
 
 def test_mapper_still_rejects_a_close_with_an_invalid_quantity_lattice() -> None:

@@ -21,6 +21,7 @@ from .admission import (
     RiskIntent,
     RiskPermit,
     RiskPolicy,
+    StrategyAllocationSnapshot,
     VerifiedDispatchResolution,
     VerifiedExecutionJournalAuthority,
 )
@@ -60,6 +61,7 @@ __all__ = [
     "RiskIntent",
     "RiskPermit",
     "RiskPolicy",
+    "StrategyAllocationSnapshot",
     "VerifiedExecutionJournalAuthority",
     "INSTRUMENT_METADATA_DIGEST_TAG",
     "InstrumentRiskAdmissionMapper",
