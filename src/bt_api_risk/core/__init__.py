@@ -65,6 +65,7 @@ def __dir__() -> list[str]:
     """Expose lazy public names to introspection without importing features."""
     return sorted(set(globals()) | set(__all__))
 
+
 __all__ = [
     "RiskManager",
     "RiskAssessor",

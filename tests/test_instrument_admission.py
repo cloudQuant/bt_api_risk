@@ -44,9 +44,7 @@ def _metadata(**overrides: object) -> InstrumentRiskMetadata:
     return InstrumentRiskMetadata(**values)  # type: ignore[arg-type]
 
 
-def _order(
-    metadata: InstrumentRiskMetadata, **overrides: object
-) -> InstrumentRiskOrder:
+def _order(metadata: InstrumentRiskMetadata, **overrides: object) -> InstrumentRiskOrder:
     values: dict[str, object] = {
         "instrument": metadata.instrument,
         "quantity": Decimal("2"),
@@ -76,9 +74,7 @@ def _execution_shape(metadata: InstrumentRiskMetadata, **overrides: object) -> o
 def test_assessment_enforces_lattices_multiplier_slippage_and_fee() -> None:
     metadata = _metadata()
 
-    assessment = InstrumentRiskRegistry((metadata,)).assess(
-        _order(metadata), now_ns=1_500
-    )
+    assessment = InstrumentRiskRegistry((metadata,)).assess(_order(metadata), now_ns=1_500)
 
     assert assessment.quoted_notional == Decimal("600")
     assert assessment.worst_case_price == Decimal("100.5")
@@ -89,9 +85,7 @@ def test_assessment_enforces_lattices_multiplier_slippage_and_fee() -> None:
 
 def test_exported_assessment_rejects_negative_fee_and_inconsistent_gross() -> None:
     metadata = _metadata()
-    assessment = InstrumentRiskRegistry((metadata,)).assess(
-        _order(metadata), now_ns=1_500
-    )
+    assessment = InstrumentRiskRegistry((metadata,)).assess(_order(metadata), now_ns=1_500)
 
     with pytest.raises(ValueError, match="worst_case_fee"):
         InstrumentRiskAssessment(
@@ -130,9 +124,7 @@ def test_assessment_rejects_unprovable_quantity_or_price(
 ) -> None:
     metadata = _metadata()
     with pytest.raises(RiskDeniedError) as caught:
-        InstrumentRiskRegistry((metadata,)).assess(
-            _order(metadata, **overrides), now_ns=1_500
-        )
+        InstrumentRiskRegistry((metadata,)).assess(_order(metadata, **overrides), now_ns=1_500)
     assert caught.value.code == code
 
 
@@ -240,9 +232,7 @@ def test_mapper_requires_digest_and_proven_position_effect() -> None:
     assert missing_digest.value.code == "INSTRUMENT_METADATA_DIGEST_REQUIRED"
 
     with pytest.raises(RiskDeniedError) as unknown_effect:
-        mapper(
-            _execution_shape(metadata, position_effect=SimpleNamespace(value="UNKNOWN"))
-        )
+        mapper(_execution_shape(metadata, position_effect=SimpleNamespace(value="UNKNOWN")))
     assert unknown_effect.value.code == "INSTRUMENT_POSITION_EFFECT_UNPROVEN"
 
 
@@ -308,9 +298,7 @@ def test_mapper_binds_policy_unit_and_authoritative_strategy_revision(tmp_path) 
             notional_unit="USD",
         ),
     )
-    gate.set_strategy_allocation(
-        scope, "strategy-1", "revision-1", max_notional=Decimal("1000")
-    )
+    gate.set_strategy_allocation(scope, "strategy-1", "revision-1", max_notional=Decimal("1000"))
     permit = gate.reserve(mapped)
     assert permit.notional_unit == "USD"
 
@@ -408,10 +396,7 @@ def test_complete_zero_budget_snapshot_reports_exhausted_without_permit(
 
     assert exhausted.value.code == "STRATEGY_ALLOCATION_EXHAUSTED"
     with gate._connection() as connection:
-        assert (
-            connection.execute("SELECT COUNT(*) FROM risk_reservations").fetchone()[0]
-            == 0
-        )
+        assert connection.execute("SELECT COUNT(*) FROM risk_reservations").fetchone()[0] == 0
 
 
 def test_mapper_refuses_position_limit_without_exact_allocation_unit() -> None:

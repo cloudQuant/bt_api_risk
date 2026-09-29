@@ -12,9 +12,7 @@ from bt_api_risk.core.admission import (
 from bt_api_risk.core.instrument import InstrumentRiskMetadata, InstrumentRiskRegistry
 
 
-def fixture(
-    *, budget="600", step="1", minimum=None, maximum=None, fee="0", slippage="0"
-):
+def fixture(*, budget="600", step="1", minimum=None, maximum=None, fee="0", slippage="0"):
     allocation = StrategyAllocationSnapshot(
         AccountScope("fixture", "account-a", "simulation"),
         "strategy-a",
@@ -81,9 +79,7 @@ def test_fixed_fee_is_charged_once_and_ambient_decimal_precision_does_not_round_
         assert size(allocation, registry) == Decimal("6")
 
 
-@pytest.mark.parametrize(
-    "value", [None, True, Decimal("NaN"), Decimal("Infinity"), Decimal("-1")]
-)
+@pytest.mark.parametrize("value", [None, True, Decimal("NaN"), Decimal("Infinity"), Decimal("-1")])
 def test_invalid_budget_rejects(value):
     allocation, registry = fixture()
     with pytest.raises(ValueError):
@@ -137,9 +133,7 @@ def test_unknown_instrument_rejects():
         )
 
 
-@pytest.mark.parametrize(
-    "price", [None, True, 100.0, "100", Decimal("NaN"), Decimal("0")]
-)
+@pytest.mark.parametrize("price", [None, True, 100.0, "100", Decimal("NaN"), Decimal("0")])
 def test_advisory_price_requires_explicit_positive_decimal(price):
     allocation, registry = fixture()
     with pytest.raises(ValueError, match="limit price"):

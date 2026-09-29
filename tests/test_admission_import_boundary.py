@@ -21,7 +21,7 @@ def test_durable_admission_works_when_analytical_imports_are_forbidden(tmp_path,
         str(Path(bt_api_risk.__file__).resolve().parent.parent),
         str(Path(base_spec.origin).resolve().parent.parent),
     ]
-    script = r'''
+    script = r"""
 import importlib
 import importlib.abc
 import sys
@@ -58,7 +58,7 @@ try:
 finally:
     gate.close()
 assert not (blocked & {name.split(".")[0] for name in sys.modules})
-'''
+"""
     result = subprocess.run(  # noqa: S603 -- fixed interpreter/script and synthetic local arguments.
         [sys.executable, "-I", "-c", script, json.dumps(paths), entry, str(tmp_path / "risk.db")],
         cwd=tmp_path,

@@ -44,11 +44,7 @@ _BPS_DENOMINATOR = Decimal("10000")
 
 def _identifier(value: object, name: str, *, instrument: bool = False) -> str:
     pattern = _INSTRUMENT if instrument else _IDENTIFIER
-    if (
-        not isinstance(value, str)
-        or value != value.strip()
-        or not pattern.fullmatch(value)
-    ):
+    if not isinstance(value, str) or value != value.strip() or not pattern.fullmatch(value):
         raise ValueError("invalid " + name)
     return value
 
@@ -123,16 +119,10 @@ def _precision(*values: Decimal) -> int:
 
     precision = max(
         50,
-        sum(
-            len(value.as_tuple().digits) + abs(value.as_tuple().exponent)
-            for value in values
-        )
-        + 32,
+        sum(len(value.as_tuple().digits) + abs(value.as_tuple().exponent) for value in values) + 32,
     )
     if precision > 10000:
-        raise ValueError(
-            "instrument decimal scale exceeds the supported arithmetic bound"
-        )
+        raise ValueError("instrument decimal scale exceeds the supported arithmetic bound")
     return precision
 
 
@@ -200,9 +190,7 @@ class InstrumentRiskMetadata:
             raise ValueError("invalid as_of_ns")
         if type(self.expires_at_ns) is not int or self.expires_at_ns <= self.as_of_ns:
             raise ValueError("invalid expires_at_ns")
-        object.__setattr__(
-            self, "tick_size", _decimal(self.tick_size, "tick_size", positive=True)
-        )
+        object.__setattr__(self, "tick_size", _decimal(self.tick_size, "tick_size", positive=True))
         object.__setattr__(
             self,
             "quantity_step",
@@ -257,14 +245,10 @@ class InstrumentRiskMetadata:
             "fixed_fee": _decimal_text(self.fixed_fee),
             "instrument": self.instrument,
             "max_gross_notional": _decimal_text(self.max_gross_notional),
-            "max_quantity": None
-            if self.max_quantity is None
-            else _decimal_text(self.max_quantity),
+            "max_quantity": None if self.max_quantity is None else _decimal_text(self.max_quantity),
             "max_slippage_bps": _decimal_text(self.max_slippage_bps),
             "metadata_version": self.metadata_version,
-            "min_quantity": None
-            if self.min_quantity is None
-            else _decimal_text(self.min_quantity),
+            "min_quantity": None if self.min_quantity is None else _decimal_text(self.min_quantity),
             "quantity_step": _decimal_text(self.quantity_step),
             "schema": _SCHEMA,
             "taker_fee_bps": _decimal_text(self.taker_fee_bps),
@@ -299,9 +283,7 @@ class InstrumentRiskOrder:
             "instrument",
             _identifier(self.instrument, "instrument", instrument=True),
         )
-        object.__setattr__(
-            self, "quantity", _decimal(self.quantity, "quantity", positive=True)
-        )
+        object.__setattr__(self, "quantity", _decimal(self.quantity, "quantity", positive=True))
         if self.limit_price is not None:
             object.__setattr__(
                 self,
@@ -339,9 +321,7 @@ class InstrumentRiskAssessment:
             "worst_case_notional",
             "gross_notional",
         ):
-            object.__setattr__(
-                self, name, _decimal(getattr(self, name), name, positive=True)
-            )
+            object.__setattr__(self, name, _decimal(getattr(self, name), name, positive=True))
         object.__setattr__(
             self,
             "worst_case_fee",
@@ -350,9 +330,7 @@ class InstrumentRiskAssessment:
         if Fraction(self.gross_notional) != (
             Fraction(self.worst_case_notional) + Fraction(self.worst_case_fee)
         ):
-            raise ValueError(
-                "gross_notional must equal worst_case_notional plus worst_case_fee"
-            )
+            raise ValueError("gross_notional must equal worst_case_notional plus worst_case_fee")
 
     def bound_payload_fingerprint(self, intent_fingerprint: str) -> str:
         """Bind trusted metadata and all risk amounts to an execution intent hash."""
@@ -389,16 +367,12 @@ class InstrumentRiskRegistry:
             raise ValueError("at least one instrument metadata entry is required")
         self._records = records
 
-    def get(
-        self, instrument: str
-    ) -> Optional[InstrumentRiskMetadata]:  # noqa: UP045 -- Python 3.9.
+    def get(self, instrument: str) -> Optional[InstrumentRiskMetadata]:  # noqa: UP045 -- Python 3.9.
         """Return a registered profile without making an admission decision."""
 
         return self._records.get(instrument)
 
-    def assess(
-        self, order: InstrumentRiskOrder, now_ns: int
-    ) -> InstrumentRiskAssessment:
+    def assess(self, order: InstrumentRiskOrder, now_ns: int) -> InstrumentRiskAssessment:
         """Validate metadata/lattices and calculate the worst-case local bound."""
 
         metadata = self._metadata_for(order, now_ns, require_fresh=True)
@@ -440,15 +414,10 @@ class InstrumentRiskRegistry:
                 Decimal("1") + metadata.max_slippage_bps / _BPS_DENOMINATOR
             )
             worst_case_price = _ceil_to_lattice(adverse_price, metadata.tick_size)
-            quoted_notional = (
-                order.quantity * order.limit_price * metadata.contract_multiplier
-            )
-            worst_case_notional = (
-                order.quantity * worst_case_price * metadata.contract_multiplier
-            )
+            quoted_notional = order.quantity * order.limit_price * metadata.contract_multiplier
+            worst_case_notional = order.quantity * worst_case_price * metadata.contract_multiplier
             worst_case_fee = (
-                worst_case_notional * metadata.taker_fee_bps / _BPS_DENOMINATOR
-                + metadata.fixed_fee
+                worst_case_notional * metadata.taker_fee_bps / _BPS_DENOMINATOR + metadata.fixed_fee
             )
             gross_notional = worst_case_notional + worst_case_fee
         if gross_notional > metadata.max_gross_notional:
@@ -466,9 +435,7 @@ class InstrumentRiskRegistry:
             gross_notional=gross_notional,
         )
 
-    def validate_reduction(
-        self, order: InstrumentRiskOrder, now_ns: int
-    ) -> InstrumentRiskMetadata:
+    def validate_reduction(self, order: InstrumentRiskOrder, now_ns: int) -> InstrumentRiskMetadata:
         """Validate a known risk-reducing request without market-data freshness gating.
 
         A stale quote must not become an excuse to prevent an independently
@@ -526,9 +493,7 @@ class InstrumentRiskRegistry:
                 "instrument metadata is not active yet",
             )
         if require_fresh and now_ns >= metadata.expires_at_ns:
-            raise RiskDeniedError(
-                "INSTRUMENT_METADATA_STALE", "instrument metadata is expired"
-            )
+            raise RiskDeniedError("INSTRUMENT_METADATA_STALE", "instrument metadata is expired")
         return metadata
 
 
@@ -581,13 +546,9 @@ class InstrumentRiskAdmissionMapper:
     def _order_from_intent(self, intent: Any) -> InstrumentRiskOrder:
         tags = getattr(intent, "tags", None)
         if not isinstance(tags, Mapping):
-            raise RiskDeniedError(
-                "INSTRUMENT_METADATA_DIGEST_REQUIRED", "intent tags are required"
-            )
+            raise RiskDeniedError("INSTRUMENT_METADATA_DIGEST_REQUIRED", "intent tags are required")
         metadata_digest = tags.get(INSTRUMENT_METADATA_DIGEST_TAG)
-        if not isinstance(metadata_digest, str) or not _SHA256.fullmatch(
-            metadata_digest
-        ):
+        if not isinstance(metadata_digest, str) or not _SHA256.fullmatch(metadata_digest):
             raise RiskDeniedError(
                 "INSTRUMENT_METADATA_DIGEST_REQUIRED",
                 "intent is missing the exact instrument metadata digest",
@@ -617,9 +578,7 @@ class InstrumentRiskAdmissionMapper:
             raise RiskDeniedError(
                 "INSTRUMENT_INTENT_INVALID", "intent lacks immutable identity"
             ) from error
-        position_effect = getattr(
-            getattr(intent, "position_effect", None), "value", None
-        )
+        position_effect = getattr(getattr(intent, "position_effect", None), "value", None)
         strategy_id = None
         allocation_version = None
         quantity_unit = None
@@ -628,9 +587,7 @@ class InstrumentRiskAdmissionMapper:
             assessment = self._registry.assess(order, self._clock_ns())
             action = IntentAction.INCREASE
             notional = assessment.gross_notional
-            payload_fingerprint = assessment.bound_payload_fingerprint(
-                intent_fingerprint
-            )
+            payload_fingerprint = assessment.bound_payload_fingerprint(intent_fingerprint)
             quantity_unit = assessment.metadata.quantity_unit
             if self._allocation_reader is not None:
                 execution_scope = getattr(intent, "scope", None)
@@ -649,10 +606,8 @@ class InstrumentRiskAdmissionMapper:
                     ) from error
                 if (
                     getattr(execution_scope, "provider", None) != self._scope.provider
-                    or getattr(execution_scope, "account_ref", None)
-                    != self._scope.account_id
-                    or getattr(execution_scope, "environment", None)
-                    != self._scope.environment
+                    or getattr(execution_scope, "account_ref", None) != self._scope.account_id
+                    or getattr(execution_scope, "environment", None) != self._scope.environment
                 ):
                     raise RiskDeniedError(
                         "STRATEGY_ALLOCATION_SCOPE_MISMATCH",
@@ -721,15 +676,11 @@ class InstrumentRiskAdmissionMapper:
                         allocation_version = allocation.allocation_version
                         allocation_notional = getattr(allocation, "max_notional", None)
                         allocation_position = getattr(allocation, "max_position", None)
-                        allocation_notional_unit = getattr(
-                            allocation, "notional_unit", None
-                        )
+                        allocation_notional_unit = getattr(allocation, "notional_unit", None)
                         allocation_position_instrument = getattr(
                             allocation, "position_instrument", None
                         )
-                        allocation_position_unit = getattr(
-                            allocation, "position_unit", None
-                        )
+                        allocation_position_unit = getattr(allocation, "position_unit", None)
                     except (AttributeError, TypeError, ValueError) as error:
                         raise RiskDeniedError(
                             "STRATEGY_ALLOCATION_UNAVAILABLE",
@@ -816,23 +767,17 @@ class InstrumentRiskAdmissionMapper:
             allocation_version=allocation_version,
             instrument=(
                 order.instrument
-                if action is IntentAction.INCREASE
-                and strategy_id
-                and quantity_unit is not None
+                if action is IntentAction.INCREASE and strategy_id and quantity_unit is not None
                 else None
             ),
             quantity=(
                 order.quantity
-                if action is IntentAction.INCREASE
-                and strategy_id
-                and quantity_unit is not None
+                if action is IntentAction.INCREASE and strategy_id and quantity_unit is not None
                 else None
             ),
             quantity_unit=(
                 quantity_unit
-                if action is IntentAction.INCREASE
-                and strategy_id
-                and quantity_unit is not None
+                if action is IntentAction.INCREASE and strategy_id and quantity_unit is not None
                 else None
             ),
             notional_unit=notional_unit,

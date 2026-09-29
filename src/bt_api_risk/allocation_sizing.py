@@ -32,20 +32,14 @@ def size_for_strategy_allocation(
         raise ValueError("an exact local strategy allocation snapshot is required")
     if type(registry) is not InstrumentRiskRegistry:
         raise ValueError("an exact instrument risk registry is required")
-    if (
-        type(limit_price) is not Decimal
-        or not limit_price.is_finite()
-        or limit_price <= 0
-    ):
+    if type(limit_price) is not Decimal or not limit_price.is_finite() or limit_price <= 0:
         raise ValueError("a positive finite Decimal limit price is required")
     if (
         allocation.source != "local_risk_reservation_ledger"
         or allocation.completeness != "LOCAL_LEDGER_COMPLETE"
         or allocation.reason is not None
     ):
-        raise RiskDeniedError(
-            "ALLOCATION_UNAVAILABLE", "complete local allocation is required"
-        )
+        raise RiskDeniedError("ALLOCATION_UNAVAILABLE", "complete local allocation is required")
     for value in (
         allocation.allocated_notional,
         allocation.used_notional,
@@ -70,16 +64,9 @@ def size_for_strategy_allocation(
         )
     metadata = registry.get(instrument)
     if metadata is None:
-        raise RiskDeniedError(
-            "INSTRUMENT_METADATA_MISSING", "reviewed instrument is unavailable"
-        )
-    if (
-        not allocation.notional_unit
-        or metadata.valuation_unit != allocation.notional_unit
-    ):
-        raise RiskDeniedError(
-            "NOTIONAL_UNIT_MISMATCH", "allocation and metadata units differ"
-        )
+        raise RiskDeniedError("INSTRUMENT_METADATA_MISSING", "reviewed instrument is unavailable")
+    if not allocation.notional_unit or metadata.valuation_unit != allocation.notional_unit:
+        raise RiskDeniedError("NOTIONAL_UNIT_MISMATCH", "allocation and metadata units differ")
 
     def order(quantity):
         return InstrumentRiskOrder(

@@ -81,11 +81,7 @@ class AccountScope:
     environment: str
 
     def __post_init__(self) -> None:
-        if (
-            not self.provider.strip()
-            or not self.account_id.strip()
-            or not self.environment.strip()
-        ):
+        if not self.provider.strip() or not self.account_id.strip() or not self.environment.strip():
             raise ValueError("provider, account_id, and environment are required")
 
     @property
@@ -120,9 +116,7 @@ class RiskPolicy:
         try:
             limit = _as_decimal(self.max_increase_notional)
         except (InvalidOperation, ValueError) as exc:
-            raise ValueError(
-                "max_increase_notional must be a non-negative decimal"
-            ) from exc
+            raise ValueError("max_increase_notional must be a non-negative decimal") from exc
         if not self.policy_id.strip():
             raise ValueError("policy_id is required")
         if limit < Decimal("0"):
@@ -194,9 +188,7 @@ class RiskIntent:
         ):
             raise ValueError("notional_unit must be a canonical uppercase unit code")
         if (self.strategy_id is None) != (self.allocation_version is None):
-            raise ValueError(
-                "strategy_id and allocation_version must be supplied together"
-            )
+            raise ValueError("strategy_id and allocation_version must be supplied together")
         for name in ("strategy_id", "allocation_version"):
             value = getattr(self, name)
             if value is not None and (
@@ -207,9 +199,7 @@ class RiskIntent:
         if any(value is not None for value in position_fields) and not all(
             value is not None for value in position_fields
         ):
-            raise ValueError(
-                "instrument, quantity, and quantity_unit must be supplied together"
-            )
+            raise ValueError("instrument, quantity, and quantity_unit must be supplied together")
         if self.instrument is not None and (
             not isinstance(self.instrument, str)
             or not _ALLOCATION_INSTRUMENT.fullmatch(self.instrument)
@@ -353,9 +343,7 @@ def _validate_dispatch_evidence_class(
     simulation_providers = {"fake", "fixture"}
     if evidence_class is DispatchEvidenceClass.SIMULATION_JOURNAL:
         if scope.provider not in simulation_providers:
-            raise ValueError(
-                "simulation evidence cannot bind a non-simulation provider scope"
-            )
+            raise ValueError("simulation evidence cannot bind a non-simulation provider scope")
     elif scope.provider in simulation_providers:
         raise ValueError("native evidence cannot bind a fake or fixture provider scope")
 
@@ -383,9 +371,7 @@ class DispatchClaimBinding:
             raise ValueError("dispatch claim cause does not match intent")
         _require_sha256(self.intent_hash, "intent_hash")
         _require_sha256(self.claim_digest, "claim_digest")
-        if not isinstance(self.claimed_at, (int, float)) or not math.isfinite(
-            self.claimed_at
-        ):
+        if not isinstance(self.claimed_at, (int, float)) or not math.isfinite(self.claimed_at):
             raise ValueError("invalid dispatch claim timestamp")
 
 
@@ -433,16 +419,9 @@ class DispatchTerminalProof:
         ):
             _require_sha256(getattr(self, name), name)
         if type(self.terminal_state) is not DispatchTerminalState:
-            raise ValueError(
-                "terminal proof must name an allowed no-fill terminal state"
-            )
-        if (
-            type(self.dispatch_attempt_count) is not int
-            or self.dispatch_attempt_count != 1
-        ):
-            raise ValueError(
-                "terminal proof must establish exactly one dispatch attempt"
-            )
+            raise ValueError("terminal proof must name an allowed no-fill terminal state")
+        if type(self.dispatch_attempt_count) is not int or self.dispatch_attempt_count != 1:
+            raise ValueError("terminal proof must establish exactly one dispatch attempt")
         if type(self.journal_revision) is not int or self.journal_revision <= 0:
             raise ValueError("invalid terminal proof journal revision")
         if type(self.filled_quantity) is not int or self.filled_quantity != 0:
@@ -510,19 +489,12 @@ class DispatchTrackedOrderProof:
             "exposure_reservation_sha256",
         ):
             _require_sha256(getattr(self, name), name)
-        if (
-            type(self.dispatch_attempt_count) is not int
-            or self.dispatch_attempt_count != 1
-        ):
-            raise ValueError(
-                "tracked-order proof must establish exactly one dispatch attempt"
-            )
+        if type(self.dispatch_attempt_count) is not int or self.dispatch_attempt_count != 1:
+            raise ValueError("tracked-order proof must establish exactly one dispatch attempt")
         if type(self.journal_revision) is not int or self.journal_revision <= 0:
             raise ValueError("invalid tracked-order journal revision")
         if type(self.filled_quantity) is not int or self.filled_quantity != 0:
-            raise ValueError(
-                "tracked-order transfer cannot use synthetic or partial fills"
-            )
+            raise ValueError("tracked-order transfer cannot use synthetic or partial fills")
         if type(self.trade_count) is not int or self.trade_count != 0:
             raise ValueError("tracked-order transfer requires zero verified trades")
 
@@ -638,7 +610,10 @@ class CancelDispatchResolutionProof:
             filled_quantity = _as_decimal(self.target_filled_quantity)
         except (InvalidOperation, ValueError) as exc:
             raise ValueError("invalid cancellation target filled quantity") from exc
-        if filled_quantity < Decimal("0") or _decimal_text(filled_quantity) != self.target_filled_quantity:
+        if (
+            filled_quantity < Decimal("0")
+            or _decimal_text(filled_quantity) != self.target_filled_quantity
+        ):
             raise ValueError("cancellation target filled quantity is not canonical")
         if self.terminal_state is CancelDispatchTerminalState.CANCELLED:
             if (
@@ -646,7 +621,9 @@ class CancelDispatchResolutionProof:
                 or self.target_state != "CANCELLED"
                 or self.target_event_type != "cancelled_by_cancel_intent"
             ):
-                raise ValueError("cancelled action requires its exact terminal target postcondition")
+                raise ValueError(
+                    "cancelled action requires its exact terminal target postcondition"
+                )
         elif (
             self.target_postcondition is not CancelTargetPostcondition.TARGET_REMAINS_OPEN
             or self.target_state not in {"ACKED", "PARTIALLY_FILLED"}
@@ -763,8 +740,7 @@ class VerifiedCancellationJournalAuthority(Protocol):
         claim: DispatchClaimBinding,
     ) -> AbstractContextManager[
         Optional[VerifiedCancelDispatchResolution]  # noqa: UP045 -- Python 3.9 is supported.
-    ]:
-        ...
+    ]: ...
 
 
 def _dispatch_resolution_proof_sha256(proof: DispatchResolutionProof) -> str:
@@ -853,8 +829,7 @@ class VerifiedExecutionJournalAuthority(Protocol):
         claim: DispatchClaimBinding,
     ) -> AbstractContextManager[
         Optional[VerifiedDispatchResolution]  # noqa: UP045 -- Python 3.9 is supported.
-    ]:
-        ...
+    ]: ...
 
 
 class DurableRiskGate:
@@ -945,33 +920,20 @@ class DurableRiskGate:
             try:
                 normalized_notional = _as_decimal(max_notional)
             except (InvalidOperation, ValueError) as exc:
-                raise ValueError(
-                    "max_notional must be a non-negative finite decimal"
-                ) from exc
+                raise ValueError("max_notional must be a non-negative finite decimal") from exc
             if normalized_notional < Decimal("0"):
                 raise ValueError("max_notional must be a non-negative finite decimal")
-            if not isinstance(notional_unit, str) or not _NOTIONAL_UNIT.fullmatch(
-                notional_unit
-            ):
+            if not isinstance(notional_unit, str) or not _NOTIONAL_UNIT.fullmatch(notional_unit):
                 raise ValueError("max_notional requires a canonical notional_unit")
         elif notional_unit is not None and (
-            not isinstance(notional_unit, str)
-            or not _NOTIONAL_UNIT.fullmatch(notional_unit)
+            not isinstance(notional_unit, str) or not _NOTIONAL_UNIT.fullmatch(notional_unit)
         ):
             raise ValueError("notional_unit must be a canonical uppercase unit code")
-        if (
-            self._policy.notional_unit is not None
-            and notional_unit != self._policy.notional_unit
-        ):
+        if self._policy.notional_unit is not None and notional_unit != self._policy.notional_unit:
             raise ValueError("allocation notional_unit must match the account policy")
         if normalized_notional is not None and self._policy.notional_unit is None:
-            raise ValueError(
-                "notional allocation requires a fixed account policy notional_unit"
-            )
-        if (
-            self._policy.require_strategy_allocation
-            and self._policy.notional_unit is None
-        ):
+            raise ValueError("notional allocation requires a fixed account policy notional_unit")
+        if self._policy.require_strategy_allocation and self._policy.notional_unit is None:
             raise ValueError("strategy allocation policy needs a notional_unit")
 
         normalized_position = None
@@ -979,18 +941,14 @@ class DurableRiskGate:
             try:
                 normalized_position = _as_decimal(max_position)
             except (InvalidOperation, ValueError) as exc:
-                raise ValueError(
-                    "max_position must be a positive finite decimal"
-                ) from exc
+                raise ValueError("max_position must be a positive finite decimal") from exc
             if normalized_position <= Decimal("0"):
                 raise ValueError("max_position must be a positive finite decimal")
-            if not isinstance(
-                position_instrument, str
-            ) or not _ALLOCATION_INSTRUMENT.fullmatch(position_instrument):
-                raise ValueError("max_position requires an exact position_instrument")
-            if not isinstance(position_unit, str) or not _ALLOCATION_ID.fullmatch(
-                position_unit
+            if not isinstance(position_instrument, str) or not _ALLOCATION_INSTRUMENT.fullmatch(
+                position_instrument
             ):
+                raise ValueError("max_position requires an exact position_instrument")
+            if not isinstance(position_unit, str) or not _ALLOCATION_ID.fullmatch(position_unit):
                 raise ValueError("max_position requires an exact position_unit")
         elif position_instrument is not None or position_unit is not None:
             raise ValueError("position instrument/unit require max_position")
@@ -1004,32 +962,19 @@ class DurableRiskGate:
                 "SELECT * FROM risk_strategy_allocations WHERE scope_key = ? AND strategy_id = ?",
                 (scope.key, strategy_id),
             ).fetchone()
-            if (
-                current is not None
-                and current["allocation_version"] == allocation_version
-            ):
+            if current is not None and current["allocation_version"] == allocation_version:
                 same_facts = (
                     current["max_notional"]
-                    == (
-                        None
-                        if normalized_notional is None
-                        else _decimal_text(normalized_notional)
-                    )
+                    == (None if normalized_notional is None else _decimal_text(normalized_notional))
                     and current["max_position"]
-                    == (
-                        None
-                        if normalized_position is None
-                        else _decimal_text(normalized_position)
-                    )
+                    == (None if normalized_position is None else _decimal_text(normalized_position))
                     and current["position_instrument"] == position_instrument
                     and current["position_unit"] == position_unit
                     and current["notional_unit"] == notional_unit
                 )
                 if same_facts:
                     return
-                raise ValueError(
-                    "allocation version cannot be reused with changed limits"
-                )
+                raise ValueError("allocation version cannot be reused with changed limits")
 
             prior_version = connection.execute(
                 """SELECT 1 FROM risk_strategy_allocation_versions
@@ -1108,12 +1053,8 @@ class DurableRiskGate:
                     scope.key,
                     strategy_id,
                     allocation_version,
-                    None
-                    if normalized_notional is None
-                    else _decimal_text(normalized_notional),
-                    None
-                    if normalized_position is None
-                    else _decimal_text(normalized_position),
+                    None if normalized_notional is None else _decimal_text(normalized_notional),
+                    None if normalized_position is None else _decimal_text(normalized_position),
                     position_instrument,
                     position_unit,
                     notional_unit,
@@ -1137,12 +1078,8 @@ class DurableRiskGate:
                     scope.key,
                     strategy_id,
                     allocation_version,
-                    None
-                    if normalized_notional is None
-                    else _decimal_text(normalized_notional),
-                    None
-                    if normalized_position is None
-                    else _decimal_text(normalized_position),
+                    None if normalized_notional is None else _decimal_text(normalized_notional),
+                    None if normalized_position is None else _decimal_text(normalized_position),
                     position_instrument,
                     position_unit,
                     notional_unit,
@@ -1166,9 +1103,7 @@ class DurableRiskGate:
 
         if not isinstance(scope, AccountScope):
             raise ValueError("scope must be an AccountScope")
-        if not isinstance(strategy_id, str) or not _ALLOCATION_ID.fullmatch(
-            strategy_id
-        ):
+        if not isinstance(strategy_id, str) or not _ALLOCATION_ID.fullmatch(strategy_id):
             raise ValueError("invalid strategy_id")
         with self._connection() as connection:
             connection.execute("BEGIN")
@@ -1255,9 +1190,7 @@ class DurableRiskGate:
             )
 
         allocated = (
-            None
-            if allocation["max_notional"] is None
-            else _as_decimal(allocation["max_notional"])
+            None if allocation["max_notional"] is None else _as_decimal(allocation["max_notional"])
         )
         available = None
         reason = None
@@ -1286,9 +1219,7 @@ class DurableRiskGate:
                 - Fraction(account_used)
                 - Fraction(account_reserved),
             )
-            available = _decimal_from_fraction(
-                min(strategy_remaining, account_remaining)
-            )
+            available = _decimal_from_fraction(min(strategy_remaining, account_remaining))
 
         return StrategyAllocationSnapshot(
             scope=scope,
@@ -1419,9 +1350,7 @@ class DurableRiskGate:
                 raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
             permit = self._permit_from_row(row)
             if permit.policy_fingerprint != self._policy.fingerprint:
-                raise PermitInvalidError(
-                    "POLICY_CHANGED", "permit was issued under another policy"
-                )
+                raise PermitInvalidError("POLICY_CHANGED", "permit was issued under another policy")
             self._ensure_policy_binding(connection, permit.scope.key)
             self._expire_active(connection, now)
             row = connection.execute(
@@ -1430,9 +1359,7 @@ class DurableRiskGate:
             assert row is not None
             permit = self._permit_from_row(row)
             if row["status"] != self._ACTIVE:
-                raise PermitInvalidError(
-                    "PERMIT_NOT_ACTIVE", "permit is no longer active"
-                )
+                raise PermitInvalidError("PERMIT_NOT_ACTIVE", "permit is no longer active")
             self._assert_reservation_allocation_current(connection, row, invalid=True)
             if intent is not None:
                 if intent.intent_id != permit.intent_id or intent.scope != permit.scope:
@@ -1514,9 +1441,7 @@ class DurableRiskGate:
                     now,
                 ),
             )
-            self._freeze_in_transaction(
-                connection, permit.scope, cause_id, cause_id, now
-            )
+            self._freeze_in_transaction(connection, permit.scope, cause_id, cause_id, now)
             return permit
 
     def dispatch_claim_binding(self, permit_id: str) -> DispatchClaimBinding:
@@ -1553,9 +1478,7 @@ class DurableRiskGate:
             self._ensure_policy_binding(connection, str(row["scope_key"]))
             self._require_dispatch_claim(connection, row)
             if row["status"] != self._ACTIVE:
-                raise PermitInvalidError(
-                    "PERMIT_NOT_ACTIVE", "only an active permit can settle"
-                )
+                raise PermitInvalidError("PERMIT_NOT_ACTIVE", "only an active permit can settle")
             connection.execute(
                 "UPDATE risk_reservations SET status = ? WHERE permit_id = ?",
                 (self._SETTLED, permit_id),
@@ -1623,9 +1546,7 @@ class DurableRiskGate:
                     "a dispatch-claimed permit cannot be released",
                 )
             if row["status"] != self._ACTIVE:
-                raise PermitInvalidError(
-                    "PERMIT_NOT_ACTIVE", "only an active permit can release"
-                )
+                raise PermitInvalidError("PERMIT_NOT_ACTIVE", "only an active permit can release")
             connection.execute(
                 "UPDATE risk_reservations SET status = ?, reason = ? WHERE permit_id = ?",
                 (self._RELEASED, reason, permit_id),
@@ -1636,14 +1557,10 @@ class DurableRiskGate:
         if not cause_id.strip() or not reason.strip():
             raise ValueError("freeze cause_id and reason are required")
         if self._is_dispatch_freeze_cause(cause_id):
-            raise ValueError(
-                "dispatch-inflight freeze causes are reserved for dispatch claims"
-            )
+            raise ValueError("dispatch-inflight freeze causes are reserved for dispatch claims")
         with self._transaction() as connection:
             self._ensure_policy_binding(connection, scope.key)
-            self._freeze_in_transaction(
-                connection, scope, cause_id, reason, self._clock()
-            )
+            self._freeze_in_transaction(connection, scope, cause_id, reason, self._clock())
 
     def resolve_freeze(self, scope: AccountScope, cause_id: str) -> None:
         """Resolve an ordinary freeze; dispatch latches need reconciliation."""
@@ -1762,16 +1679,12 @@ class DurableRiskGate:
                         "CANCEL_DISPATCH_RESOLUTION_INCONSISTENT",
                         "stored cancellation resolution conflicts with current risk state",
                     )
-                if (
-                    reservation["action"] != IntentAction.CANCEL.value
-                    or _as_decimal(
-                        connection.execute(
-                            "SELECT notional FROM risk_reservations WHERE permit_id = ?",
-                            (proof.permit_id,),
-                        ).fetchone()["notional"]
-                    )
-                    != Decimal("0")
-                ):
+                if reservation["action"] != IntentAction.CANCEL.value or _as_decimal(
+                    connection.execute(
+                        "SELECT notional FROM risk_reservations WHERE permit_id = ?",
+                        (proof.permit_id,),
+                    ).fetchone()["notional"]
+                ) != Decimal("0"):
                     raise PermitInvalidError(
                         "CANCEL_DISPATCH_RESOLUTION_NOT_CANCEL",
                         "stored cancellation resolution is not bound to a zero-notional cancel",
@@ -1820,9 +1733,7 @@ class DurableRiskGate:
             self._assert_cancel_dispatch_proof_matches_claim(proof, binding)
             return binding
 
-    def resolve_cancel_dispatch_freeze(
-        self, proof: CancelDispatchResolutionProof
-    ) -> None:
+    def resolve_cancel_dispatch_freeze(self, proof: CancelDispatchResolutionProof) -> None:
         """Resolve one cancel-action latch using an exact terminal cancel record.
 
         This path never uses order-level ``CANCELED_NO_FILL`` evidence. A
@@ -1883,9 +1794,7 @@ class DurableRiskGate:
                         (proof.permit_id,),
                     ).fetchone()
                     if existing is not None:
-                        if not self._cancel_dispatch_resolution_row_matches_proof(
-                            existing, proof
-                        ):
+                        if not self._cancel_dispatch_resolution_row_matches_proof(existing, proof):
                             raise PermitInvalidError(
                                 "CANCEL_DISPATCH_ALREADY_RESOLVED",
                                 "this cancellation claim has another immutable resolution",
@@ -1915,9 +1824,7 @@ class DurableRiskGate:
                     ).fetchone()
                     if reservation is None:
                         raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
-                    self._ensure_policy_binding(
-                        connection, str(reservation["scope_key"])
-                    )
+                    self._ensure_policy_binding(connection, str(reservation["scope_key"]))
                     if (
                         reservation["action"] != IntentAction.CANCEL.value
                         or _as_decimal(reservation["notional"]) != Decimal("0")
@@ -1931,9 +1838,7 @@ class DurableRiskGate:
                         )
                     claim = self._require_dispatch_claim(connection, reservation)
                     current_binding = self._dispatch_claim_binding(reservation, claim)
-                    self._assert_cancel_dispatch_proof_matches_claim(
-                        proof, current_binding
-                    )
+                    self._assert_cancel_dispatch_proof_matches_claim(proof, current_binding)
                     if reservation["status"] not in {self._ACTIVE, self._SETTLED}:
                         raise PermitInvalidError(
                             "CANCEL_DISPATCH_PERMIT_NOT_SETTLEABLE",
@@ -2069,9 +1974,7 @@ class DurableRiskGate:
                 "a verified execution-journal authority is required",
             )
 
-        binding = self._load_dispatch_claim_binding(
-            proof.permit_id, proof.journal_record_sha256
-        )
+        binding = self._load_dispatch_claim_binding(proof.permit_id, proof.journal_record_sha256)
         self._assert_dispatch_proof_matches_claim(proof, binding)
         try:
             guard = guard_factory(proof, claim=binding)
@@ -2080,12 +1983,8 @@ class DurableRiskGate:
                     attestation.scope == binding.scope == proof.scope
                     and attestation.permit_id == binding.permit_id == proof.permit_id
                     and attestation.intent_id == binding.intent_id == proof.intent_id
-                    and attestation.intent_hash
-                    == binding.intent_hash
-                    == proof.intent_hash
-                    and attestation.claim_digest
-                    == binding.claim_digest
-                    == proof.claim_digest
+                    and attestation.intent_hash == binding.intent_hash == proof.intent_hash
+                    and attestation.claim_digest == binding.claim_digest == proof.claim_digest
                     and attestation.proof_sha256 == proof.fingerprint
                     and attestation.journal_revision == proof.journal_revision
                     and attestation.journal_record_sha256 == proof.journal_record_sha256
@@ -2121,17 +2020,13 @@ class DurableRiskGate:
                         (proof.permit_id,),
                     ).fetchone()
                     if reservation is None:
-                        raise PermitInvalidError(
-                            "PERMIT_UNKNOWN", "permit does not exist"
-                        )
+                        raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
                     if reservation["action"] == IntentAction.CANCEL.value:
                         raise PermitInvalidError(
                             "CANCEL_DISPATCH_REQUIRES_CANCEL_PROOF",
                             "cancellation dispatch requires terminal cancellation-action evidence",
                         )
-                    self._ensure_policy_binding(
-                        connection, str(reservation["scope_key"])
-                    )
+                    self._ensure_policy_binding(connection, str(reservation["scope_key"]))
                     claim = self._require_dispatch_claim(connection, reservation)
                     current_binding = self._dispatch_claim_binding(reservation, claim)
                     self._assert_dispatch_proof_matches_claim(proof, current_binding)
@@ -2245,9 +2140,7 @@ class DurableRiskGate:
                 """,
                 (scope.key, self._ACTIVE, self._SETTLED),
             ).fetchall()
-            increase_rows = [
-                row for row in rows if row["action"] == IntentAction.INCREASE.value
-            ]
+            increase_rows = [row for row in rows if row["action"] == IntentAction.INCREASE.value]
             return {
                 "active_freeze_reasons": self._freeze_reasons(connection, scope),
                 "increase_count": len(increase_rows),
@@ -2264,23 +2157,17 @@ class DurableRiskGate:
         self, row: sqlite3.Row, intent: RiskIntent, now: float
     ) -> RiskPermit:
         if row["intent_hash"] != intent.fingerprint:
-            raise RiskDeniedError(
-                "INTENT_ID_REUSED", "intent id was reused with another payload"
-            )
+            raise RiskDeniedError("INTENT_ID_REUSED", "intent id was reused with another payload")
         if row["status"] != self._ACTIVE:
             raise RiskDeniedError("INTENT_NOT_REUSABLE", "intent was already finalized")
         permit = self._permit_from_row(row)
         if permit.expires_at <= now:
             raise RiskDeniedError("INTENT_EXPIRED", "intent permit has expired")
         if permit.policy_fingerprint != self._policy.fingerprint:
-            raise RiskDeniedError(
-                "POLICY_CHANGED", "intent was admitted by another policy"
-            )
+            raise RiskDeniedError("POLICY_CHANGED", "intent was admitted by another policy")
         return permit
 
-    def _assert_increase_limit(
-        self, connection: sqlite3.Connection, intent: RiskIntent
-    ) -> None:
+    def _assert_increase_limit(self, connection: sqlite3.Connection, intent: RiskIntent) -> None:
         rows = connection.execute(
             """
             SELECT notional, notional_unit FROM risk_reservations
@@ -2370,9 +2257,7 @@ class DurableRiskGate:
             return "RISK_POLICY_BINDING_UNAVAILABLE"
         return "RISK_POLICY_BINDING_UNAVAILABLE"
 
-    def _ensure_policy_binding(
-        self, connection: sqlite3.Connection, scope_key: str
-    ) -> None:
+    def _ensure_policy_binding(self, connection: sqlite3.Connection, scope_key: str) -> None:
         """Persist or enforce the immutable policy selected for an account ledger.
 
         This is called only while ``BEGIN IMMEDIATE`` is held. Existing history
@@ -2443,10 +2328,7 @@ class DurableRiskGate:
         """Require one policy-owned denomination before summing notional amounts."""
 
         if self._policy.notional_unit is None:
-            if (
-                self._policy.require_strategy_allocation
-                or intent.notional_unit is not None
-            ):
+            if self._policy.require_strategy_allocation or intent.notional_unit is not None:
                 raise RiskDeniedError(
                     "NOTIONAL_UNIT_UNBOUND", "account policy has no fixed notional unit"
                 )
@@ -2605,9 +2487,7 @@ class DurableRiskGate:
         )
         raise error(code, "permit allocation version is no longer current")
 
-    def _assert_not_frozen(
-        self, connection: sqlite3.Connection, scope: AccountScope
-    ) -> None:
+    def _assert_not_frozen(self, connection: sqlite3.Connection, scope: AccountScope) -> None:
         reasons = self._freeze_reasons(connection, scope)
         if reasons:
             raise RiskDeniedError(
@@ -2632,15 +2512,11 @@ class DurableRiskGate:
         if row["status"] != self._ACTIVE:
             raise PermitInvalidError("PERMIT_NOT_ACTIVE", "permit is no longer active")
         if permit.policy_fingerprint != self._policy.fingerprint:
-            raise PermitInvalidError(
-                "POLICY_CHANGED", "permit was issued under another policy"
-            )
+            raise PermitInvalidError("POLICY_CHANGED", "permit was issued under another policy")
         self._ensure_policy_binding(connection, permit.scope.key)
         self._assert_reservation_allocation_current(connection, row, invalid=True)
         if intent.intent_id != permit.intent_id or intent.scope != permit.scope:
-            raise PermitInvalidError(
-                "PERMIT_SCOPE_MISMATCH", "permit does not match intent scope"
-            )
+            raise PermitInvalidError("PERMIT_SCOPE_MISMATCH", "permit does not match intent scope")
         if intent.fingerprint != row["intent_hash"]:
             raise PermitInvalidError(
                 "PERMIT_INTENT_MISMATCH", "permit does not match intent payload"
@@ -2845,9 +2721,7 @@ class DurableRiskGate:
             (scope.key, cause_id, reason, updated_at),
         )
 
-    def _freeze_reasons(
-        self, connection: sqlite3.Connection, scope: AccountScope
-    ) -> list[str]:
+    def _freeze_reasons(self, connection: sqlite3.Connection, scope: AccountScope) -> list[str]:
         rows = connection.execute(
             "SELECT reason FROM risk_freezes WHERE scope_key = ? AND active = 1 ORDER BY cause_id",
             (scope.key,),
@@ -3074,9 +2948,7 @@ class DurableRiskGate:
             )
             reservation_columns = {
                 str(row["name"])
-                for row in connection.execute(
-                    "PRAGMA table_info(risk_reservations)"
-                ).fetchall()
+                for row in connection.execute("PRAGMA table_info(risk_reservations)").fetchall()
             }
             for name, column_type in (
                 ("strategy_id", "TEXT"),
@@ -3088,10 +2960,7 @@ class DurableRiskGate:
             ):
                 if name not in reservation_columns:
                     connection.execute(
-                        "ALTER TABLE risk_reservations ADD COLUMN "
-                        + name
-                        + " "
-                        + column_type
+                        "ALTER TABLE risk_reservations ADD COLUMN " + name + " " + column_type
                     )
             for table in (
                 "risk_strategy_allocations",
@@ -3099,14 +2968,10 @@ class DurableRiskGate:
             ):
                 allocation_columns = {
                     str(row["name"])
-                    for row in connection.execute(
-                        "PRAGMA table_info(" + table + ")"
-                    ).fetchall()
+                    for row in connection.execute("PRAGMA table_info(" + table + ")").fetchall()
                 }
                 if "notional_unit" not in allocation_columns:
-                    connection.execute(
-                        "ALTER TABLE " + table + " ADD COLUMN notional_unit TEXT"
-                    )
+                    connection.execute("ALTER TABLE " + table + " ADD COLUMN notional_unit TEXT")
             connection.execute(
                 """CREATE INDEX IF NOT EXISTS idx_risk_reservations_strategy_status
                    ON risk_reservations(scope_key, strategy_id, status, action)"""
@@ -3153,9 +3018,7 @@ def _as_decimal(value: object) -> Decimal:
 def _sum_decimal_exact(values: Iterator[Decimal]) -> Decimal:
     """Sum finite Decimal values without the ambient context precision."""
 
-    return _decimal_from_fraction(
-        sum((Fraction(value) for value in values), Fraction(0))
-    )
+    return _decimal_from_fraction(sum((Fraction(value) for value in values), Fraction(0)))
 
 
 def _decimal_from_fraction(value: Fraction) -> Decimal:

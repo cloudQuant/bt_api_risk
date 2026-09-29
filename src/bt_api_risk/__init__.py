@@ -89,6 +89,7 @@ def __dir__() -> list[str]:
     """Keep the established public exports discoverable without loading them."""
     return sorted(set(globals()) | set(__all__))
 
+
 __all__ = [
     # Core Risk Management
     "RiskManager",

@@ -95,9 +95,7 @@ class FakeVerifiedExecutionJournalAuthority:
             "cause_id": proof.cause_id,
             "claim_digest": proof.claim_digest,
             "evidence_class": proof.evidence_class,
-            "revision": proof.journal_revision
-            if current_revision is None
-            else current_revision,
+            "revision": proof.journal_revision if current_revision is None else current_revision,
             "attempts": proof.dispatch_attempt_count if attempts is None else attempts,
             "reconciliation_sha256": proof.reconciliation_evidence_sha256,
             "writer_fence_sha256": proof.writer_fence_sha256,
@@ -135,18 +133,14 @@ class FakeVerifiedExecutionJournalAuthority:
                     row["evidence_class"] is proof.evidence_class,
                     row["revision"] == proof.journal_revision,
                     row["attempts"] == proof.dispatch_attempt_count == 1,
-                    row["reconciliation_sha256"]
-                    == proof.reconciliation_evidence_sha256,
+                    row["reconciliation_sha256"] == proof.reconciliation_evidence_sha256,
                     row["writer_fence_sha256"] == proof.writer_fence_sha256,
                     row["filled_quantity"] == proof.filled_quantity == 0,
                     row["trade_count"] == proof.trade_count == 0,
                 )
             )
             if valid and type(proof) is DispatchTerminalProof:
-                valid = (
-                    row["kind"] == "terminal"
-                    and row["terminal_state"] is proof.terminal_state
-                )
+                valid = row["kind"] == "terminal" and row["terminal_state"] is proof.terminal_state
             elif valid and type(proof) is DispatchTrackedOrderProof:
                 valid = all(
                     (
@@ -155,8 +149,7 @@ class FakeVerifiedExecutionJournalAuthority:
                         row["provider_order_id"] == proof.provider_order_id,
                         row["accepted_request_sha256"] == proof.accepted_request_sha256,
                         row["exposure_reservation_id"] == proof.exposure_reservation_id,
-                        row["exposure_reservation_sha256"]
-                        == proof.exposure_reservation_sha256,
+                        row["exposure_reservation_sha256"] == proof.exposure_reservation_sha256,
                     )
                 )
             if valid is True:
@@ -207,9 +200,7 @@ class TamperedReceiptJournalAuthority:
 
 
 def _claimed_gate(tmp_path, scope, policy, authority=None, name="resolve"):
-    gate = DurableRiskGate(
-        tmp_path / f"{name}.db", policy, execution_journal_authority=authority
-    )
+    gate = DurableRiskGate(tmp_path / f"{name}.db", policy, execution_journal_authority=authority)
     intent = make_intent(scope, name)
     permit = gate.reserve(intent)
     gate.claim_for_dispatch(permit.permit_id, intent)
@@ -301,12 +292,8 @@ def test_freeze_blocks_increase_but_not_cancel_or_reduce(
         gate.reserve(make_intent(scope, "open", IntentAction.INCREASE))
     assert error.value.code == "FROZEN"
 
-    cancel = gate.reserve(
-        make_intent(scope, "cancel", IntentAction.CANCEL, notional="0")
-    )
-    reduce = gate.reserve(
-        make_intent(scope, "reduce", IntentAction.REDUCE, notional="0")
-    )
+    cancel = gate.reserve(make_intent(scope, "cancel", IntentAction.CANCEL, notional="0"))
+    reduce = gate.reserve(make_intent(scope, "reduce", IntentAction.REDUCE, notional="0"))
     assert cancel.action is IntentAction.CANCEL
     assert reduce.action is IntentAction.REDUCE
 
@@ -389,9 +376,7 @@ def test_dispatch_claimed_permit_cannot_be_released(tmp_path, scope, policy):
     assert snapshot["increase_notional"] == Decimal("40")
 
 
-def test_ensure_settled_requires_exact_dispatch_claim_and_keeps_latch(
-    tmp_path, scope, policy
-):
+def test_ensure_settled_requires_exact_dispatch_claim_and_keeps_latch(tmp_path, scope, policy):
     gate = DurableRiskGate(tmp_path / "risk.db", policy)
     intent = make_intent(scope, "ensure-settled")
     permit = gate.reserve(intent)
@@ -430,9 +415,7 @@ def test_dispatch_claim_is_single_use_and_duplicate_does_not_create_permission(
 def test_dispatch_resolution_requires_injected_authority_and_exact_no_fill_proof(
     tmp_path, scope, policy
 ):
-    gate, _, permit, binding = _claimed_gate(
-        tmp_path, scope, policy, name="no-authority"
-    )
+    gate, _, permit, binding = _claimed_gate(tmp_path, scope, policy, name="no-authority")
     proof = _terminal_proof(binding)
 
     with pytest.raises(PermitInvalidError) as missing:
@@ -506,9 +489,9 @@ def test_exact_terminal_proof_clears_only_matching_latch_and_releases_no_fill_ca
     assert gate.active_freeze_reasons(scope) == []
     assert gate.snapshot(scope)["increase_count"] == 0
     assert gate.snapshot(scope)["increase_notional"] == Decimal("0")
-    assert gate.reserve(
-        make_intent(scope, "after-no-fill", notional="100")
-    ).notional == Decimal("100")
+    assert gate.reserve(make_intent(scope, "after-no-fill", notional="100")).notional == Decimal(
+        "100"
+    )
 
 
 def test_acked_tracked_proof_clears_uncertainty_but_keeps_risk_capacity_reserved(
@@ -585,9 +568,7 @@ def test_dispatch_proof_unknown_stale_or_duplicate_attempt_stays_frozen(
     tmp_path, scope, policy, case
 ):
     authority = FakeVerifiedExecutionJournalAuthority()
-    gate, _, _, binding = _claimed_gate(
-        tmp_path, scope, policy, authority, name="invalid-" + case
-    )
+    gate, _, _, binding = _claimed_gate(tmp_path, scope, policy, authority, name="invalid-" + case)
     if case == "duplicate-attempt":
         with pytest.raises(ValueError, match="exactly one dispatch attempt"):
             _terminal_proof(binding, dispatch_attempt_count=2)
@@ -609,9 +590,7 @@ def test_dispatch_proof_rejects_fills_unknown_state_and_simulation_ctp_scope(
     tmp_path, scope, policy
 ):
     authority = FakeVerifiedExecutionJournalAuthority()
-    gate, _, _, binding = _claimed_gate(
-        tmp_path, scope, policy, authority, name="invalid-fill"
-    )
+    gate, _, _, binding = _claimed_gate(tmp_path, scope, policy, authority, name="invalid-fill")
     with pytest.raises(ValueError, match="zero filled quantity"):
         _terminal_proof(binding, filled_quantity=1)
     with pytest.raises(ValueError):
@@ -623,9 +602,7 @@ def test_dispatch_proof_rejects_fills_unknown_state_and_simulation_ctp_scope(
             evidence_class=DispatchEvidenceClass.SIMULATION_JOURNAL,
         )
     with pytest.raises(ValueError, match="fake or fixture"):
-        _terminal_proof(
-            binding, evidence_class=DispatchEvidenceClass.NATIVE_PROVIDER_JOURNAL
-        )
+        _terminal_proof(binding, evidence_class=DispatchEvidenceClass.NATIVE_PROVIDER_JOURNAL)
 
     proof = _terminal_proof(binding)
     with pytest.raises(PermitInvalidError) as unknown:
@@ -636,9 +613,7 @@ def test_dispatch_proof_rejects_fills_unknown_state_and_simulation_ctp_scope(
 
 def test_dispatch_proof_replay_is_rejected_after_restart(tmp_path, scope, policy):
     authority = FakeVerifiedExecutionJournalAuthority()
-    gate, _, _, binding = _claimed_gate(
-        tmp_path, scope, policy, authority, name="proof-restart"
-    )
+    gate, _, _, binding = _claimed_gate(tmp_path, scope, policy, authority, name="proof-restart")
     proof = _terminal_proof(binding)
     authority.register(proof)
     gate.resolve_dispatch_freeze(proof)
@@ -655,9 +630,7 @@ def test_dispatch_proof_replay_is_rejected_after_restart(tmp_path, scope, policy
 
 def test_concurrent_duplicate_dispatch_proofs_commit_only_once(tmp_path, scope, policy):
     authority = FakeVerifiedExecutionJournalAuthority()
-    gate, _, _, binding = _claimed_gate(
-        tmp_path, scope, policy, authority, name="proof-concurrent"
-    )
+    gate, _, _, binding = _claimed_gate(tmp_path, scope, policy, authority, name="proof-concurrent")
     proof = _terminal_proof(binding)
     authority.register(proof)
     second_gate = DurableRiskGate(
@@ -686,15 +659,11 @@ def test_concurrent_duplicate_dispatch_proofs_commit_only_once(tmp_path, scope, 
     )
     assert gate.active_freeze_reasons(scope) == []
     with gate._connection() as connection:
-        count = connection.execute(
-            "SELECT COUNT(*) FROM risk_dispatch_resolutions"
-        ).fetchone()[0]
+        count = connection.execute("SELECT COUNT(*) FROM risk_dispatch_resolutions").fetchone()[0]
     assert count == 1
 
 
-def test_dispatch_latch_namespace_cannot_be_created_or_cleared_generically(
-    tmp_path, scope, policy
-):
+def test_dispatch_latch_namespace_cannot_be_created_or_cleared_generically(tmp_path, scope, policy):
     gate = DurableRiskGate(tmp_path / "risk.db", policy)
     with pytest.raises(ValueError, match="reserved"):
         gate.freeze(scope, "dispatch-inflight:forged", "forged reason")
@@ -740,9 +709,7 @@ def test_foreign_keys_are_enabled_on_every_connection(tmp_path, scope, policy):
             )
 
 
-@pytest.mark.parametrize(
-    "value", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity"), True]
-)
+@pytest.mark.parametrize("value", [Decimal("NaN"), Decimal("Infinity"), Decimal("-Infinity"), True])
 def test_nonfinite_and_boolean_amounts_are_not_risk_limits_or_intents(value, scope):
     with pytest.raises(ValueError):
         RiskPolicy("unsafe", value, 1)
@@ -762,9 +729,7 @@ def test_permit_expiry_must_be_finite(ttl):
         RiskPolicy("unsafe", Decimal("100"), 1, ttl)
 
 
-def test_exact_retry_after_freeze_does_not_return_an_admitted_increase(
-    tmp_path, scope, policy
-):
+def test_exact_retry_after_freeze_does_not_return_an_admitted_increase(tmp_path, scope, policy):
     gate = DurableRiskGate(tmp_path / "risk.db", policy)
     intent = make_intent(scope, "same")
     gate.reserve(intent)
@@ -777,9 +742,7 @@ def test_exact_retry_after_freeze_does_not_return_an_admitted_increase(
     assert gate.active_freeze_reasons(scope) == ["operator hold"]
 
 
-def test_concurrent_connections_cannot_oversubscribe_account_budget(
-    tmp_path, scope, policy
-):
+def test_concurrent_connections_cannot_oversubscribe_account_budget(tmp_path, scope, policy):
     database = tmp_path / "risk.db"
     gates = [DurableRiskGate(database, policy), DurableRiskGate(database, policy)]
     barrier = Barrier(8)
@@ -827,9 +790,7 @@ def test_risk_payload_binding_is_immutable(scope):
     with pytest.raises(FrozenInstanceError):
         intent.payload_fingerprint = "changed"
     with pytest.raises(ValueError, match="immutable"):
-        RiskIntent(
-            "mutable", scope, IntentAction.INCREASE, Decimal("1"), {"quantity": 1}
-        )
+        RiskIntent("mutable", scope, IntentAction.INCREASE, Decimal("1"), {"quantity": 1})
     assert intent.fingerprint == fingerprint
 
 
@@ -873,9 +834,7 @@ else:
     assert gate.snapshot(scope)["increase_notional"] == Decimal("80")
 
 
-def test_atomic_dispatch_claim_fences_two_prevalidated_processes(
-    tmp_path, scope, policy
-):
+def test_atomic_dispatch_claim_fences_two_prevalidated_processes(tmp_path, scope, policy):
     """A check-then-freeze race must admit at most one provider boundary.
 
     Both permits are intentionally reserved before either child begins.  The
@@ -944,9 +903,7 @@ else:
     }
 
 
-def _allocation_policy(
-    *, account_limit: str = "1000", count_limit: int = 20
-) -> RiskPolicy:
+def _allocation_policy(*, account_limit: str = "1000", count_limit: int = 20) -> RiskPolicy:
     return RiskPolicy(
         "allocation-policy",
         Decimal(account_limit),
@@ -987,9 +944,7 @@ def test_account_and_strategy_allowance_have_distinct_exhaustion_codes(tmp_path,
     account_gate = DurableRiskGate(
         tmp_path / "account-budget.db", _allocation_policy(account_limit="50")
     )
-    account_gate.set_strategy_allocation(
-        scope, "strategy-1", "v1", max_notional=Decimal("100")
-    )
+    account_gate.set_strategy_allocation(scope, "strategy-1", "v1", max_notional=Decimal("100"))
     account_gate.reserve(_allocation_intent(scope, "account-used", notional="40"))
     with pytest.raises(RiskDeniedError) as account_exhausted:
         account_gate.reserve(_allocation_intent(scope, "account-over", notional="20"))
@@ -998,9 +953,7 @@ def test_account_and_strategy_allowance_have_distinct_exhaustion_codes(tmp_path,
     strategy_gate = DurableRiskGate(
         tmp_path / "strategy-budget.db", _allocation_policy(account_limit="1000")
     )
-    strategy_gate.set_strategy_allocation(
-        scope, "strategy-1", "v1", max_notional=Decimal("50")
-    )
+    strategy_gate.set_strategy_allocation(scope, "strategy-1", "v1", max_notional=Decimal("50"))
     strategy_gate.reserve(_allocation_intent(scope, "strategy-used", notional="40"))
     with pytest.raises(RiskDeniedError) as strategy_exhausted:
         strategy_gate.reserve(_allocation_intent(scope, "strategy-over", notional="20"))
@@ -1126,9 +1079,7 @@ else:
     assert gate.snapshot(scope)["increase_notional"] == Decimal("600")
 
 
-def test_allocation_revision_invalidates_old_permit_and_never_reuses_version(
-    tmp_path, scope
-):
+def test_allocation_revision_invalidates_old_permit_and_never_reuses_version(tmp_path, scope):
     gate = DurableRiskGate(tmp_path / "allocation-revision.db", _allocation_policy())
     gate.set_strategy_allocation(
         scope,
@@ -1139,9 +1090,7 @@ def test_allocation_revision_invalidates_old_permit_and_never_reuses_version(
         position_instrument="fixture/contract",
         position_unit="contract",
     )
-    old_intent = _allocation_intent(
-        scope, "old-permit", notional="30", quantity="3", version="v1"
-    )
+    old_intent = _allocation_intent(scope, "old-permit", notional="30", quantity="3", version="v1")
     old_permit = gate.reserve(old_intent)
     gate.set_strategy_allocation(
         scope,
@@ -1159,9 +1108,7 @@ def test_allocation_revision_invalidates_old_permit_and_never_reuses_version(
     # Old-version reservation still counts against the aggregate allowance.
     with pytest.raises(RiskDeniedError) as exhausted:
         gate.reserve(
-            _allocation_intent(
-                scope, "new-too-much", notional="1", quantity="3", version="v2"
-            )
+            _allocation_intent(scope, "new-too-much", notional="1", quantity="3", version="v2")
         )
     assert exhausted.value.code == "STRATEGY_ALLOCATION_EXHAUSTED"
 
@@ -1185,14 +1132,10 @@ def test_allocation_revision_invalidates_old_permit_and_never_reuses_version(
             position_unit="contract",
         )
     with pytest.raises(ValueError, match="changed limits"):
-        gate.set_strategy_allocation(
-            scope, "strategy-1", "v2", max_notional=Decimal("99")
-        )
+        gate.set_strategy_allocation(scope, "strategy-1", "v2", max_notional=Decimal("99"))
 
 
-def test_lowered_position_cap_keeps_old_reservations_and_reduce_does_not_release(
-    tmp_path, scope
-):
+def test_lowered_position_cap_keeps_old_reservations_and_reduce_does_not_release(tmp_path, scope):
     gate = DurableRiskGate(tmp_path / "lowered-position.db", _allocation_policy())
     gate.set_strategy_allocation(
         scope,
@@ -1204,9 +1147,7 @@ def test_lowered_position_cap_keeps_old_reservations_and_reduce_does_not_release
         position_unit="contract",
     )
     gate.reserve(_allocation_intent(scope, "held", notional="30", quantity="3"))
-    gate.reserve(
-        _allocation_intent(scope, "reduce", notional="0", action=IntentAction.REDUCE)
-    )
+    gate.reserve(_allocation_intent(scope, "reduce", notional="0", action=IntentAction.REDUCE))
     gate.set_strategy_allocation(
         scope,
         "strategy-1",
@@ -1218,9 +1159,7 @@ def test_lowered_position_cap_keeps_old_reservations_and_reduce_does_not_release
     )
     with pytest.raises(RiskDeniedError) as exhausted:
         gate.reserve(
-            _allocation_intent(
-                scope, "still-full", notional="1", quantity="0.1", version="v2"
-            )
+            _allocation_intent(scope, "still-full", notional="1", quantity="0.1", version="v2")
         )
     assert exhausted.value.code == "STRATEGY_ALLOCATION_EXHAUSTED"
 
@@ -1325,9 +1264,7 @@ def test_failed_allocation_revision_rolls_back_its_version_number(tmp_path, scop
                BEGIN SELECT RAISE(ABORT, 'forced allocation failure'); END"""
         )
     with pytest.raises(sqlite3.IntegrityError, match="forced allocation failure"):
-        gate.set_strategy_allocation(
-            scope, "strategy-1", "v1", max_notional=Decimal("100")
-        )
+        gate.set_strategy_allocation(scope, "strategy-1", "v1", max_notional=Decimal("100"))
     with sqlite3.connect(database) as connection:
         connection.execute("DROP TRIGGER reject_strategy_revision")
     gate.set_strategy_allocation(scope, "strategy-1", "v1", max_notional=Decimal("100"))
@@ -1339,9 +1276,7 @@ def test_different_gate_policies_and_legacy_unit_rows_cannot_reinterpret_usage(
 ):
     database = tmp_path / "policy-unit-change.db"
     legacy_gate = DurableRiskGate(database, policy)
-    legacy_permit = legacy_gate.reserve(
-        make_intent(scope, "legacy-unknown-unit", notional="10")
-    )
+    legacy_permit = legacy_gate.reserve(make_intent(scope, "legacy-unknown-unit", notional="10"))
 
     required_cny = RiskPolicy(
         "allocation-cny",
@@ -1353,9 +1288,7 @@ def test_different_gate_policies_and_legacy_unit_rows_cannot_reinterpret_usage(
     )
     cny_gate = DurableRiskGate(database, required_cny)
     with pytest.raises(RiskDeniedError) as no_strategy_mapping:
-        cny_gate.set_strategy_allocation(
-            scope, "strategy-1", "v1", max_notional=Decimal("100")
-        )
+        cny_gate.set_strategy_allocation(scope, "strategy-1", "v1", max_notional=Decimal("100"))
     assert no_strategy_mapping.value.code == "RISK_POLICY_BINDING_MISMATCH"
     with pytest.raises(PermitInvalidError) as policy_changed:
         cny_gate.validate_permit(legacy_permit.permit_id)
@@ -1370,9 +1303,7 @@ def test_different_gate_policies_and_legacy_unit_rows_cannot_reinterpret_usage(
 
     isolated_database = tmp_path / "two-policy-views.db"
     cny_gate = DurableRiskGate(isolated_database, required_cny)
-    cny_gate.set_strategy_allocation(
-        scope, "strategy-1", "v1", max_notional=Decimal("100")
-    )
+    cny_gate.set_strategy_allocation(scope, "strategy-1", "v1", max_notional=Decimal("100"))
     cny_intent = RiskIntent(
         "cny-open",
         scope,
@@ -1393,18 +1324,14 @@ def test_different_gate_policies_and_legacy_unit_rows_cannot_reinterpret_usage(
         usd_gate.validate_permit(cny_permit.permit_id)
     assert old_policy_permit.value.code == "POLICY_CHANGED"
     with pytest.raises(RiskDeniedError) as allocation_policy_drift:
-        usd_gate.set_strategy_allocation(
-            scope, "strategy-1", "v1", max_notional=Decimal("100")
-        )
+        usd_gate.set_strategy_allocation(scope, "strategy-1", "v1", max_notional=Decimal("100"))
     assert allocation_policy_drift.value.code == "RISK_POLICY_BINDING_MISMATCH"
     with pytest.raises(RiskDeniedError) as mixed_account_ledger:
         usd_gate.reserve(_allocation_intent(scope, "usd-open", notional="1"))
     assert mixed_account_ledger.value.code == "RISK_POLICY_BINDING_MISMATCH"
 
 
-def test_account_policy_binding_rejects_cap_toggle_and_missing_unit_drift(
-    tmp_path, scope
-):
+def test_account_policy_binding_rejects_cap_toggle_and_missing_unit_drift(tmp_path, scope):
     database = tmp_path / "policy-binding.db"
     strict = DurableRiskGate(database, _allocation_policy(account_limit="100"))
     strict.set_strategy_allocation(
@@ -1433,9 +1360,7 @@ def test_account_policy_binding_rejects_cap_toggle_and_missing_unit_drift(
         drifted.reserve(make_intent(scope, "policy-bypass-wide", notional="900"))
     assert widened_cap.value.code == "RISK_POLICY_BINDING_MISMATCH"
     with pytest.raises(RiskDeniedError) as changed_allocation:
-        drifted.set_strategy_allocation(
-            scope, "strategy-1", "v2", max_notional=Decimal("1000")
-        )
+        drifted.set_strategy_allocation(scope, "strategy-1", "v2", max_notional=Decimal("1000"))
     assert changed_allocation.value.code == "RISK_POLICY_BINDING_MISMATCH"
     snapshot = drifted.get_strategy_allocation(scope, "strategy-1")
     assert snapshot.available_notional is None
@@ -1509,9 +1434,7 @@ def test_allocation_update_and_dispatch_claim_are_serialized(tmp_path, scope):
     def update() -> str:
         barrier.wait(timeout=5)
         try:
-            gate.set_strategy_allocation(
-                scope, "strategy-1", "v2", max_notional=Decimal("100")
-            )
+            gate.set_strategy_allocation(scope, "strategy-1", "v2", max_notional=Decimal("100"))
             return "updated"
         except RiskDeniedError as error:
             return error.code
