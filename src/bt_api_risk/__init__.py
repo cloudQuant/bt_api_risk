@@ -28,6 +28,8 @@ Intelligent Risk Management and Compliance Monitoring System for 73+ exchanges.
 
 from __future__ import annotations
 
+from importlib import import_module
+
 from .containers.risk_events import RiskEvent, RiskEventType, RiskLevel
 from .containers.risk_metrics import RiskMetrics
 from .core.admission import (
@@ -58,10 +60,28 @@ from .core.instrument import (
     InstrumentRiskOrder,
     InstrumentRiskRegistry,
 )
-from .core.risk_assessor import RiskAssessor
-from .core.risk_manager import RiskManager
-from .ml_models.anomaly_detector import AnomalyDetector
-from .ml_models.ensemble_model import RiskEnsembleModel
+
+_ANALYSIS_EXPORTS = {
+    "RiskAssessor": ".core.risk_assessor",
+    "RiskManager": ".core.risk_manager",
+    "AnomalyDetector": ".ml_models.anomaly_detector",
+    "RiskEnsembleModel": ".ml_models.ensemble_model",
+}
+
+
+def __getattr__(name: str):
+    """Load analytical features only when explicitly requested by the caller."""
+    module = _ANALYSIS_EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module, __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Keep the established public exports discoverable without loading them."""
+    return sorted(set(globals()) | set(__all__))
 
 __all__ = [
     # Core Risk Management

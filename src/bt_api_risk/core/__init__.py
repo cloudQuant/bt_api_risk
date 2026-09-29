@@ -5,6 +5,8 @@
 
 from __future__ import annotations
 
+from importlib import import_module
+
 from .admission import (
     AccountScope,
     DispatchClaimBinding,
@@ -33,11 +35,29 @@ from .instrument import (
     InstrumentRiskOrder,
     InstrumentRiskRegistry,
 )
-from .limits_manager import LimitsManager
-from .policy_engine import PolicyEngine
-from .risk_assessor import RiskAssessor
-from .risk_calculator import RiskCalculator
-from .risk_manager import RiskManager
+
+_ANALYSIS_EXPORTS = {
+    "LimitsManager": ".limits_manager",
+    "PolicyEngine": ".policy_engine",
+    "RiskAssessor": ".risk_assessor",
+    "RiskCalculator": ".risk_calculator",
+    "RiskManager": ".risk_manager",
+}
+
+
+def __getattr__(name: str):
+    """Keep deterministic admission independent of analytical imports."""
+    module = _ANALYSIS_EXPORTS.get(name)
+    if module is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    value = getattr(import_module(module, __name__), name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Expose lazy public names to introspection without importing features."""
+    return sorted(set(globals()) | set(__all__))
 
 __all__ = [
     "RiskManager",
