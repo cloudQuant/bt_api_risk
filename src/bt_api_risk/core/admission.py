@@ -300,6 +300,28 @@ class StrategyAllocationSnapshot:
     reason: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
 
 
+class FreezeResolutionStatus(str, Enum):
+    """Result of resolving one exact ordinary freeze cause."""
+
+    CLEARED = "CLEARED"
+    ALREADY_RESOLVED = "ALREADY_RESOLVED"
+    NOT_FOUND = "NOT_FOUND"
+
+
+@dataclass(frozen=True)
+class FreezeResolution:
+    """Typed outcome and same-scope postcondition for exact freeze resolution."""
+
+    status: FreezeResolutionStatus
+    has_other_active_freezes: bool
+
+    def __post_init__(self) -> None:
+        if type(self.status) is not FreezeResolutionStatus:
+            raise ValueError("status must be a FreezeResolutionStatus")
+        if type(self.has_other_active_freezes) is not bool:
+            raise ValueError("has_other_active_freezes must be a boolean")
+
+
 class DispatchTerminalState(str, Enum):
     """Only no-fill terminal outcomes that can release a dispatch latch."""
 
@@ -1577,6 +1599,58 @@ class DurableRiskGate:
                 WHERE scope_key = ? AND cause_id = ?
                 """,
                 (self._clock(), scope.key, cause_id),
+            )
+
+    def resolve_freeze_exact(self, scope: AccountScope, cause_id: str) -> FreezeResolution:
+        """Resolve one exact ordinary cause and report remaining scope freezes.
+
+        Unlike :meth:`resolve_freeze`, this method distinguishes an active
+        cause, an existing already-resolved cause, and a cause that was never
+        recorded. The transition and remaining-freeze check share one write
+        transaction, so callers can reconcile a lost acknowledgement without
+        inferring identity from a reason string or a separate read.
+        Dispatch-inflight causes remain reserved for typed journal proofs.
+        """
+        if not isinstance(scope, AccountScope):
+            raise ValueError("scope must be an AccountScope")
+        if not isinstance(cause_id, str) or not cause_id.strip():
+            raise ValueError("cause_id is required")
+        if self._is_dispatch_freeze_cause(cause_id):
+            raise PermitInvalidError(
+                "DISPATCH_FREEZE_REQUIRES_RECONCILIATION",
+                "a dispatch-inflight freeze cannot be cleared by the generic resolver",
+            )
+
+        with self._transaction() as connection:
+            self._ensure_policy_binding(connection, scope.key)
+            row = connection.execute(
+                "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+                (scope.key, cause_id),
+            ).fetchone()
+            if row is None:
+                status = FreezeResolutionStatus.NOT_FOUND
+            elif row["active"] == 1:
+                updated = connection.execute(
+                    """UPDATE risk_freezes SET active = 0, updated_at = ?
+                       WHERE scope_key = ? AND cause_id = ? AND active = 1""",
+                    (self._clock(), scope.key, cause_id),
+                )
+                if updated.rowcount != 1:
+                    raise RiskGateError("exact freeze resolution did not update one row")
+                status = FreezeResolutionStatus.CLEARED
+            elif row["active"] == 0:
+                status = FreezeResolutionStatus.ALREADY_RESOLVED
+            else:
+                raise RiskGateError("persisted freeze active state is invalid")
+
+            other_active = connection.execute(
+                """SELECT 1 FROM risk_freezes
+                   WHERE scope_key = ? AND cause_id <> ? AND active = 1 LIMIT 1""",
+                (scope.key, cause_id),
+            ).fetchone()
+            return FreezeResolution(
+                status=status,
+                has_other_active_freezes=other_active is not None,
             )
 
     @staticmethod
