@@ -2442,6 +2442,7 @@ class DurableRiskGate:
         now = self._clock()
         live_gross = self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS
         with self._transaction() as connection:
+            self._assert_current_instrument_facts(intent)
             if live_gross:
                 # BEGIN IMMEDIATE can wait behind another process.  LIVE_GROSS
                 # freshness is checked at the point where this transaction
@@ -2469,6 +2470,7 @@ class DurableRiskGate:
                         self._expire_active(connection, final_now)
                         self._existing_permit_or_raise(existing, intent, final_now)
                         self._assert_live_gross_limits(connection, intent, include_intent=False)
+                self._assert_current_instrument_facts(intent)
                 return permit
 
             if intent.action is IntentAction.UNKNOWN_EFFECT:
@@ -2502,6 +2504,7 @@ class DurableRiskGate:
                 quantity_unit=intent.quantity_unit,
                 notional_unit=intent.notional_unit,
             )
+            self._assert_current_instrument_facts(intent)
             connection.execute(
                 """
                 INSERT INTO risk_reservations (
@@ -2549,6 +2552,7 @@ class DurableRiskGate:
                         "INTENT_EXPIRED", "permit TTL elapsed before LIVE_GROSS admission committed"
                     )
                 self._assert_live_gross_limits(connection, intent, include_intent=False)
+            self._assert_current_instrument_facts(intent)
             return permit
 
     def reserve_group_vector(
@@ -3916,6 +3920,7 @@ class DurableRiskGate:
         now = self._clock()
         live_gross = self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS
         with self._transaction() as connection:
+            self._assert_current_instrument_facts(intent, invalid=True)
             if live_gross:
                 now = self._clock()
             reservation_row = connection.execute(
@@ -3970,6 +3975,7 @@ class DurableRiskGate:
                         )
                     self._assert_not_frozen(connection, permit.scope)
                     self._assert_live_gross_limits(connection, intent, include_intent=False)
+            self._assert_current_instrument_facts(intent, invalid=True)
             connection.execute(
                 """
                 INSERT INTO risk_dispatch_claims (
@@ -3986,6 +3992,7 @@ class DurableRiskGate:
                 ),
             )
             self._freeze_in_transaction(connection, permit.scope, cause_id, cause_id, now)
+            self._assert_current_instrument_facts(intent, invalid=True)
             if live_gross and permit.action is IntentAction.INCREASE:
                 commit_now = self._clock()
                 if permit.expires_at <= commit_now:
@@ -3993,6 +4000,11 @@ class DurableRiskGate:
                         "PERMIT_NOT_ACTIVE", "permit expired before dispatch claim committed"
                     )
                 self._assert_live_gross_limits(connection, intent, include_intent=False)
+            # The LIVE_GROSS scan can take long enough for the instrument or
+            # FX interval to expire.  Keep this check at the end of the write
+            # transaction so an expired fact cannot authorize a committed
+            # dispatch claim.
+            self._assert_current_instrument_facts(intent, invalid=True)
             return permit
 
     def dispatch_claim_binding(self, permit_id: str) -> DispatchClaimBinding:
@@ -6259,6 +6271,57 @@ class DurableRiskGate:
             raise RiskDeniedError(
                 "GROUP_INVALID_LEG", "child order does not carry trusted bounded risk facts"
             ) from exc
+
+    @staticmethod
+    def _assert_instrument_facts(
+        intent: RiskIntent,
+        now_ns: int,
+        *,
+        invalid: bool = False,
+    ) -> None:
+        """Recheck an optional trusted instrument-fact interval at a write cut."""
+
+        if intent.action is not IntentAction.INCREASE:
+            return
+        observed_at_ns = intent.instrument_facts_observed_at_ns
+        valid_until_ns = intent.instrument_facts_valid_until_ns
+        if observed_at_ns is None and valid_until_ns is None:
+            return
+        error_type = PermitInvalidError if invalid else RiskDeniedError
+        if (
+            type(observed_at_ns) is not int
+            or type(valid_until_ns) is not int
+            or observed_at_ns <= 0
+            or valid_until_ns <= observed_at_ns
+        ):
+            raise error_type(
+                "INSTRUMENT_FACTS_UNPROVEN",
+                "instrument admission lacks a valid trusted facts interval",
+            )
+        if not observed_at_ns <= now_ns < valid_until_ns:
+            raise error_type(
+                "INSTRUMENT_FACTS_STALE",
+                "instrument facts are not current at the Risk transaction boundary",
+            )
+
+    def _assert_current_instrument_facts(
+        self,
+        intent: RiskIntent,
+        *,
+        invalid: bool = False,
+    ) -> None:
+        """Check only mapped opening intents that carry a bounded fact interval."""
+
+        if (
+            intent.action is not IntentAction.INCREASE
+        ):
+            return
+        if (
+            intent.instrument_facts_observed_at_ns is None
+            and intent.instrument_facts_valid_until_ns is None
+        ):
+            return
+        self._assert_instrument_facts(intent, self._now_ns(), invalid=invalid)
 
     @staticmethod
     def _assert_group_exposure_facts(

@@ -6,9 +6,15 @@ must reserve against the current allocation revision before dispatch.
 
 from decimal import Decimal, localcontext
 from fractions import Fraction
+from typing import Optional
 
 from .core.admission import RiskDeniedError, StrategyAllocationSnapshot
-from .core.instrument import InstrumentRiskOrder, InstrumentRiskRegistry, _precision
+from .core.instrument import (
+    InstrumentRiskFxRate,
+    InstrumentRiskOrder,
+    InstrumentRiskRegistry,
+    _precision,
+)
 
 
 def size_for_strategy_allocation(
@@ -18,6 +24,7 @@ def size_for_strategy_allocation(
     instrument: str,
     limit_price: Decimal,
     now_ns: int,
+    fx_rate: Optional[InstrumentRiskFxRate] = None,  # noqa: UP045 -- Python 3.9.
 ) -> Decimal:
     """Suggest a quantity on the reviewed lattice within local notional budget.
 
@@ -75,6 +82,7 @@ def size_for_strategy_allocation(
             limit_price,
             metadata.metadata_version,
             metadata.digest,
+            fx_rate,
         )
 
     def assess(quantity):
@@ -90,6 +98,7 @@ def size_for_strategy_allocation(
                 metadata.taker_fee_bps,
                 metadata.fixed_fee,
                 metadata.max_slippage_bps,
+                Decimal("1") if fx_rate is None else fx_rate.rate,
             )
             return registry.assess(request, now_ns)
 
@@ -106,11 +115,12 @@ def size_for_strategy_allocation(
     # precision. Reuse the assessor's computed costs instead of a second
     # price/fee formula that can drift from the writer's risk calculation.
     budget = min(budget, metadata.max_gross_notional)
-    variable = Fraction(assessment.gross_notional) - Fraction(metadata.fixed_fee)
+    fixed_fee = assessment.fixed_fee_in_valuation_unit
+    variable = Fraction(assessment.gross_notional) - Fraction(fixed_fee)
     if variable <= 0:
         raise ValueError("instrument assessment has no positive variable cost")
     lots = int(
-        (Fraction(budget) - Fraction(metadata.fixed_fee))
+        (Fraction(budget) - Fraction(fixed_fee))
         * Fraction(probe_quantity)
         / variable
         / Fraction(metadata.quantity_step)

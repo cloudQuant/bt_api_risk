@@ -148,9 +148,13 @@ def _ceil_to_lattice(value: Decimal, step: Decimal) -> Decimal:
 class InstrumentRiskMetadata:
     """Reviewed, time-bounded instrument facts used before a provider write.
 
-    ``max_gross_notional`` is intentionally fee-inclusive.  It limits the
-    calculation returned by :class:`InstrumentRiskAssessment`, which includes
-    a conservative adverse price envelope and estimated taker/fixed fees.
+    ``max_gross_notional`` is intentionally fee-inclusive and is denominated
+    in ``valuation_unit`` when one is supplied.  It limits the calculation
+    returned by :class:`InstrumentRiskAssessment`, which includes a
+    conservative adverse price envelope and estimated taker/fixed fees.
+    ``fixed_fee_unit`` names the denomination of ``fixed_fee``.  Historical
+    same-currency records may omit it; cross-currency records with a nonzero
+    fixed fee must state either the quote or valuation unit explicitly.
     The class is provider-neutral; a deployment must obtain and review these
     values through its own trusted metadata path before it can construct one.
     """
@@ -174,6 +178,9 @@ class InstrumentRiskMetadata:
     max_slippage_bps: Decimal = Decimal("0")
     quantity_unit: Optional[str] = None  # noqa: UP045 -- package supports Python 3.9.
     valuation_unit: Optional[str] = None  # noqa: UP045 -- package supports Python 3.9.
+    quote_currency: Optional[str] = None  # noqa: UP045 -- package supports Python 3.9.
+    fx_source_ref: Optional[str] = None  # noqa: UP045 -- package supports Python 3.9.
+    fixed_fee_unit: Optional[str] = None  # noqa: UP045 -- package supports Python 3.9.
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -228,6 +235,39 @@ class InstrumentRiskMetadata:
             or not _NOTIONAL_UNIT.fullmatch(self.valuation_unit)
         ):
             raise ValueError("valuation_unit must be a canonical uppercase unit code")
+        if self.quote_currency is not None and (
+            not isinstance(self.quote_currency, str)
+            or not _NOTIONAL_UNIT.fullmatch(self.quote_currency)
+        ):
+            raise ValueError("quote_currency must be a canonical uppercase unit code")
+        if self.quote_currency is not None and self.valuation_unit is None:
+            raise ValueError("quote_currency requires a valuation_unit")
+        cross_currency = (
+            self.quote_currency is not None
+            and self.valuation_unit is not None
+            and self.quote_currency != self.valuation_unit
+        )
+        if self.fx_source_ref is not None:
+            object.__setattr__(
+                self,
+                "fx_source_ref",
+                _identifier(self.fx_source_ref, "fx_source_ref"),
+            )
+        if cross_currency != (self.fx_source_ref is not None):
+            raise ValueError("cross-currency metadata requires exactly one fx_source_ref")
+        if self.fixed_fee_unit is not None:
+            if (
+                not isinstance(self.fixed_fee_unit, str)
+                or not _NOTIONAL_UNIT.fullmatch(self.fixed_fee_unit)
+            ):
+                raise ValueError("fixed_fee_unit must be a canonical uppercase unit code")
+            allowed_fee_units = {self.valuation_unit}
+            if self.quote_currency is not None:
+                allowed_fee_units.add(self.quote_currency)
+            if self.fixed_fee_unit not in allowed_fee_units:
+                raise ValueError("fixed_fee_unit must match the quote or valuation unit")
+        if cross_currency and self.fixed_fee > 0 and self.fixed_fee_unit is None:
+            raise ValueError("cross-currency fixed_fee requires an explicit fixed_fee_unit")
         if (
             self.min_quantity is not None
             and self.max_quantity is not None
@@ -258,11 +298,91 @@ class InstrumentRiskMetadata:
             payload["quantity_unit"] = self.quantity_unit
         if self.valuation_unit is not None:
             payload["valuation_unit"] = self.valuation_unit
+        if self.quote_currency is not None:
+            payload["quote_currency"] = self.quote_currency
+        if self.fx_source_ref is not None:
+            payload["fx_source_ref"] = self.fx_source_ref
+        if self.fixed_fee_unit is not None:
+            payload["fixed_fee_unit"] = self.fixed_fee_unit
         return payload
 
     @property
     def digest(self) -> str:
         """Return the exact trusted-metadata digest required in each intent."""
+
+        return _sha256(_canonical_json(self.to_payload()))
+
+
+@dataclass(frozen=True)
+class InstrumentRiskFxRate:
+    """One immutable, source-bound quote-to-valuation conversion fact.
+
+    ``rate`` is the amount of ``valuation_unit`` represented by one unit of
+    ``quote_currency``.  Source provenance is part of the canonical payload so
+    changing the provider record or revision changes the admission identity.
+    """
+
+    instrument: str
+    quote_currency: str
+    valuation_unit: str
+    rate: Decimal
+    observed_at_ns: int
+    valid_until_ns: int
+    source_ref: str
+    source_revision: str
+    source_record_sha256: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "instrument",
+            _identifier(self.instrument, "instrument", instrument=True),
+        )
+        for name in ("quote_currency", "valuation_unit"):
+            value = getattr(self, name)
+            if type(value) is not str or not _NOTIONAL_UNIT.fullmatch(value):
+                raise ValueError("invalid " + name)
+        if self.quote_currency == self.valuation_unit:
+            raise ValueError("FX facts are only valid for cross-currency pairs")
+        object.__setattr__(self, "rate", _decimal(self.rate, "rate", positive=True))
+        if type(self.observed_at_ns) is not int or self.observed_at_ns <= 0:
+            raise ValueError("invalid observed_at_ns")
+        if type(self.valid_until_ns) is not int or self.valid_until_ns <= self.observed_at_ns:
+            raise ValueError("invalid valid_until_ns")
+        object.__setattr__(self, "source_ref", _identifier(self.source_ref, "source_ref"))
+        object.__setattr__(
+            self,
+            "source_revision",
+            _identifier(self.source_revision, "source_revision"),
+        )
+        _digest(self.source_record_sha256, "source_record_sha256")
+
+    @property
+    def fx_pair(self) -> str:
+        """Return the canonical ``QUOTE/VALUATION`` pair."""
+
+        return self.quote_currency + "/" + self.valuation_unit
+
+    def to_payload(self) -> dict[str, object]:
+        """Return all immutable FX facts in their canonical wire form."""
+
+        return {
+            "fx_pair": self.fx_pair,
+            "instrument": self.instrument,
+            "observed_at_ns": self.observed_at_ns,
+            "quote_currency": self.quote_currency,
+            "rate": _decimal_text(self.rate),
+            "schema": "bt_api_risk.instrument-fx-rate.v1",
+            "source_record_sha256": self.source_record_sha256,
+            "source_ref": self.source_ref,
+            "source_revision": self.source_revision,
+            "valid_until_ns": self.valid_until_ns,
+            "valuation_unit": self.valuation_unit,
+        }
+
+    @property
+    def digest(self) -> str:
+        """Return the stable digest of the exact source-bound FX fact."""
 
         return _sha256(_canonical_json(self.to_payload()))
 
@@ -276,6 +396,7 @@ class InstrumentRiskOrder:
     limit_price: Optional[Decimal]  # noqa: UP045 -- package supports Python 3.9.
     metadata_version: str
     metadata_digest: str
+    fx_rate: Optional[InstrumentRiskFxRate] = None  # noqa: UP045 -- package supports Python 3.9.
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -298,11 +419,23 @@ class InstrumentRiskOrder:
         object.__setattr__(
             self, "metadata_digest", _digest(self.metadata_digest, "metadata_digest")
         )
+        if self.fx_rate is not None and (
+            type(self.fx_rate) is not InstrumentRiskFxRate
+            or self.fx_rate.instrument != self.instrument
+        ):
+            raise ValueError("FX facts must be an exact typed fact for the order instrument")
 
 
 @dataclass(frozen=True)
 class InstrumentRiskAssessment:
-    """One deterministic, fee-inclusive bound accepted by a trusted profile."""
+    """One deterministic, fee-inclusive bound accepted by a trusted profile.
+
+    For cross-currency assessments, ``quoted_notional`` and
+    ``worst_case_notional`` remain in the quote currency so price and tick
+    checks stay in the execution denomination. ``worst_case_fee`` and
+    ``gross_notional`` are in the valuation unit after applying the bound FX
+    fact. Same-currency assessments retain the historical unit and arithmetic.
+    """
 
     metadata: InstrumentRiskMetadata
     order: InstrumentRiskOrder
@@ -311,6 +444,7 @@ class InstrumentRiskAssessment:
     worst_case_notional: Decimal
     worst_case_fee: Decimal
     gross_notional: Decimal
+    fx_rate: Optional[InstrumentRiskFxRate] = None  # noqa: UP045 -- package supports Python 3.9.
 
     def __post_init__(self) -> None:
         if self.order.instrument != self.metadata.instrument:
@@ -327,8 +461,22 @@ class InstrumentRiskAssessment:
             "worst_case_fee",
             _decimal(self.worst_case_fee, "worst_case_fee", nonnegative=True),
         )
+        quote_currency = self.metadata.quote_currency or self.metadata.valuation_unit
+        cross_currency = (
+            quote_currency is not None
+            and self.metadata.valuation_unit is not None
+            and quote_currency != self.metadata.valuation_unit
+        )
+        if cross_currency:
+            if type(self.fx_rate) is not InstrumentRiskFxRate:
+                raise ValueError("cross-currency assessment requires typed FX facts")
+            _validate_fx_binding(self.metadata, self.order, self.fx_rate)
+        elif self.fx_rate is not None:
+            raise ValueError("same-currency assessment cannot carry FX facts")
+        conversion_rate = Decimal("1") if self.fx_rate is None else self.fx_rate.rate
         if Fraction(self.gross_notional) != (
-            Fraction(self.worst_case_notional) + Fraction(self.worst_case_fee)
+            Fraction(self.worst_case_notional) * Fraction(conversion_rate)
+            + Fraction(self.worst_case_fee)
         ):
             raise ValueError("gross_notional must equal worst_case_notional plus worst_case_fee")
 
@@ -336,20 +484,72 @@ class InstrumentRiskAssessment:
         """Bind trusted metadata and all risk amounts to an execution intent hash."""
 
         intent_fingerprint = _digest(intent_fingerprint, "intent_fingerprint")
-        return _sha256(
-            _canonical_json(
-                {
-                    "gross_notional": _decimal_text(self.gross_notional),
-                    "intent_fingerprint": intent_fingerprint,
-                    "metadata_digest": self.metadata.digest,
-                    "quoted_notional": _decimal_text(self.quoted_notional),
-                    "schema": _SCHEMA,
-                    "worst_case_fee": _decimal_text(self.worst_case_fee),
-                    "worst_case_notional": _decimal_text(self.worst_case_notional),
-                    "worst_case_price": _decimal_text(self.worst_case_price),
-                }
-            )
-        )
+        payload: dict[str, object] = {
+            "gross_notional": _decimal_text(self.gross_notional),
+            "intent_fingerprint": intent_fingerprint,
+            "metadata_digest": self.metadata.digest,
+            "quoted_notional": _decimal_text(self.quoted_notional),
+            "schema": _SCHEMA,
+            "worst_case_fee": _decimal_text(self.worst_case_fee),
+            "worst_case_notional": _decimal_text(self.worst_case_notional),
+            "worst_case_price": _decimal_text(self.worst_case_price),
+        }
+        # Omitting this key entirely preserves legacy same-currency fingerprints.
+        if self.fx_rate is not None:
+            payload["fx_rate"] = self.fx_rate.to_payload()
+            payload["fx_rate_sha256"] = self.fx_rate.digest
+        return _sha256(_canonical_json(payload))
+
+    @property
+    def fixed_fee_in_valuation_unit(self) -> Decimal:
+        """Return the assessed fixed fee converted to the account unit."""
+
+        fixed_fee = self.metadata.fixed_fee
+        if (
+            fixed_fee > 0
+            and self.fx_rate is not None
+            and self.metadata.fixed_fee_unit == self.fx_rate.quote_currency
+        ):
+            with localcontext() as context:
+                context.prec = _precision(fixed_fee, self.fx_rate.rate)
+                return fixed_fee * self.fx_rate.rate
+        return fixed_fee
+
+
+def _fx_binding_error(
+    metadata: InstrumentRiskMetadata,
+    order: InstrumentRiskOrder,
+    fx_rate: object,
+) -> Optional[str]:
+    """Return a stable denial code when a rate does not match trusted facts."""
+
+    if type(fx_rate) is not InstrumentRiskFxRate:
+        return "INSTRUMENT_FX_REQUIRED"
+    if order.instrument != metadata.instrument or fx_rate.instrument != metadata.instrument:
+        return "INSTRUMENT_FX_INSTRUMENT_MISMATCH"
+    if order.fx_rate is not fx_rate:
+        return "INSTRUMENT_FX_ORDER_MISMATCH"
+    if (
+        metadata.quote_currency is None
+        or metadata.valuation_unit is None
+        or fx_rate.quote_currency != metadata.quote_currency
+        or fx_rate.valuation_unit != metadata.valuation_unit
+        or fx_rate.fx_pair != metadata.quote_currency + "/" + metadata.valuation_unit
+    ):
+        return "INSTRUMENT_FX_PAIR_MISMATCH"
+    if fx_rate.source_ref != metadata.fx_source_ref:
+        return "INSTRUMENT_FX_SOURCE_MISMATCH"
+    return None
+
+
+def _validate_fx_binding(
+    metadata: InstrumentRiskMetadata,
+    order: InstrumentRiskOrder,
+    fx_rate: InstrumentRiskFxRate,
+) -> None:
+    code = _fx_binding_error(metadata, order, fx_rate)
+    if code is not None:
+        raise ValueError("FX fact does not match trusted metadata: " + code)
 
 
 class InstrumentRiskRegistry:
@@ -376,6 +576,36 @@ class InstrumentRiskRegistry:
         """Validate metadata/lattices and calculate the worst-case local bound."""
 
         metadata = self._metadata_for(order, now_ns, require_fresh=True)
+        quote_currency = metadata.quote_currency or metadata.valuation_unit
+        cross_currency = (
+            quote_currency is not None
+            and metadata.valuation_unit is not None
+            and quote_currency != metadata.valuation_unit
+        )
+        fx_rate = order.fx_rate
+        if cross_currency:
+            binding_error = _fx_binding_error(metadata, order, fx_rate)
+            if binding_error is not None:
+                raise RiskDeniedError(
+                    binding_error,
+                    "FX facts do not match the trusted instrument, pair, or source",
+                )
+            assert type(fx_rate) is InstrumentRiskFxRate
+            if not fx_rate.observed_at_ns <= now_ns < fx_rate.valid_until_ns:
+                raise RiskDeniedError(
+                    "INSTRUMENT_FX_STALE",
+                    "FX facts are not current at the Risk admission boundary",
+                )
+            if metadata.fixed_fee > 0 and metadata.fixed_fee_unit is None:
+                raise RiskDeniedError(
+                    "INSTRUMENT_FIXED_FEE_UNIT_UNPROVEN",
+                    "cross-currency fixed fees require an explicit currency unit",
+                )
+        elif fx_rate is not None:
+            raise RiskDeniedError(
+                "INSTRUMENT_FX_UNEXPECTED",
+                "FX facts are not applicable to this same-currency instrument",
+            )
         if order.limit_price is None:
             raise RiskDeniedError(
                 "INSTRUMENT_PRICE_UNPROVEN",
@@ -401,25 +631,42 @@ class InstrumentRiskRegistry:
                 "INSTRUMENT_MAX_QUANTITY", "order quantity exceeds the reviewed maximum"
             )
 
+        precision_values = (
+            order.quantity,
+            order.limit_price,
+            metadata.contract_multiplier,
+            metadata.taker_fee_bps,
+            metadata.fixed_fee,
+            metadata.max_slippage_bps,
+        )
+        if fx_rate is not None:
+            precision_values += (fx_rate.rate,)
         with localcontext() as context:
-            context.prec = _precision(
-                order.quantity,
-                order.limit_price,
-                metadata.contract_multiplier,
-                metadata.taker_fee_bps,
-                metadata.fixed_fee,
-                metadata.max_slippage_bps,
-            )
+            context.prec = _precision(*precision_values)
             adverse_price = order.limit_price * (
                 Decimal("1") + metadata.max_slippage_bps / _BPS_DENOMINATOR
             )
             worst_case_price = _ceil_to_lattice(adverse_price, metadata.tick_size)
             quoted_notional = order.quantity * order.limit_price * metadata.contract_multiplier
             worst_case_notional = order.quantity * worst_case_price * metadata.contract_multiplier
-            worst_case_fee = (
-                worst_case_notional * metadata.taker_fee_bps / _BPS_DENOMINATOR + metadata.fixed_fee
-            )
-            gross_notional = worst_case_notional + worst_case_fee
+            if fx_rate is None:
+                # Keep exact legacy arithmetic and fingerprints for same-unit
+                # instruments which predate explicit currency metadata.
+                worst_case_fee = (
+                    worst_case_notional * metadata.taker_fee_bps / _BPS_DENOMINATOR
+                    + metadata.fixed_fee
+                )
+                gross_notional = worst_case_notional + worst_case_fee
+            else:
+                variable_quote_fee = (
+                    worst_case_notional * metadata.taker_fee_bps / _BPS_DENOMINATOR
+                )
+                if metadata.fixed_fee_unit == fx_rate.quote_currency:
+                    fixed_fee_valuation = metadata.fixed_fee * fx_rate.rate
+                else:
+                    fixed_fee_valuation = metadata.fixed_fee
+                worst_case_fee = variable_quote_fee * fx_rate.rate + fixed_fee_valuation
+                gross_notional = worst_case_notional * fx_rate.rate + worst_case_fee
         if gross_notional > metadata.max_gross_notional:
             raise RiskDeniedError(
                 "INSTRUMENT_GROSS_NOTIONAL_LIMIT",
@@ -433,6 +680,7 @@ class InstrumentRiskRegistry:
             worst_case_notional=worst_case_notional,
             worst_case_fee=worst_case_fee,
             gross_notional=gross_notional,
+            fx_rate=fx_rate,
         )
 
     def validate_reduction(self, order: InstrumentRiskOrder, now_ns: int) -> InstrumentRiskMetadata:
@@ -519,6 +767,9 @@ class InstrumentRiskAdmissionMapper:
             Callable[[Any], Any]
         ] = None,
         wire_account_ref: Optional[str] = None,  # noqa: UP045 -- Python 3.9 is supported.
+        fx_rates_by_instrument: Optional[  # noqa: UP045 -- Python 3.9 is supported.
+            Iterable[InstrumentRiskFxRate]
+        ] = None,
     ) -> None:
         if not isinstance(scope, AccountScope):
             raise ValueError("scope must be an AccountScope")
@@ -536,11 +787,25 @@ class InstrumentRiskAdmissionMapper:
             or wire_account_ref != wire_account_ref.strip()
         ):
             raise ValueError("wire_account_ref must be a non-empty account alias")
+        fx_rates: dict[str, InstrumentRiskFxRate] = {}
+        if fx_rates_by_instrument is not None:
+            if isinstance(fx_rates_by_instrument, (str, bytes)):
+                raise ValueError("fx_rates_by_instrument must contain typed FX facts")
+            try:
+                for fx_rate in fx_rates_by_instrument:
+                    if type(fx_rate) is not InstrumentRiskFxRate:
+                        raise ValueError("fx_rates_by_instrument must contain typed FX facts")
+                    if fx_rate.instrument in fx_rates:
+                        raise ValueError("duplicate instrument FX fact")
+                    fx_rates[fx_rate.instrument] = fx_rate
+            except TypeError as error:
+                raise ValueError("fx_rates_by_instrument must be iterable") from error
         self._scope = scope
         self._registry = registry
         self._clock_ns = clock_ns or _wall_clock_ns
         self._allocation_reader = allocation_reader
         self._wire_account_ref = wire_account_ref
+        self._fx_rates_by_instrument = fx_rates
 
     @property
     def registry(self) -> InstrumentRiskRegistry:
@@ -586,8 +851,21 @@ class InstrumentRiskAdmissionMapper:
         """Assess one execution-shaped object and reject missing trusted facts."""
 
         order = self._order_from_intent(intent)
+        self._verify_fx_source_binding(order)
         now_ns = self._clock_ns()
         return self._registry.assess(order, now_ns)
+
+    def _verify_fx_source_binding(self, order: InstrumentRiskOrder) -> None:
+        """Require the order to carry this mapper's exact configured FX fact."""
+
+        if order.fx_rate is None:
+            return
+        configured = self._fx_rates_by_instrument.get(order.instrument)
+        if configured is not order.fx_rate:
+            raise RiskDeniedError(
+                "INSTRUMENT_FX_SOURCE_UNBOUND",
+                "FX fact is not the exact source-bound fact configured for this instrument",
+            )
 
     def _order_from_intent(self, intent: Any) -> InstrumentRiskOrder:
         tags = getattr(intent, "tags", None)
@@ -606,6 +884,7 @@ class InstrumentRiskAdmissionMapper:
                 limit_price=intent.price,
                 metadata_version=intent.metadata_version,
                 metadata_digest=metadata_digest,
+                fx_rate=getattr(intent, "fx_rate", None),
             )
         except (AttributeError, TypeError, ValueError) as error:
             raise RiskDeniedError(
@@ -630,7 +909,10 @@ class InstrumentRiskAdmissionMapper:
         allocation_version = None
         quantity_unit = None
         notional_unit = None
+        instrument_facts_observed_at_ns = None
+        instrument_facts_valid_until_ns = None
         if position_effect == "OPEN":
+            self._verify_fx_source_binding(order)
             assessment = self._registry.assess(order, self._clock_ns())
             action = IntentAction.INCREASE
             notional = assessment.gross_notional
@@ -641,6 +923,15 @@ class InstrumentRiskAdmissionMapper:
             # into the account reservation so a fixed-unit account policy can
             # enforce its denomination on account-only risk admission too.
             notional_unit = assessment.metadata.valuation_unit
+            if assessment.fx_rate is not None:
+                instrument_facts_observed_at_ns = max(
+                    assessment.metadata.as_of_ns,
+                    assessment.fx_rate.observed_at_ns,
+                )
+                instrument_facts_valid_until_ns = min(
+                    assessment.metadata.expires_at_ns,
+                    assessment.fx_rate.valid_until_ns,
+                )
             if self._allocation_reader is not None:
                 try:
                     strategy_id = _identifier(execution_scope.strategy_id, "strategy_id")
@@ -823,6 +1114,8 @@ class InstrumentRiskAdmissionMapper:
                 else None
             ),
             notional_unit=notional_unit,
+            instrument_facts_observed_at_ns=instrument_facts_observed_at_ns,
+            instrument_facts_valid_until_ns=instrument_facts_valid_until_ns,
         )
 
     def map_group_intent(self, intent: Any) -> RiskIntent:
@@ -849,6 +1142,7 @@ class InstrumentRiskAdmissionMapper:
                 "group legs require a mapped opening intent with strategy allocation",
             )
         order = self._order_from_intent(intent)
+        self._verify_fx_source_binding(order)
         observed_at_ns = self._clock_ns()
         assessment = self._registry.assess(order, observed_at_ns)
         metadata = assessment.metadata
@@ -858,29 +1152,46 @@ class InstrumentRiskAdmissionMapper:
                 "GROUP_EXPOSURE_SIDE_UNPROVEN",
                 "group order side is not a supported canonical value",
             )
-        profile = _sha256(
-            _canonical_json(
-                {
-                    "contract_multiplier": _decimal_text(metadata.contract_multiplier),
-                    "exposure_profile_schema": "bt_api_risk.group-exposure-profile.v1",
-                    "fixed_fee": _decimal_text(metadata.fixed_fee),
-                    "instrument": metadata.instrument,
-                    "max_slippage_bps": _decimal_text(metadata.max_slippage_bps),
-                    "notional_unit": metadata.valuation_unit,
-                    "position_effect": "OPEN",
-                    "quantity_step": _decimal_text(metadata.quantity_step),
-                    "quantity_unit": metadata.quantity_unit,
-                    "side": side,
-                    "taker_fee_bps": _decimal_text(metadata.taker_fee_bps),
-                    "tick_size": _decimal_text(metadata.tick_size),
-                }
+        profile_payload: dict[str, object] = {
+            "contract_multiplier": _decimal_text(metadata.contract_multiplier),
+            "exposure_profile_schema": "bt_api_risk.group-exposure-profile.v1",
+            "fixed_fee": _decimal_text(metadata.fixed_fee),
+            "instrument": metadata.instrument,
+            "max_slippage_bps": _decimal_text(metadata.max_slippage_bps),
+            "notional_unit": metadata.valuation_unit,
+            "position_effect": "OPEN",
+            "quantity_step": _decimal_text(metadata.quantity_step),
+            "quantity_unit": metadata.quantity_unit,
+            "side": side,
+            "taker_fee_bps": _decimal_text(metadata.taker_fee_bps),
+            "tick_size": _decimal_text(metadata.tick_size),
+        }
+        for name in ("quote_currency", "fx_source_ref", "fixed_fee_unit"):
+            value = getattr(metadata, name)
+            if value is not None:
+                profile_payload[name] = value
+        profile = _sha256(_canonical_json(profile_payload))
+        facts_observed_at_ns = observed_at_ns
+        facts_valid_until_ns = metadata.expires_at_ns
+        if assessment.fx_rate is not None:
+            facts_observed_at_ns = max(
+                metadata.as_of_ns,
+                assessment.fx_rate.observed_at_ns,
             )
-        )
+            facts_valid_until_ns = min(
+                metadata.expires_at_ns,
+                assessment.fx_rate.valid_until_ns,
+            )
+            if not facts_observed_at_ns <= observed_at_ns < facts_valid_until_ns:
+                raise RiskDeniedError(
+                    "INSTRUMENT_FX_STALE",
+                    "instrument and FX facts are not current for the group reservation",
+                )
         return replace(
             mapped,
             exposure_profile_fingerprint=profile,
-            instrument_facts_observed_at_ns=observed_at_ns,
-            instrument_facts_valid_until_ns=metadata.expires_at_ns,
+            instrument_facts_observed_at_ns=facts_observed_at_ns,
+            instrument_facts_valid_until_ns=facts_valid_until_ns,
         )
 
 
@@ -918,6 +1229,7 @@ __all__ = [
     "INSTRUMENT_METADATA_DIGEST_TAG",
     "InstrumentRiskAdmissionMapper",
     "InstrumentRiskAssessment",
+    "InstrumentRiskFxRate",
     "InstrumentRiskMetadata",
     "InstrumentRiskOrder",
     "InstrumentRiskRegistry",
