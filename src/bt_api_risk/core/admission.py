@@ -624,6 +624,267 @@ class DispatchTrackedOrderProof:
 DispatchResolutionProof = Union[DispatchTerminalProof, DispatchTrackedOrderProof]
 
 
+class DispatchResolutionReceiptStatus(str, Enum):
+    """Durable state of one exact dispatch claim as observed by the risk gate."""
+
+    UNRESOLVED_ACTIVE = "UNRESOLVED_ACTIVE"
+    ACKED_TRACKED_RESOLVED = "ACKED_TRACKED_RESOLVED"
+
+
+@dataclass(frozen=True)
+class DispatchRecoveryAttestation:
+    """New-fence journal evidence for recovering an immutable PROOF_READY event.
+
+    This value carries identities only. It authorizes nothing by itself; the
+    injected journal authority must verify the old event chain and the new
+    account-wide writer fence while :meth:`DurableRiskGate.resolve_dispatch_freeze_recovered`
+    commits the matching resolution.
+    """
+
+    scope: AccountScope
+    permit_id: str
+    intent_id: str
+    intent_hash: str
+    cause_id: str
+    claim_digest: str
+    proof_sha256: str
+    proof_ready_revision: int
+    proof_ready_record_sha256: str
+    original_writer_owner_id: str
+    original_writer_fencing_token: int
+    original_writer_fence_sha256: str
+    order_observation_revision: int
+    order_observation_record_sha256: str
+    fill_observation_revision: int
+    fill_observation_record_sha256: str
+    reconciliation_evidence_sha256: str
+    accepted_request_sha256: str
+    provider_order_id: str
+    exposure_reservation_id: str
+    exposure_reservation_sha256: str
+    recovery_event_id: str
+    recovery_event_revision: int
+    recovery_event_sha256: str
+    current_writer_owner_id: str
+    current_writer_fencing_token: int
+    current_writer_fence_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.scope) is not AccountScope:
+            raise ValueError("invalid dispatch recovery scope")
+        for name in (
+            "permit_id",
+            "intent_id",
+            "cause_id",
+            "provider_order_id",
+            "exposure_reservation_id",
+            "recovery_event_id",
+            "original_writer_owner_id",
+            "current_writer_owner_id",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError("invalid dispatch recovery " + name)
+        if self.cause_id != "dispatch-inflight:" + self.intent_id:
+            raise ValueError("dispatch recovery cause does not match intent")
+        for name in (
+            "intent_hash",
+            "claim_digest",
+            "proof_sha256",
+            "proof_ready_record_sha256",
+            "original_writer_fence_sha256",
+            "order_observation_record_sha256",
+            "fill_observation_record_sha256",
+            "reconciliation_evidence_sha256",
+            "accepted_request_sha256",
+            "exposure_reservation_sha256",
+            "recovery_event_id",
+            "recovery_event_sha256",
+            "current_writer_fence_sha256",
+        ):
+            _require_sha256(getattr(self, name), name)
+        for name in (
+            "proof_ready_revision",
+            "order_observation_revision",
+            "fill_observation_revision",
+            "recovery_event_revision",
+            "original_writer_fencing_token",
+            "current_writer_fencing_token",
+        ):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError("invalid dispatch recovery " + name)
+        if not (
+            self.order_observation_revision < self.proof_ready_revision
+            and self.fill_observation_revision < self.proof_ready_revision
+            and self.recovery_event_revision > self.proof_ready_revision
+        ):
+            raise ValueError("dispatch recovery journal revisions are not ordered")
+        if self.current_writer_fencing_token <= self.original_writer_fencing_token:
+            raise ValueError("dispatch recovery requires a newer writer fence")
+        if self.current_writer_fence_sha256 == self.original_writer_fence_sha256:
+            raise ValueError("dispatch recovery must bind a distinct newer writer fence")
+
+    @property
+    def fingerprint(self) -> str:
+        """Stable digest of the original evidence and the current recovery fence."""
+        return _sha256(_canonical_json(_dispatch_recovery_attestation_payload(self)))
+
+
+@dataclass(frozen=True)
+class DispatchResolutionReceipt:
+    """Read-only, single-snapshot receipt for one durable dispatch claim."""
+
+    status: DispatchResolutionReceiptStatus
+    claim: DispatchClaimBinding
+    proof: Optional[DispatchTrackedOrderProof] = None  # noqa: UP045 -- Python 3.9 is supported.
+    proof_sha256: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+    dispatch_latch_active: bool = True
+    has_other_active_freezes: bool = False
+    recovery_attestation: Optional[  # noqa: UP045 -- Python 3.9 is supported.
+        DispatchRecoveryAttestation
+    ] = None
+
+    def __post_init__(self) -> None:
+        if type(self.status) is not DispatchResolutionReceiptStatus:
+            raise ValueError("invalid dispatch resolution receipt status")
+        if type(self.claim) is not DispatchClaimBinding:
+            raise ValueError("invalid dispatch resolution receipt claim")
+        if (
+            type(self.dispatch_latch_active) is not bool
+            or type(self.has_other_active_freezes) is not bool
+        ):
+            raise ValueError("invalid dispatch resolution receipt freeze state")
+        if self.status is DispatchResolutionReceiptStatus.UNRESOLVED_ACTIVE:
+            if (
+                self.proof is not None
+                or self.proof_sha256 is not None
+                or self.recovery_attestation is not None
+                or self.dispatch_latch_active is not True
+            ):
+                raise ValueError("unresolved receipt cannot carry a resolution proof")
+            return
+        if (
+            type(self.proof) is not DispatchTrackedOrderProof
+            or self.proof_sha256 != self.proof.fingerprint
+            or self.dispatch_latch_active is not False
+        ):
+            raise ValueError("resolved receipt must carry its exact tracked-order proof")
+        if self.recovery_attestation is not None and not _recovery_attestation_matches_proof(
+            self.recovery_attestation, self.proof
+        ):
+            raise ValueError("recovery receipt does not match its tracked-order proof")
+
+    @property
+    def scope(self) -> AccountScope:
+        return self.claim.scope
+
+    @property
+    def permit_id(self) -> str:
+        return self.claim.permit_id
+
+    @property
+    def intent_id(self) -> str:
+        return self.claim.intent_id
+
+    @property
+    def intent_hash(self) -> str:
+        return self.claim.intent_hash
+
+    @property
+    def cause_id(self) -> str:
+        return self.claim.cause_id
+
+    @property
+    def claim_digest(self) -> str:
+        return self.claim.claim_digest
+
+
+@dataclass(frozen=True)
+class VerifiedDispatchRecoveryResolution:
+    """Typed proof that the old journal evidence and new fence were verified."""
+
+    scope: AccountScope
+    permit_id: str
+    intent_id: str
+    intent_hash: str
+    cause_id: str
+    claim_digest: str
+    proof_sha256: str
+    attestation_sha256: str
+    recovery_event_id: str
+    recovery_event_revision: int
+    recovery_event_sha256: str
+    original_writer_owner_id: str
+    original_writer_fencing_token: int
+    original_writer_fence_sha256: str
+    current_writer_owner_id: str
+    current_writer_fencing_token: int
+    current_writer_fence_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.scope) is not AccountScope:
+            raise ValueError("invalid verified dispatch recovery scope")
+        for name in (
+            "permit_id",
+            "intent_id",
+            "cause_id",
+            "recovery_event_id",
+            "original_writer_owner_id",
+            "current_writer_owner_id",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError("invalid verified dispatch recovery " + name)
+        if self.cause_id != "dispatch-inflight:" + self.intent_id:
+            raise ValueError("verified recovery cause does not match intent")
+        for name in (
+            "intent_hash",
+            "claim_digest",
+            "proof_sha256",
+            "attestation_sha256",
+            "recovery_event_id",
+            "recovery_event_sha256",
+            "original_writer_fence_sha256",
+            "current_writer_fence_sha256",
+        ):
+            _require_sha256(getattr(self, name), name)
+        if type(self.recovery_event_revision) is not int or self.recovery_event_revision <= 0:
+            raise ValueError("invalid verified dispatch recovery event revision")
+        if type(self.original_writer_fencing_token) is not int or (
+            self.original_writer_fencing_token <= 0
+        ):
+            raise ValueError("invalid original dispatch recovery fence token")
+        if type(self.current_writer_fencing_token) is not int or (
+            self.current_writer_fencing_token <= self.original_writer_fencing_token
+        ):
+            raise ValueError("invalid current dispatch recovery fence token")
+        if self.current_writer_fence_sha256 == self.original_writer_fence_sha256:
+            raise ValueError("recovery verification must bind distinct old and new fences")
+
+
+class VerifiedRecoveredExecutionJournalAuthority(Protocol):
+    """Authority for replaying original proof evidence under a newer fence.
+
+    The returned context manager must validate the complete immutable
+    PROOF_READY/order/fill journal chain, exposure reference, original event
+    fence, and append-only recovery event. It must prove that the supplied
+    recovery event belongs to the exact settled Risk claim and hold the current
+    account-wide writer fence until the context exits after Risk commits. It
+    yields no receipt for missing, conflicting, stale, or incomplete evidence.
+    """
+
+    def recovered_dispatch_resolution_guard(
+        self,
+        proof: DispatchTrackedOrderProof,
+        attestation: DispatchRecoveryAttestation,
+        *,
+        claim: DispatchClaimBinding,
+    ) -> AbstractContextManager[
+        Optional[VerifiedDispatchRecoveryResolution]  # noqa: UP045 -- Python 3.9 is supported.
+    ]: ...
+
+
 @dataclass(frozen=True)
 class CancelDispatchResolutionProof:
     """Typed evidence for resolving only a cancellation-action dispatch latch.
@@ -888,6 +1149,122 @@ def _dispatch_resolution_proof_sha256(proof: DispatchResolutionProof) -> str:
             provider_order_id=proof.provider_order_id,
         )
     return _sha256(_canonical_json(payload))
+
+
+def _dispatch_recovery_attestation_payload(
+    attestation: DispatchRecoveryAttestation,
+) -> dict[str, object]:
+    """Return the versioned canonical payload stored for a recovery audit."""
+    return {
+        "accepted_request_sha256": attestation.accepted_request_sha256,
+        "cause_id": attestation.cause_id,
+        "claim_digest": attestation.claim_digest,
+        "current_writer_fence_sha256": attestation.current_writer_fence_sha256,
+        "current_writer_fencing_token": attestation.current_writer_fencing_token,
+        "current_writer_owner_id": attestation.current_writer_owner_id,
+        "exposure_reservation_id": attestation.exposure_reservation_id,
+        "exposure_reservation_sha256": attestation.exposure_reservation_sha256,
+        "fill_observation_record_sha256": attestation.fill_observation_record_sha256,
+        "fill_observation_revision": attestation.fill_observation_revision,
+        "intent_hash": attestation.intent_hash,
+        "intent_id": attestation.intent_id,
+        "order_observation_record_sha256": attestation.order_observation_record_sha256,
+        "order_observation_revision": attestation.order_observation_revision,
+        "original_writer_fence_sha256": attestation.original_writer_fence_sha256,
+        "original_writer_fencing_token": attestation.original_writer_fencing_token,
+        "original_writer_owner_id": attestation.original_writer_owner_id,
+        "permit_id": attestation.permit_id,
+        "proof_ready_record_sha256": attestation.proof_ready_record_sha256,
+        "proof_ready_revision": attestation.proof_ready_revision,
+        "proof_sha256": attestation.proof_sha256,
+        "provider_order_id": attestation.provider_order_id,
+        "reconciliation_evidence_sha256": attestation.reconciliation_evidence_sha256,
+        "recovery_event_id": attestation.recovery_event_id,
+        "recovery_event_revision": attestation.recovery_event_revision,
+        "recovery_event_sha256": attestation.recovery_event_sha256,
+        "scope": {
+            "account_id": attestation.scope.account_id,
+            "environment": attestation.scope.environment,
+            "provider": attestation.scope.provider,
+        },
+        "schema": "bt-api-risk-dispatch-recovery-attestation-v1",
+    }
+
+
+def _recovery_attestation_matches_proof(
+    attestation: DispatchRecoveryAttestation,
+    proof: DispatchTrackedOrderProof,
+) -> bool:
+    return bool(
+        type(attestation) is DispatchRecoveryAttestation
+        and type(proof) is DispatchTrackedOrderProof
+        and attestation.scope == proof.scope
+        and attestation.permit_id == proof.permit_id
+        and attestation.intent_id == proof.intent_id
+        and attestation.intent_hash == proof.intent_hash
+        and attestation.cause_id == proof.cause_id
+        and attestation.claim_digest == proof.claim_digest
+        and attestation.proof_sha256 == proof.fingerprint
+        and attestation.proof_ready_revision == proof.journal_revision
+        and attestation.proof_ready_record_sha256 == proof.journal_record_sha256
+        and attestation.original_writer_fence_sha256 == proof.writer_fence_sha256
+        and attestation.reconciliation_evidence_sha256 == proof.reconciliation_evidence_sha256
+        and attestation.accepted_request_sha256 == proof.accepted_request_sha256
+        and attestation.provider_order_id == proof.provider_order_id
+        and attestation.exposure_reservation_id == proof.exposure_reservation_id
+        and attestation.exposure_reservation_sha256 == proof.exposure_reservation_sha256
+    )
+
+
+def _recovery_attestation_matches_claim_proof(
+    attestation: DispatchRecoveryAttestation,
+    claim: DispatchClaimBinding,
+    proof: DispatchTrackedOrderProof,
+) -> bool:
+    return bool(
+        _recovery_attestation_matches_proof(attestation, proof)
+        and attestation.scope == claim.scope
+        and attestation.permit_id == claim.permit_id
+        and attestation.intent_id == claim.intent_id
+        and attestation.intent_hash == claim.intent_hash
+        and attestation.cause_id == claim.cause_id
+        and attestation.claim_digest == claim.claim_digest
+    )
+
+
+def _verified_dispatch_recovery_matches(
+    verified: object,
+    *,
+    proof: DispatchTrackedOrderProof,
+    attestation: DispatchRecoveryAttestation,
+    claim: DispatchClaimBinding,
+) -> bool:
+    return bool(
+        type(verified) is VerifiedDispatchRecoveryResolution
+        and verified.scope == claim.scope == proof.scope == attestation.scope
+        and verified.permit_id == claim.permit_id == proof.permit_id == attestation.permit_id
+        and verified.intent_id == claim.intent_id == proof.intent_id == attestation.intent_id
+        and verified.intent_hash
+        == claim.intent_hash
+        == proof.intent_hash
+        == attestation.intent_hash
+        and verified.cause_id == claim.cause_id == proof.cause_id == attestation.cause_id
+        and verified.claim_digest
+        == claim.claim_digest
+        == proof.claim_digest
+        == attestation.claim_digest
+        and verified.proof_sha256 == proof.fingerprint == attestation.proof_sha256
+        and verified.attestation_sha256 == attestation.fingerprint
+        and verified.recovery_event_id == attestation.recovery_event_id
+        and verified.recovery_event_revision == attestation.recovery_event_revision
+        and verified.recovery_event_sha256 == attestation.recovery_event_sha256
+        and verified.original_writer_owner_id == attestation.original_writer_owner_id
+        and verified.original_writer_fencing_token == attestation.original_writer_fencing_token
+        and verified.original_writer_fence_sha256 == attestation.original_writer_fence_sha256
+        and verified.current_writer_owner_id == attestation.current_writer_owner_id
+        and verified.current_writer_fencing_token == attestation.current_writer_fencing_token
+        and verified.current_writer_fence_sha256 == attestation.current_writer_fence_sha256
+    )
 
 
 @dataclass(frozen=True)
@@ -2307,6 +2684,241 @@ class DurableRiskGate:
             claim = self._require_dispatch_claim(connection, reservation)
             return self._dispatch_claim_binding(reservation, claim)
 
+    def dispatch_resolution_receipt(self, permit_id: str) -> DispatchResolutionReceipt:
+        """Read the exact durable dispatch state from one SQLite snapshot.
+
+        This API is for recovery reconciliation only. It never changes Risk
+        state and returns a resolved receipt only for an exact settled
+        INCREASE whose immutable result is ``ACKED_TRACKED``. A terminal
+        no-fill resolution, an absent permit, or any mixed/corrupt latch,
+        claim, reservation, resolution, or recovery-audit state is not an ACK.
+        """
+        if type(permit_id) is not str or not permit_id or permit_id != permit_id.strip():
+            raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            try:
+                receipt = self._dispatch_resolution_receipt_in_transaction(connection, permit_id)
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+            else:
+                connection.execute("COMMIT")
+                return receipt
+
+    def _dispatch_resolution_receipt_in_transaction(
+        self, connection: sqlite3.Connection, permit_id: str
+    ) -> DispatchResolutionReceipt:
+        reservation = connection.execute(
+            "SELECT * FROM risk_reservations WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        if reservation is None:
+            raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+        policy_error = self._policy_binding_read_error(connection, str(reservation["scope_key"]))
+        if policy_error is not None:
+            raise PermitInvalidError(
+                policy_error, "risk database is bound to another or unknown policy"
+            )
+        if reservation["action"] != IntentAction.INCREASE.value:
+            raise PermitInvalidError(
+                "DISPATCH_RESOLUTION_STATE_CONFLICT",
+                "a tracked-order receipt requires an INCREASE reservation",
+            )
+        if reservation["status"] != self._SETTLED:
+            raise PermitInvalidError(
+                "PERMIT_NOT_SETTLED", "dispatch receipt requires a settled reservation"
+            )
+        claim_row = connection.execute(
+            "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        if claim_row is None:
+            raise PermitInvalidError(
+                "PERMIT_NOT_DISPATCH_CLAIMED", "dispatch receipt requires an exact durable claim"
+            )
+        expected_cause = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+        if (
+            claim_row["intent_id"] != reservation["intent_id"]
+            or claim_row["intent_hash"] != reservation["intent_hash"]
+            or claim_row["scope_key"] != reservation["scope_key"]
+            or claim_row["cause_id"] != expected_cause
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_CLAIM_CONFLICT",
+                "the durable dispatch claim no longer matches its reservation",
+            )
+        try:
+            claim = self._dispatch_claim_binding(reservation, claim_row)
+        except (TypeError, ValueError) as exc:
+            raise PermitInvalidError(
+                "DISPATCH_CLAIM_CONFLICT", "the durable dispatch claim is invalid"
+            ) from exc
+        freeze = connection.execute(
+            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+            (reservation["scope_key"], expected_cause),
+        ).fetchone()
+        if freeze is None or type(freeze["active"]) is not int or freeze["active"] not in (0, 1):
+            raise PermitInvalidError(
+                "DISPATCH_RESOLUTION_STATE_CONFLICT", "the exact dispatch latch is missing"
+            )
+        resolution = connection.execute(
+            "SELECT * FROM risk_dispatch_resolutions WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        audit = connection.execute(
+            "SELECT * FROM risk_dispatch_recovery_audits WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        other_freezes = connection.execute(
+            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id <> ?",
+            (reservation["scope_key"], expected_cause),
+        ).fetchall()
+        if any(
+            type(row["active"]) is not int or row["active"] not in (0, 1) for row in other_freezes
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_RESOLUTION_STATE_CONFLICT",
+                "another account freeze has an invalid active state",
+            )
+        has_other_active_freezes = any(row["active"] == 1 for row in other_freezes)
+
+        if resolution is None:
+            if audit is not None or freeze["active"] != 1:
+                raise PermitInvalidError(
+                    "DISPATCH_RESOLUTION_STATE_CONFLICT",
+                    "an unresolved claim must retain its exact active dispatch latch",
+                )
+            return DispatchResolutionReceipt(
+                status=DispatchResolutionReceiptStatus.UNRESOLVED_ACTIVE,
+                claim=claim,
+                dispatch_latch_active=True,
+                has_other_active_freezes=has_other_active_freezes,
+            )
+
+        if freeze["active"] != 0 or resolution["proof_kind"] != "ACKED_TRACKED":
+            raise PermitInvalidError(
+                "DISPATCH_RESOLUTION_STATE_CONFLICT",
+                "only an exact ACKED_TRACKED resolution with an inactive dispatch latch is recoverable",
+            )
+        if (
+            resolution["scope_key"] != reservation["scope_key"]
+            or resolution["intent_id"] != reservation["intent_id"]
+            or resolution["intent_hash"] != reservation["intent_hash"]
+            or resolution["cause_id"] != expected_cause
+            or resolution["claim_digest"] != claim.claim_digest
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_RESOLUTION_STATE_CONFLICT",
+                "the stored resolution no longer matches its exact durable claim",
+            )
+        try:
+            proof = DispatchTrackedOrderProof(
+                scope=claim.scope,
+                permit_id=permit_id,
+                intent_id=resolution["intent_id"],
+                intent_hash=resolution["intent_hash"],
+                cause_id=resolution["cause_id"],
+                claim_digest=resolution["claim_digest"],
+                evidence_class=DispatchEvidenceClass(resolution["evidence_class"]),
+                dispatch_attempt_count=resolution["dispatch_attempt_count"],
+                journal_revision=resolution["journal_revision"],
+                journal_record_sha256=resolution["journal_record_sha256"],
+                reconciliation_evidence_sha256=resolution["reconciliation_evidence_sha256"],
+                writer_fence_sha256=resolution["writer_fence_sha256"],
+                provider_order_id=resolution["provider_order_id"],
+                accepted_request_sha256=resolution["accepted_request_sha256"],
+                exposure_reservation_id=resolution["exposure_reservation_id"],
+                exposure_reservation_sha256=resolution["exposure_reservation_sha256"],
+                filled_quantity=resolution["filled_quantity"],
+                trade_count=resolution["trade_count"],
+            )
+        except (TypeError, ValueError) as exc:
+            raise PermitInvalidError(
+                "DISPATCH_RESOLUTION_STATE_CONFLICT",
+                "the stored tracked-order proof is invalid",
+            ) from exc
+        try:
+            self._assert_dispatch_proof_matches_claim(proof, claim)
+        except PermitInvalidError as exc:
+            raise PermitInvalidError(
+                "DISPATCH_RESOLUTION_STATE_CONFLICT",
+                "the stored tracked-order proof does not match the exact claim",
+            ) from exc
+
+        recovery_attestation = None
+        if audit is not None:
+            recovery_attestation = self._read_dispatch_recovery_audit(
+                audit, claim=claim, proof=proof
+            )
+        return DispatchResolutionReceipt(
+            status=DispatchResolutionReceiptStatus.ACKED_TRACKED_RESOLVED,
+            claim=claim,
+            proof=proof,
+            proof_sha256=proof.fingerprint,
+            dispatch_latch_active=False,
+            has_other_active_freezes=has_other_active_freezes,
+            recovery_attestation=recovery_attestation,
+        )
+
+    @staticmethod
+    def _read_dispatch_recovery_audit(
+        audit: sqlite3.Row,
+        *,
+        claim: DispatchClaimBinding,
+        proof: DispatchTrackedOrderProof,
+    ) -> DispatchRecoveryAttestation:
+        try:
+            payload_json = audit["attestation_json"]
+            payload = json.loads(payload_json)
+            if type(payload) is not dict or set(payload) != (
+                set(DispatchRecoveryAttestation.__dataclass_fields__) | {"schema"}
+            ):
+                raise ValueError("unexpected recovery audit fields")
+            if payload["schema"] != "bt-api-risk-dispatch-recovery-attestation-v1":
+                raise ValueError("unknown recovery audit schema")
+            scope_payload = payload["scope"]
+            if type(scope_payload) is not dict or set(scope_payload) != {
+                "provider",
+                "account_id",
+                "environment",
+            }:
+                raise ValueError("invalid recovery audit scope")
+            if any(type(value) is not str for value in scope_payload.values()):
+                raise ValueError("invalid recovery audit scope values")
+            fields = {
+                name: value for name, value in payload.items() if name not in {"schema", "scope"}
+            }
+            attestation = DispatchRecoveryAttestation(scope=AccountScope(**scope_payload), **fields)
+            if _canonical_json(_dispatch_recovery_attestation_payload(attestation)) != payload_json:
+                raise ValueError("recovery audit payload is not canonical")
+            if (
+                audit["permit_id"] != claim.permit_id
+                or audit["scope_key"] != claim.scope.key
+                or audit["proof_sha256"] != proof.fingerprint
+                or audit["attestation_sha256"] != attestation.fingerprint
+                or audit["recovery_event_id"] != attestation.recovery_event_id
+                or audit["recovery_event_revision"] != attestation.recovery_event_revision
+                or audit["recovery_event_sha256"] != attestation.recovery_event_sha256
+                or audit["original_writer_owner_id"] != attestation.original_writer_owner_id
+                or audit["original_writer_fencing_token"]
+                != attestation.original_writer_fencing_token
+                or audit["original_writer_fence_sha256"] != attestation.original_writer_fence_sha256
+                or audit["current_writer_owner_id"] != attestation.current_writer_owner_id
+                or audit["current_writer_fencing_token"] != attestation.current_writer_fencing_token
+                or audit["current_writer_fence_sha256"] != attestation.current_writer_fence_sha256
+                or not _recovery_attestation_matches_proof(attestation, proof)
+                or attestation.scope != claim.scope
+                or attestation.permit_id != claim.permit_id
+                or attestation.intent_id != claim.intent_id
+                or attestation.intent_hash != claim.intent_hash
+                or attestation.cause_id != claim.cause_id
+                or attestation.claim_digest != claim.claim_digest
+            ):
+                raise ValueError("recovery audit does not match its resolution")
+            return attestation
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise PermitInvalidError(
+                "DISPATCH_RESOLUTION_STATE_CONFLICT",
+                "the immutable dispatch recovery audit is invalid",
+            ) from exc
+
     def settle(self, permit_id: str) -> RiskPermit:
         """Consume a dispatch-claimed permit after its outcome is durably known."""
         with self._transaction() as connection:
@@ -3019,6 +3631,198 @@ class DurableRiskGate:
                 "DISPATCH_RESOLUTION_PROOF_REJECTED",
                 "the execution-journal authority could not verify this proof",
             ) from exc
+
+    def resolve_dispatch_freeze_recovered(
+        self,
+        proof: DispatchTrackedOrderProof,
+        attestation: DispatchRecoveryAttestation,
+    ) -> None:
+        """Consume an original tracked-order proof under a newer journal fence.
+
+        This is deliberately separate from :meth:`resolve_dispatch_freeze`.
+        The authority must validate the immutable original proof-ready record
+        and a new append-only recovery event while holding the current account
+        fence across this method's Risk transaction. No generic state change,
+        prior resolution, or inactive dispatch latch is accepted.
+        """
+        if type(proof) is not DispatchTrackedOrderProof:
+            raise PermitInvalidError(
+                "DISPATCH_RECOVERY_PROOF_REQUIRED",
+                "recovery requires the exact tracked-order proof type",
+            )
+        if type(attestation) is not DispatchRecoveryAttestation:
+            raise PermitInvalidError(
+                "DISPATCH_RECOVERY_ATTESTATION_REQUIRED",
+                "recovery requires a typed new-fence journal attestation",
+            )
+        if not _recovery_attestation_matches_proof(attestation, proof):
+            raise PermitInvalidError(
+                "DISPATCH_RECOVERY_ATTESTATION_MISMATCH",
+                "recovery attestation does not match the original tracked-order proof",
+            )
+        authority = self._execution_journal_authority
+        guard_factory = getattr(authority, "recovered_dispatch_resolution_guard", None)
+        if not callable(guard_factory):
+            raise PermitInvalidError(
+                "DISPATCH_RECOVERY_AUTHORITY_REQUIRED",
+                "a verified new-fence journal authority is required for recovery",
+            )
+
+        binding = self._load_dispatch_claim_binding(proof.permit_id, proof.journal_record_sha256)
+        self._assert_dispatch_proof_matches_claim(proof, binding)
+        if not _recovery_attestation_matches_claim_proof(attestation, binding, proof):
+            raise PermitInvalidError(
+                "DISPATCH_RECOVERY_ATTESTATION_MISMATCH",
+                "recovery attestation does not match the exact durable Risk claim",
+            )
+
+        # Keep the external account fence alive across the entire SQLite
+        # transaction. Unknown authority failures propagate so callers retain
+        # UNKNOWN/frozen semantics instead of projecting an ordinary denial.
+        guard = guard_factory(proof, attestation, claim=binding)
+        with guard as verified:
+            if not _verified_dispatch_recovery_matches(
+                verified, proof=proof, attestation=attestation, claim=binding
+            ):
+                raise PermitInvalidError(
+                    "DISPATCH_RECOVERY_ATTESTATION_REJECTED",
+                    "the journal authority did not verify the exact old proof and current fence",
+                )
+            with self._transaction() as connection:
+                reservation = connection.execute(
+                    "SELECT * FROM risk_reservations WHERE permit_id = ?",
+                    (proof.permit_id,),
+                ).fetchone()
+                if reservation is None:
+                    raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+                if reservation["action"] != IntentAction.INCREASE.value:
+                    raise PermitInvalidError(
+                        "DISPATCH_RECOVERY_SCOPE_REJECTED",
+                        "tracked-order recovery requires an INCREASE reservation",
+                    )
+                self._ensure_policy_binding(connection, str(reservation["scope_key"]))
+                claim_row = self._require_dispatch_claim(connection, reservation)
+                current_binding = self._dispatch_claim_binding(reservation, claim_row)
+                if current_binding != binding:
+                    raise PermitInvalidError(
+                        "DISPATCH_CLAIM_CONFLICT",
+                        "the exact durable dispatch claim changed during recovery",
+                    )
+                self._assert_dispatch_proof_matches_claim(proof, current_binding)
+                if reservation["status"] != self._SETTLED:
+                    raise PermitInvalidError(
+                        "PERMIT_NOT_SETTLED", "dispatch recovery requires a settled reservation"
+                    )
+                prior = connection.execute(
+                    "SELECT permit_id FROM risk_dispatch_resolutions WHERE permit_id = ?",
+                    (proof.permit_id,),
+                ).fetchone()
+                if prior is not None:
+                    raise PermitInvalidError(
+                        "DISPATCH_ALREADY_RECONCILED",
+                        "this dispatch claim already has a terminal resolution",
+                    )
+                prior = connection.execute(
+                    "SELECT permit_id FROM risk_dispatch_resolutions "
+                    "WHERE journal_record_sha256 = ?",
+                    (proof.journal_record_sha256,),
+                ).fetchone()
+                if prior is not None:
+                    raise PermitInvalidError(
+                        "DISPATCH_PROOF_REPLAYED",
+                        "this immutable journal proof was already consumed",
+                    )
+                prior = connection.execute(
+                    "SELECT permit_id FROM risk_dispatch_recovery_audits "
+                    "WHERE recovery_event_id = ? OR recovery_event_sha256 = ?",
+                    (attestation.recovery_event_id, attestation.recovery_event_sha256),
+                ).fetchone()
+                if prior is not None:
+                    raise PermitInvalidError(
+                        "DISPATCH_RECOVERY_EVENT_REPLAYED",
+                        "this immutable recovery event was already consumed",
+                    )
+                if not _recovery_attestation_matches_claim_proof(
+                    attestation, current_binding, proof
+                ):
+                    raise PermitInvalidError(
+                        "DISPATCH_RECOVERY_ATTESTATION_MISMATCH",
+                        "recovery attestation no longer matches the current claim",
+                    )
+                connection.execute(
+                    """
+                    INSERT INTO risk_dispatch_resolutions (
+                        permit_id, scope_key, intent_id, intent_hash, cause_id,
+                        claim_digest, proof_kind, evidence_class,
+                        dispatch_attempt_count, journal_revision,
+                        journal_record_sha256,
+                        reconciliation_evidence_sha256, writer_fence_sha256,
+                        provider_order_id, accepted_request_sha256,
+                        exposure_reservation_id, exposure_reservation_sha256,
+                        filled_quantity, trade_count, resolved_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, 'ACKED_TRACKED', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, 0, ?)
+                    """,
+                    (
+                        proof.permit_id,
+                        current_binding.scope.key,
+                        proof.intent_id,
+                        proof.intent_hash,
+                        proof.cause_id,
+                        proof.claim_digest,
+                        proof.evidence_class.value,
+                        proof.dispatch_attempt_count,
+                        proof.journal_revision,
+                        proof.journal_record_sha256,
+                        proof.reconciliation_evidence_sha256,
+                        proof.writer_fence_sha256,
+                        proof.provider_order_id,
+                        proof.accepted_request_sha256,
+                        proof.exposure_reservation_id,
+                        proof.exposure_reservation_sha256,
+                        self._clock(),
+                    ),
+                )
+                connection.execute(
+                    """
+                    INSERT INTO risk_dispatch_recovery_audits (
+                        permit_id, scope_key, proof_sha256, attestation_sha256,
+                        recovery_event_id, recovery_event_revision, recovery_event_sha256,
+                        original_writer_owner_id, original_writer_fencing_token,
+                        original_writer_fence_sha256, current_writer_owner_id,
+                        current_writer_fencing_token, current_writer_fence_sha256,
+                        attestation_json, recorded_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        proof.permit_id,
+                        current_binding.scope.key,
+                        proof.fingerprint,
+                        attestation.fingerprint,
+                        attestation.recovery_event_id,
+                        attestation.recovery_event_revision,
+                        attestation.recovery_event_sha256,
+                        attestation.original_writer_owner_id,
+                        attestation.original_writer_fencing_token,
+                        attestation.original_writer_fence_sha256,
+                        attestation.current_writer_owner_id,
+                        attestation.current_writer_fencing_token,
+                        attestation.current_writer_fence_sha256,
+                        _canonical_json(_dispatch_recovery_attestation_payload(attestation)),
+                        self._clock(),
+                    ),
+                )
+                cleared = connection.execute(
+                    """
+                    UPDATE risk_freezes SET active = 0, updated_at = ?
+                    WHERE scope_key = ? AND cause_id = ? AND active = 1
+                    """,
+                    (self._clock(), current_binding.scope.key, proof.cause_id),
+                )
+                if cleared.rowcount != 1:
+                    raise PermitInvalidError(
+                        "DISPATCH_FREEZE_MISSING",
+                        "the exact dispatch latch was not active at recovery commit",
+                    )
 
     def active_freeze_reasons(self, scope: AccountScope) -> list[str]:
         """Return current independent freeze causes for the scope."""
@@ -4722,6 +5526,36 @@ class DurableRiskGate:
                     resolved_at REAL NOT NULL,
                     FOREIGN KEY(permit_id) REFERENCES risk_reservations(permit_id)
                 );
+                CREATE TABLE IF NOT EXISTS risk_dispatch_recovery_audits (
+                    permit_id TEXT PRIMARY KEY,
+                    scope_key TEXT NOT NULL,
+                    proof_sha256 TEXT NOT NULL,
+                    attestation_sha256 TEXT NOT NULL UNIQUE,
+                    recovery_event_id TEXT NOT NULL UNIQUE,
+                    recovery_event_revision INTEGER NOT NULL CHECK(recovery_event_revision > 0),
+                    recovery_event_sha256 TEXT NOT NULL UNIQUE,
+                    original_writer_owner_id TEXT NOT NULL,
+                    original_writer_fencing_token INTEGER NOT NULL
+                        CHECK(original_writer_fencing_token > 0),
+                    original_writer_fence_sha256 TEXT NOT NULL,
+                    current_writer_owner_id TEXT NOT NULL,
+                    current_writer_fencing_token INTEGER NOT NULL
+                        CHECK(current_writer_fencing_token > original_writer_fencing_token),
+                    current_writer_fence_sha256 TEXT NOT NULL,
+                    attestation_json TEXT NOT NULL,
+                    recorded_at REAL NOT NULL,
+                    FOREIGN KEY(permit_id) REFERENCES risk_dispatch_resolutions(permit_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS risk_dispatch_recovery_audit_immutable_update
+                BEFORE UPDATE ON risk_dispatch_recovery_audits
+                BEGIN
+                    SELECT RAISE(ABORT, 'dispatch recovery audits are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS risk_dispatch_recovery_audit_immutable_delete
+                BEFORE DELETE ON risk_dispatch_recovery_audits
+                BEGIN
+                    SELECT RAISE(ABORT, 'dispatch recovery audits are immutable');
+                END;
                 CREATE TABLE IF NOT EXISTS risk_cancel_dispatch_resolutions (
                     permit_id TEXT PRIMARY KEY,
                     scope_key TEXT NOT NULL,
