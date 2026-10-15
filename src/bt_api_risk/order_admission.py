@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any, NoReturn, Optional
 
 from .core.admission import (
@@ -33,8 +34,39 @@ from .core.admission import (
     RiskIntent,
     RiskPermit,
 )
+from .core.exposure import ExposureAccountingMode
 
 _RISK_DENIAL_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,95}$")
+_POLICY_FINGERPRINT = re.compile(r"^[0-9a-f]{64}$")
+
+
+@dataclass(frozen=True)
+class RiskAdmissionPolicyBinding:
+    """Immutable projection of the policy actually configured on a gate.
+
+    Service composition may inspect this value to select a compatible
+    integration path. It is constructed from the gate's frozen ``RiskPolicy``
+    and is never accepted from an order, service caller, or configuration
+    payload.
+    """
+
+    policy_id: str
+    policy_fingerprint: str
+    exposure_accounting_mode: ExposureAccountingMode
+
+    def __post_init__(self) -> None:
+        if (
+            type(self.policy_id) is not str
+            or not self.policy_id.strip()
+        ):
+            raise ValueError("policy_id must be a non-empty string")
+        if (
+            type(self.policy_fingerprint) is not str
+            or _POLICY_FINGERPRINT.fullmatch(self.policy_fingerprint) is None
+        ):
+            raise ValueError("policy_fingerprint must be a lowercase SHA-256 digest")
+        if type(self.exposure_accounting_mode) is not ExposureAccountingMode:
+            raise ValueError("exposure_accounting_mode must be an ExposureAccountingMode")
 
 
 class RiskAdmissionAdapterError(ValueError):
@@ -82,6 +114,17 @@ class DurableRiskAdmissionAdapter:
             raise RiskAdmissionAdapterError("INTENT_MAPPER_REQUIRED")
         self._gate = gate
         self._map_intent = map_intent
+
+    @property
+    def policy_binding(self) -> RiskAdmissionPolicyBinding:
+        """Expose the actual immutable policy bound to the durable gate."""
+
+        policy = self._gate.policy
+        return RiskAdmissionPolicyBinding(
+            policy_id=policy.policy_id,
+            policy_fingerprint=policy.fingerprint,
+            exposure_accounting_mode=policy.exposure_accounting_mode,
+        )
 
     def reserve(self, intent: Any) -> RiskPermit:
         """Durably reserve capacity for one immutable account order."""

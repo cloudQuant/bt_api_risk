@@ -8,7 +8,7 @@ import importlib.util
 import json
 import subprocess
 import sys
-from dataclasses import replace
+from dataclasses import FrozenInstanceError, replace
 from decimal import Decimal
 from pathlib import Path
 
@@ -19,10 +19,12 @@ from bt_api_risk import (
     AccountScope,
     DurableRiskAdmissionAdapter,
     DurableRiskGate,
+    ExposureAccountingMode,
     InstrumentRiskAdmissionMapper,
     InstrumentRiskMetadata,
     InstrumentRiskRegistry,
     RiskAdmissionDeniedError,
+    RiskAdmissionPolicyBinding,
     RiskPolicy,
 )
 
@@ -104,6 +106,68 @@ def _mapper(account_scope, metadata, gate=None, *, wire_account_ref=None):
         allocation_reader=allocation_reader,
         wire_account_ref=wire_account_ref,
     )
+
+
+@pytest.mark.parametrize(
+    "mode",
+    [ExposureAccountingMode.RESERVATIONS_ONLY, ExposureAccountingMode.LIVE_GROSS],
+)
+def test_adapter_policy_binding_projects_actual_policy_immutably(tmp_path, mode):
+    live_gross = mode is ExposureAccountingMode.LIVE_GROSS
+    policy = RiskPolicy(
+        "policy-binding-test",
+        Decimal("100"),
+        10,
+        require_strategy_allocation=live_gross,
+        notional_unit="USD" if live_gross else None,
+        exposure_accounting_mode=mode,
+        max_gross_occupancy_notional=Decimal("500") if live_gross else None,
+        max_gross_occupancy_intent_count=10 if live_gross else None,
+        max_exposure_facts_age_seconds=60.0 if live_gross else None,
+    )
+    gate = DurableRiskGate(
+        tmp_path / f"{mode.value}.sqlite",
+        policy,
+        clock=lambda: 1_700_000_000.0,
+    )
+    adapter = DurableRiskAdmissionAdapter(gate, lambda _order: None)
+
+    binding = adapter.policy_binding
+
+    assert type(binding) is RiskAdmissionPolicyBinding
+    assert binding.policy_id == policy.policy_id
+    assert binding.policy_fingerprint == policy.fingerprint
+    assert binding.exposure_accounting_mode is mode
+    assert adapter.policy_binding == binding
+    with pytest.raises(FrozenInstanceError):
+        binding.exposure_accounting_mode = ExposureAccountingMode.RESERVATIONS_ONLY
+    gate.close()
+
+
+def test_policy_binding_rejects_untyped_mode_and_invalid_fingerprint():
+    with pytest.raises(ValueError, match="ExposureAccountingMode"):
+        RiskAdmissionPolicyBinding("policy", "a" * 64, "LIVE_GROSS")
+    with pytest.raises(ValueError, match="SHA-256"):
+        RiskAdmissionPolicyBinding(
+            "policy", "A" * 64, ExposureAccountingMode.RESERVATIONS_ONLY
+        )
+
+
+def test_adapter_policy_binding_preserves_policy_ids_accepted_by_gate(tmp_path):
+    policy = RiskPolicy(" policy-binding-test ", Decimal("100"), 10)
+    gate = DurableRiskGate(
+        tmp_path / "whitespace-policy.sqlite",
+        policy,
+        clock=lambda: 1_700_000_000.0,
+    )
+    adapter = DurableRiskAdmissionAdapter(gate, lambda _order: None)
+
+    binding = adapter.policy_binding
+
+    assert binding.policy_id == " policy-binding-test "
+    assert binding.policy_fingerprint == policy.fingerprint
+    assert binding.exposure_accounting_mode is ExposureAccountingMode.RESERVATIONS_ONLY
+    gate.close()
 
 
 def test_actual_order_contract_maps_to_durable_permit_and_recovers_settlement(tmp_path):
@@ -382,8 +446,11 @@ class NoOptionalDomainImports(importlib.abc.MetaPathFinder):
 sys.meta_path.insert(0, NoOptionalDomainImports())
 import bt_api_risk
 assert 'DurableRiskAdmissionAdapter' not in vars(bt_api_risk)
+assert 'RiskAdmissionPolicyBinding' not in vars(bt_api_risk)
 adapter = bt_api_risk.DurableRiskAdmissionAdapter
 assert adapter.__module__ == 'bt_api_risk.order_admission'
+binding = bt_api_risk.RiskAdmissionPolicyBinding
+assert binding.__module__ == 'bt_api_risk.order_admission'
 assert 'bt_api_execution' not in sys.modules
 assert 'bt_api_gateway' not in sys.modules
 assert not (blocked & {name.split('.')[0] for name in sys.modules})

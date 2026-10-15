@@ -110,6 +110,7 @@ _ANALYSIS_EXPORTS = {
 
 _ADMISSION_EXPORTS = {
     "DurableRiskAdmissionAdapter": ".order_admission",
+    "RiskAdmissionPolicyBinding": ".order_admission",
     "RiskAdmissionAdapterError": ".order_admission",
     "RiskAdmissionDeniedError": ".order_admission",
 }
@@ -206,6 +207,7 @@ __all__ = [
     "InstrumentRiskOrder",
     "InstrumentRiskRegistry",
     "DurableRiskAdmissionAdapter",
+    "RiskAdmissionPolicyBinding",
     "RiskAdmissionAdapterError",
     "RiskAdmissionDeniedError",
 ]
