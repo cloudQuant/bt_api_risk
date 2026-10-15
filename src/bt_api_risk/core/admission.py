@@ -10,7 +10,9 @@ dispatch.
 SQLite is deliberately used here because it is part of the Python standard
 library, provides an atomic ``BEGIN IMMEDIATE`` transaction across local
 processes, and keeps the first implementation usable on Windows and Linux.
-It is an account-admission store, not an order ledger or a position book.
+The default mode remains reservation-only; explicit ``LIVE_GROSS`` mode also
+persists conservative, source-verified per-order occupancy, not a full position
+book or execution engine.
 """
 
 from __future__ import annotations
@@ -30,9 +32,24 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Optional, Protocol, Union
 
+from .exposure import (
+    ExposureAccountingMode,
+    GrossExposureAuthority,
+    GrossExposureBaselineProof,
+    OrderExposureObservationProof,
+    OrderExposureSnapshot,
+    OrderExposureState,
+    VerifiedGrossExposureBaseline,
+    fill_ids_sha256,
+    fill_ids_sha256_from_ids,
+    verified_baseline_matches,
+    verified_observation_matches,
+)
 from .freeze_activation import (
     FreezeActivationResult,
     FreezeActivationStatus,
+)
+from .freeze_activation import (
     activate_freeze_once as _activate_freeze_once,
 )
 
@@ -105,10 +122,17 @@ class AccountScope:
 class RiskPolicy:
     """Fail-closed limits used for one account scope.
 
-    ``max_increase_notional`` and ``max_increase_count`` apply to outstanding
-    reservations.  A filled position is deliberately not inferred from this
-    store; a later account/position authority must reconcile it before a
-    production integration makes broader exposure claims.
+    ``max_increase_notional`` and ``max_increase_count`` always apply to
+    outstanding reservations.  The default ``RESERVATIONS_ONLY`` mode keeps
+    the legacy behavior and does not infer filled positions.  ``LIVE_GROSS``
+    is a separate explicit opt-in with independent gross occupancy caps and
+    requires a trusted account baseline plus complete current order evidence.
+    Once the baseline expires, new increases remain blocked.  Fresh order
+    observations may still reconcile or release verified open leaves, but a
+    baseline cannot be refreshed while any filled or open Risk-owned exposure
+    remains.  This version has no position-absorption or reduction-proof API;
+    an account with persistent filled exposure can therefore remain read-only
+    until a future trusted exposure-reconciliation path is added.
     """
 
     policy_id: str
@@ -117,6 +141,10 @@ class RiskPolicy:
     permit_ttl_seconds: float = 30.0
     require_strategy_allocation: bool = False
     notional_unit: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+    exposure_accounting_mode: ExposureAccountingMode = ExposureAccountingMode.RESERVATIONS_ONLY
+    max_gross_occupancy_notional: Optional[Decimal] = None  # noqa: UP045 -- Python 3.9 is supported.
+    max_gross_occupancy_intent_count: Optional[int] = None  # noqa: UP045 -- Python 3.9 is supported.
+    max_exposure_facts_age_seconds: Optional[float] = None  # noqa: UP045 -- Python 3.9 is supported.
 
     def __post_init__(self) -> None:
         try:
@@ -142,7 +170,51 @@ class RiskPolicy:
             or not _NOTIONAL_UNIT.fullmatch(self.notional_unit)
         ):
             raise ValueError("notional_unit must be a canonical uppercase unit code")
+        if type(self.exposure_accounting_mode) is not ExposureAccountingMode:
+            raise ValueError("exposure_accounting_mode must be an ExposureAccountingMode")
+        gross_cap = None
+        if self.max_gross_occupancy_notional is not None:
+            try:
+                gross_cap = _as_decimal(self.max_gross_occupancy_notional)
+            except (InvalidOperation, ValueError) as exc:
+                raise ValueError("max_gross_occupancy_notional must be non-negative") from exc
+            if gross_cap < 0:
+                raise ValueError("max_gross_occupancy_notional must be non-negative")
+        if self.max_gross_occupancy_intent_count is not None and (
+            type(self.max_gross_occupancy_intent_count) is not int
+            or self.max_gross_occupancy_intent_count < 0
+        ):
+            raise ValueError("max_gross_occupancy_intent_count must be non-negative")
+        if self.max_exposure_facts_age_seconds is not None and (
+            isinstance(self.max_exposure_facts_age_seconds, bool)
+            or not math.isfinite(self.max_exposure_facts_age_seconds)
+            or self.max_exposure_facts_age_seconds <= 0
+        ):
+            raise ValueError("max_exposure_facts_age_seconds must be positive and finite")
+        if self.exposure_accounting_mode is ExposureAccountingMode.RESERVATIONS_ONLY:
+            if any(
+                value is not None
+                for value in (
+                    gross_cap,
+                    self.max_gross_occupancy_intent_count,
+                    self.max_exposure_facts_age_seconds,
+                )
+            ):
+                raise ValueError("gross occupancy caps require LIVE_GROSS accounting")
+        else:
+            if (
+                self.notional_unit is None
+                or not self.require_strategy_allocation
+                or gross_cap is None
+                or self.max_gross_occupancy_intent_count is None
+                or self.max_exposure_facts_age_seconds is None
+            ):
+                raise ValueError(
+                    "LIVE_GROSS requires a fixed unit, strategy allocations, and explicit caps/freshness"
+                )
         object.__setattr__(self, "max_increase_notional", limit)
+        if gross_cap is not None:
+            object.__setattr__(self, "max_gross_occupancy_notional", gross_cap)
 
     @property
     def fingerprint(self) -> str:
@@ -156,6 +228,21 @@ class RiskPolicy:
             payload["require_strategy_allocation"] = True
         if self.notional_unit is not None:
             payload["notional_unit"] = self.notional_unit
+        if self.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS:
+            payload.update(
+                {
+                    "exposure_accounting_mode": ExposureAccountingMode.LIVE_GROSS.value,
+                    "exposure_schema_version": 2,
+                    "max_gross_occupancy_notional": _decimal_text(
+                        self.max_gross_occupancy_notional  # type: ignore[arg-type]
+                    ),
+                    "max_gross_occupancy_intent_count": self.max_gross_occupancy_intent_count,
+                    "max_exposure_facts_age_seconds": format(
+                        float(self.max_exposure_facts_age_seconds),
+                        ".17g",  # type: ignore[arg-type]
+                    ),
+                }
+            )
         return _sha256(_canonical_json(payload))
 
 
@@ -301,6 +388,8 @@ class StrategyAllocationSnapshot:
     position_instrument: Optional[str]  # noqa: UP045 -- Python 3.9 is supported.
     position_unit: Optional[str]  # noqa: UP045 -- Python 3.9 is supported.
     as_of: float
+    max_gross_occupancy_notional: Optional[Decimal] = None  # noqa: UP045 -- Python 3.9 is supported.
+    max_gross_occupancy_intent_count: Optional[int] = None  # noqa: UP045 -- Python 3.9 is supported.
     source: str = field(default="local_risk_reservation_ledger", init=False)
     completeness: str = "LOCAL_LEDGER_COMPLETE"
     reason: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
@@ -890,12 +979,16 @@ class DurableRiskGate:
         execution_journal_authority: Optional[  # noqa: UP045 -- Python 3.9 is supported.
             VerifiedExecutionJournalAuthority
         ] = None,
+        gross_exposure_authority: Optional[  # noqa: UP045 -- Python 3.9 is supported.
+            GrossExposureAuthority
+        ] = None,
     ) -> None:
         self._database_path = Path(database_path)
         self._policy = policy
         self._clock = clock or _wall_clock
         self._timeout_seconds = timeout_seconds
         self._execution_journal_authority = execution_journal_authority
+        self._gross_exposure_authority = gross_exposure_authority
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_schema()
 
@@ -921,6 +1014,8 @@ class DurableRiskGate:
         ] = None,
         position_unit: Optional[str] = None,  # noqa: UP045 -- Python 3.9 is supported.
         notional_unit: Optional[str] = None,  # noqa: UP045 -- Python 3.9 is supported.
+        max_gross_occupancy_notional: Optional[Decimal] = None,  # noqa: UP045 -- Python 3.9 is supported.
+        max_gross_occupancy_intent_count: Optional[int] = None,  # noqa: UP045 -- Python 3.9 is supported.
     ) -> None:
         """Install one local allocation revision for a strategy in this account.
 
@@ -980,7 +1075,30 @@ class DurableRiskGate:
                 raise ValueError("max_position requires an exact position_unit")
         elif position_instrument is not None or position_unit is not None:
             raise ValueError("position instrument/unit require max_position")
-        if normalized_notional is None and normalized_position is None:
+        normalized_gross_notional = None
+        if max_gross_occupancy_notional is not None:
+            try:
+                normalized_gross_notional = _as_decimal(max_gross_occupancy_notional)
+            except (InvalidOperation, ValueError) as exc:
+                raise ValueError("max_gross_occupancy_notional must be non-negative") from exc
+            if normalized_gross_notional < 0:
+                raise ValueError("max_gross_occupancy_notional must be non-negative")
+            if notional_unit != self._policy.notional_unit:
+                raise ValueError("gross occupancy allocation unit must match the account policy")
+        if max_gross_occupancy_intent_count is not None and (
+            type(max_gross_occupancy_intent_count) is not int
+            or max_gross_occupancy_intent_count < 0
+        ):
+            raise ValueError("max_gross_occupancy_intent_count must be non-negative")
+        if self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS and (
+            normalized_gross_notional is None or max_gross_occupancy_intent_count is None
+        ):
+            raise ValueError("LIVE_GROSS strategy allocation requires explicit gross caps")
+        if (
+            normalized_notional is None
+            and normalized_position is None
+            and normalized_gross_notional is None
+        ):
             raise ValueError("an allocation needs at least one supported limit")
 
         now = self._clock()
@@ -999,6 +1117,14 @@ class DurableRiskGate:
                     and current["position_instrument"] == position_instrument
                     and current["position_unit"] == position_unit
                     and current["notional_unit"] == notional_unit
+                    and current["max_gross_occupancy_notional"]
+                    == (
+                        None
+                        if normalized_gross_notional is None
+                        else _decimal_text(normalized_gross_notional)
+                    )
+                    and current["max_gross_occupancy_intent_count"]
+                    == max_gross_occupancy_intent_count
                 )
                 if same_facts:
                     return
@@ -1075,8 +1201,9 @@ class DurableRiskGate:
             connection.execute(
                 """INSERT INTO risk_strategy_allocation_versions (
                        scope_key, strategy_id, allocation_version, max_notional,
-                       max_position, position_instrument, position_unit, notional_unit, created_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       max_position, position_instrument, position_unit, notional_unit,
+                       max_gross_occupancy_notional, max_gross_occupancy_intent_count, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     scope.key,
                     strategy_id,
@@ -1086,14 +1213,19 @@ class DurableRiskGate:
                     position_instrument,
                     position_unit,
                     notional_unit,
+                    None
+                    if normalized_gross_notional is None
+                    else _decimal_text(normalized_gross_notional),
+                    max_gross_occupancy_intent_count,
                     now,
                 ),
             )
             connection.execute(
                 """INSERT INTO risk_strategy_allocations (
                        scope_key, strategy_id, allocation_version, max_notional,
-                       max_position, position_instrument, position_unit, notional_unit, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       max_position, position_instrument, position_unit, notional_unit,
+                       max_gross_occupancy_notional, max_gross_occupancy_intent_count, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(scope_key, strategy_id) DO UPDATE SET
                        allocation_version = excluded.allocation_version,
                        max_notional = excluded.max_notional,
@@ -1101,6 +1233,8 @@ class DurableRiskGate:
                        position_instrument = excluded.position_instrument,
                        position_unit = excluded.position_unit,
                        notional_unit = excluded.notional_unit,
+                       max_gross_occupancy_notional = excluded.max_gross_occupancy_notional,
+                       max_gross_occupancy_intent_count = excluded.max_gross_occupancy_intent_count,
                        updated_at = excluded.updated_at""",
                 (
                     scope.key,
@@ -1111,6 +1245,10 @@ class DurableRiskGate:
                     position_instrument,
                     position_unit,
                     notional_unit,
+                    None
+                    if normalized_gross_notional is None
+                    else _decimal_text(normalized_gross_notional),
+                    max_gross_occupancy_intent_count,
                     now,
                 ),
             )
@@ -1266,6 +1404,12 @@ class DurableRiskGate:
             position_instrument=allocation["position_instrument"],
             position_unit=allocation["position_unit"],
             as_of=as_of,
+            max_gross_occupancy_notional=(
+                None
+                if allocation["max_gross_occupancy_notional"] is None
+                else _as_decimal(allocation["max_gross_occupancy_notional"])
+            ),
+            max_gross_occupancy_intent_count=allocation["max_gross_occupancy_intent_count"],
             completeness="LOCAL_LEDGER_COMPLETE"
             if available is not None
             else "LOCAL_LEDGER_INCOMPLETE",
@@ -1281,7 +1425,13 @@ class DurableRiskGate:
         provider dispatch opportunity.
         """
         now = self._clock()
+        live_gross = self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS
         with self._transaction() as connection:
+            if live_gross:
+                # BEGIN IMMEDIATE can wait behind another process.  LIVE_GROSS
+                # freshness is checked at the point where this transaction
+                # owns the writer lock, never with a pre-wait timestamp.
+                now = self._clock()
             self._ensure_policy_binding(connection, intent.scope.key)
             self._expire_active(connection, now)
             existing = connection.execute(
@@ -1293,6 +1443,16 @@ class DurableRiskGate:
                 self._assert_reservation_allocation_current(connection, existing)
                 if permit.action is IntentAction.INCREASE:
                     self._assert_not_frozen(connection, permit.scope)
+                    if live_gross:
+                        self._assert_live_gross_limits(
+                            connection, intent, now, include_intent=False
+                        )
+                        final_now = self._clock()
+                        self._expire_active(connection, final_now)
+                        self._existing_permit_or_raise(existing, intent, final_now)
+                        self._assert_live_gross_limits(
+                            connection, intent, final_now, include_intent=False
+                        )
                 return permit
 
             if intent.action is IntentAction.UNKNOWN_EFFECT:
@@ -1305,6 +1465,8 @@ class DurableRiskGate:
                 self._assert_intent_notional_unit(intent)
                 self._assert_increase_limit(connection, intent)
                 self._assert_strategy_allocation_limit(connection, intent)
+                if live_gross:
+                    self._assert_live_gross_limits(connection, intent, now)
 
             generation = self._next_generation(connection, intent.scope.key)
             permit = RiskPermit(
@@ -1356,7 +1518,587 @@ class DurableRiskGate:
                     permit.notional_unit,
                 ),
             )
+            if live_gross and intent.action is IntentAction.INCREASE:
+                # Re-read the clock immediately before COMMIT.  The new permit
+                # is already in this transaction, so the usage projection
+                # counts it exactly once while the final freshness/cap check
+                # verifies that it is still safe to admit.
+                final_now = self._clock()
+                self._expire_active(connection, final_now)
+                if permit.expires_at <= final_now:
+                    raise RiskDeniedError(
+                        "INTENT_EXPIRED", "permit TTL elapsed before LIVE_GROSS admission committed"
+                    )
+                self._assert_live_gross_limits(connection, intent, final_now, include_intent=False)
             return permit
+
+    def install_gross_exposure_baseline(
+        self, proof: GrossExposureBaselineProof
+    ) -> VerifiedGrossExposureBaseline:
+        """Install one authority-verified, fully attributed LIVE_GROSS baseline.
+
+        A new baseline generation is accepted only when every previous
+        Risk-owned exposure is zero and there are no pending increase permits
+        or unresolved dispatch claims.  This prevents a refresh from silently
+        double-counting or dropping filled lots that the baseline cannot yet
+        reconcile by stable order identity.  When an installed baseline later
+        expires, fresh order observations can still advance the order ledger,
+        but new increases stay blocked and an explicit stale-baseline freeze
+        remains until a clean fresh baseline is accepted.
+        """
+        if self._policy.exposure_accounting_mode is not ExposureAccountingMode.LIVE_GROSS:
+            raise RiskDeniedError(
+                "LIVE_GROSS_NOT_CONFIGURED", "policy does not enable LIVE_GROSS accounting"
+            )
+        if type(proof) is not GrossExposureBaselineProof:
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_BASELINE_PROOF_REQUIRED", "a typed baseline proof is required"
+            )
+        if proof.notional_unit != self._policy.notional_unit:
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_UNIT_MISMATCH", "baseline does not use the fixed policy unit"
+            )
+        now_ns = int(float(self._clock()) * 1_000_000_000)
+        if not self._gross_facts_are_fresh(proof.observed_at_ns, proof.valid_until_ns, now_ns):
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_BASELINE_STALE", "account baseline is stale or not yet observed"
+            )
+        authority = self._gross_exposure_authority
+        guard_factory = getattr(authority, "baseline_guard", None)
+        if not callable(guard_factory):
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_AUTHORITY_REQUIRED",
+                "a current account baseline authority is required",
+            )
+        try:
+            with guard_factory(proof) as receipt:
+                if not verified_baseline_matches(proof, receipt):
+                    raise RiskDeniedError(
+                        "GROSS_EXPOSURE_BASELINE_REJECTED",
+                        "the authority did not verify this exact baseline and writer fence",
+                    )
+                with self._transaction() as connection:
+                    committed_at_ns = int(float(self._clock()) * 1_000_000_000)
+                    if not self._gross_facts_are_fresh(
+                        proof.observed_at_ns, proof.valid_until_ns, committed_at_ns
+                    ):
+                        raise RiskDeniedError(
+                            "GROSS_EXPOSURE_BASELINE_STALE",
+                            "account baseline expired while acquiring the writer fence",
+                        )
+                    self._ensure_policy_binding(connection, proof.scope.key)
+                    existing = connection.execute(
+                        "SELECT * FROM risk_gross_exposure_baselines WHERE scope_key = ?",
+                        (proof.scope.key,),
+                    ).fetchone()
+                    if existing is not None and existing["proof_sha256"] == proof.fingerprint:
+                        replay_at_ns = int(float(self._clock()) * 1_000_000_000)
+                        if not self._gross_facts_are_fresh(
+                            proof.observed_at_ns, proof.valid_until_ns, replay_at_ns
+                        ):
+                            raise RiskDeniedError(
+                                "GROSS_EXPOSURE_BASELINE_STALE",
+                                "account baseline expired before idempotent replay completed",
+                            )
+                        return receipt
+                    latest = connection.execute(
+                        "SELECT journal_revision FROM risk_gross_scope_revisions WHERE scope_key = ?",
+                        (proof.scope.key,),
+                    ).fetchone()
+                    if latest is not None and proof.account_revision <= int(
+                        latest["journal_revision"]
+                    ):
+                        raise RiskDeniedError(
+                            "GROSS_EXPOSURE_BASELINE_REVISION_STALE",
+                            "baseline revision must advance the durable account journal",
+                        )
+                    if existing is not None:
+                        self._assert_gross_baseline_refresh_safe(connection, proof.scope)
+                        if proof.account_revision <= int(existing["account_revision"]):
+                            raise RiskDeniedError(
+                                "GROSS_EXPOSURE_BASELINE_REVISION_STALE",
+                                "replacement baseline revision must strictly increase",
+                            )
+                        connection.execute(
+                            "DELETE FROM risk_gross_baseline_strategies WHERE scope_key = ?",
+                            (proof.scope.key,),
+                        )
+                        connection.execute(
+                            "DELETE FROM risk_gross_exposure_baselines WHERE scope_key = ?",
+                            (proof.scope.key,),
+                        )
+                    else:
+                        occupied = connection.execute(
+                            """SELECT 1 FROM risk_reservations
+                               WHERE scope_key = ? AND action = ? AND status IN (?, ?) LIMIT 1""",
+                            (
+                                proof.scope.key,
+                                IntentAction.INCREASE.value,
+                                self._ACTIVE,
+                                self._SETTLED,
+                            ),
+                        ).fetchone()
+                        if occupied is not None:
+                            raise RiskDeniedError(
+                                "GROSS_EXPOSURE_BASELINE_NOT_CLEAN",
+                                "install the baseline before admitting increase intents",
+                            )
+                    if proof.account_gross_notional > self._policy.max_gross_occupancy_notional:
+                        raise RiskDeniedError(
+                            "GROSS_EXPOSURE_ACCOUNT_LIMIT_EXCEEDED",
+                            "baseline already exceeds the configured account gross cap",
+                        )
+                    if (
+                        proof.account_active_increase_intent_count
+                        > self._policy.max_gross_occupancy_intent_count
+                    ):
+                        raise RiskDeniedError(
+                            "GROSS_EXPOSURE_ACCOUNT_COUNT_EXCEEDED",
+                            "baseline already exceeds the configured occupied-intent cap",
+                        )
+                    for strategy in proof.strategy_baselines:
+                        allocation = connection.execute(
+                            """SELECT * FROM risk_strategy_allocations
+                               WHERE scope_key = ? AND strategy_id = ?""",
+                            (proof.scope.key, strategy.strategy_id),
+                        ).fetchone()
+                        if (
+                            allocation is None
+                            or allocation["notional_unit"] != self._policy.notional_unit
+                            or allocation["max_gross_occupancy_notional"] is None
+                            or allocation["max_gross_occupancy_intent_count"] is None
+                        ):
+                            raise RiskDeniedError(
+                                "GROSS_EXPOSURE_STRATEGY_BASELINE_UNBOUND",
+                                "every baseline strategy requires an explicit gross allocation",
+                            )
+                        if strategy.gross_notional > _as_decimal(
+                            allocation["max_gross_occupancy_notional"]
+                        ):
+                            raise RiskDeniedError(
+                                "GROSS_EXPOSURE_STRATEGY_LIMIT_EXCEEDED",
+                                "strategy baseline exceeds its gross allocation",
+                            )
+                        if strategy.active_increase_intent_count > int(
+                            allocation["max_gross_occupancy_intent_count"]
+                        ):
+                            raise RiskDeniedError(
+                                "GROSS_EXPOSURE_STRATEGY_COUNT_EXCEEDED",
+                                "strategy baseline exceeds its occupied-intent cap",
+                            )
+                    connection.execute(
+                        """INSERT INTO risk_gross_exposure_baselines (
+                               scope_key, policy_hash, proof_sha256, account_revision,
+                               notional_unit, account_gross_notional,
+                               account_active_increase_intent_count, source_snapshot_sha256,
+                               positions_sha256, open_orders_sha256, valuation_facts_sha256,
+                               source_schema_version, observed_at_ns, valid_until_ns,
+                               writer_owner_id, writer_fencing_token, writer_fence_sha256
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            proof.scope.key,
+                            self._policy.fingerprint,
+                            proof.fingerprint,
+                            proof.account_revision,
+                            proof.notional_unit,
+                            _decimal_text(proof.account_gross_notional),
+                            proof.account_active_increase_intent_count,
+                            proof.source_snapshot_sha256,
+                            proof.positions_sha256,
+                            proof.open_orders_sha256,
+                            proof.valuation_facts_sha256,
+                            proof.source_schema_version,
+                            proof.observed_at_ns,
+                            proof.valid_until_ns,
+                            proof.writer_owner_id,
+                            proof.writer_fencing_token,
+                            proof.writer_fence_sha256,
+                        ),
+                    )
+                    connection.executemany(
+                        """INSERT INTO risk_gross_baseline_strategies (
+                               scope_key, strategy_id, gross_notional,
+                               active_increase_intent_count
+                           ) VALUES (?, ?, ?, ?)""",
+                        [
+                            (
+                                proof.scope.key,
+                                item.strategy_id,
+                                _decimal_text(item.gross_notional),
+                                item.active_increase_intent_count,
+                            )
+                            for item in proof.strategy_baselines
+                        ],
+                    )
+                    connection.execute(
+                        """INSERT INTO risk_gross_scope_revisions(scope_key, journal_revision)
+                           VALUES (?, ?) ON CONFLICT(scope_key) DO UPDATE SET
+                           journal_revision = excluded.journal_revision""",
+                        (proof.scope.key, proof.account_revision),
+                    )
+                    commit_at_ns = int(float(self._clock()) * 1_000_000_000)
+                    if not self._gross_facts_are_fresh(
+                        proof.observed_at_ns, proof.valid_until_ns, commit_at_ns
+                    ):
+                        raise RiskDeniedError(
+                            "GROSS_EXPOSURE_BASELINE_STALE",
+                            "account baseline expired before the Risk transaction committed",
+                        )
+                    connection.execute(
+                        "UPDATE risk_freezes SET active = 0, updated_at = ? "
+                        "WHERE scope_key = ? AND cause_id IN "
+                        "('gross-exposure-baseline-stale', 'gross-exposure-over-cap') AND active = 1",
+                        (self._clock(), proof.scope.key),
+                    )
+                    commit_at_ns = int(float(self._clock()) * 1_000_000_000)
+                    if not self._gross_facts_are_fresh(
+                        proof.observed_at_ns, proof.valid_until_ns, commit_at_ns
+                    ):
+                        raise RiskDeniedError(
+                            "GROSS_EXPOSURE_BASELINE_STALE",
+                            "account baseline expired at the transaction commit boundary",
+                        )
+                return receipt
+        except RiskDeniedError:
+            raise
+        except Exception as exc:
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_BASELINE_REJECTED",
+                "the baseline authority could not verify the account snapshot",
+            ) from exc
+
+    def apply_order_exposure_observation(
+        self, proof: OrderExposureObservationProof
+    ) -> OrderExposureSnapshot:
+        """Atomically convert a settled ACKED reservation from order to fill occupancy.
+
+        Incomplete/unknown facts preserve the prior gross amount and add a
+        durable freeze.  A complete cancel releases only the verified leaves;
+        filled gross is monotone and this API contains no client-driven reduce
+        or position-netting path.  Fresh order evidence can reconcile after
+        the account baseline expires, but stale baseline facts are never used
+        to admit an increase or clear the durable stale-baseline freeze.  A
+        filled position cannot be absorbed into a refreshed baseline here.
+        """
+        if self._policy.exposure_accounting_mode is not ExposureAccountingMode.LIVE_GROSS:
+            raise RiskDeniedError(
+                "LIVE_GROSS_NOT_CONFIGURED", "policy does not enable LIVE_GROSS accounting"
+            )
+        if type(proof) is not OrderExposureObservationProof:
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_PROOF_REQUIRED", "a typed order observation proof is required"
+            )
+        if (
+            proof.notional_unit != self._policy.notional_unit
+            or proof.valuation_unit != self._policy.notional_unit
+        ):
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_UNIT_MISMATCH", "order valuation must use the fixed policy unit"
+            )
+        now_ns = int(float(self._clock()) * 1_000_000_000)
+        self._assert_order_exposure_freshness(proof, now_ns)
+        authority = self._gross_exposure_authority
+        guard_factory = getattr(authority, "order_observation_guard", None)
+        if not callable(guard_factory):
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_AUTHORITY_REQUIRED", "a current order-journal authority is required"
+            )
+
+        reservation, claim, tracked = self._tracked_order_binding(proof.permit_id)
+        self._assert_order_exposure_proof_matches_binding(proof, claim, tracked)
+        try:
+            with guard_factory(proof, claim=claim, tracked_order=tracked) as receipt:
+                if not verified_observation_matches(proof, receipt):
+                    raise RiskDeniedError(
+                        "ORDER_EXPOSURE_AUTHORITY_REJECTED",
+                        "the authority did not verify this exact observation and current fence",
+                    )
+                with self._transaction() as connection:
+                    committed_at_ns = int(float(self._clock()) * 1_000_000_000)
+                    self._assert_order_exposure_freshness(proof, committed_at_ns)
+                    self._ensure_policy_binding(connection, proof.scope.key)
+                    reservation, current_claim, current_tracked = self._tracked_order_binding_in(
+                        connection, proof.permit_id
+                    )
+                    self._assert_order_exposure_proof_matches_binding(
+                        proof, current_claim, current_tracked
+                    )
+                    baseline = self._assert_live_baseline_bound(connection, proof.scope)
+                    baseline_fresh = self._gross_facts_are_fresh(
+                        int(baseline["observed_at_ns"]),
+                        int(baseline["valid_until_ns"]),
+                        committed_at_ns,
+                    )
+                    baseline_fence = int(baseline["writer_fencing_token"])
+                    if proof.writer_fencing_token < baseline_fence or (
+                        proof.writer_fencing_token == baseline_fence
+                        and (
+                            proof.writer_owner_id != baseline["writer_owner_id"]
+                            or proof.writer_fence_sha256 != baseline["writer_fence_sha256"]
+                        )
+                    ):
+                        raise RiskDeniedError(
+                            "ORDER_EXPOSURE_WRITER_FENCE_STALE",
+                            "order observation writer fence predates the accepted account baseline",
+                        )
+                    prior = connection.execute(
+                        "SELECT * FROM risk_order_exposures WHERE permit_id = ?",
+                        (proof.permit_id,),
+                    ).fetchone()
+                    if prior is not None and proof.order_revision == int(prior["order_revision"]):
+                        if proof.fingerprint == prior["proof_sha256"]:
+                            replay_at_ns = int(float(self._clock()) * 1_000_000_000)
+                            self._assert_order_exposure_freshness(proof, replay_at_ns)
+                            if not self._gross_facts_are_fresh(
+                                int(baseline["observed_at_ns"]),
+                                int(baseline["valid_until_ns"]),
+                                replay_at_ns,
+                            ):
+                                self._freeze_in_transaction(
+                                    connection,
+                                    proof.scope,
+                                    "gross-exposure-baseline-stale",
+                                    "gross_exposure_baseline_stale",
+                                    self._clock(),
+                                )
+                            else:
+                                connection.execute(
+                                    "UPDATE risk_freezes SET active = 0, updated_at = ? "
+                                    "WHERE scope_key = ? AND cause_id = "
+                                    "'gross-exposure-baseline-stale' AND active = 1",
+                                    (self._clock(), proof.scope.key),
+                                )
+                            self._assert_order_exposure_freshness(
+                                proof, int(float(self._clock()) * 1_000_000_000)
+                            )
+                            return self._order_exposure_snapshot(prior, proof.scope)
+                        if (
+                            proof.state is not OrderExposureState.UNKNOWN
+                            and prior["state"] != OrderExposureState.UNKNOWN.value
+                            and not self._same_order_revision_valuation_refresh(proof, prior)
+                        ):
+                            raise RiskDeniedError(
+                                "ORDER_EXPOSURE_REVISION_CONFLICT",
+                                "one provider order revision changed order or fill facts",
+                            )
+                    if (
+                        prior is not None
+                        and proof.state is not OrderExposureState.UNKNOWN
+                        and proof.order_revision < int(prior["order_revision"])
+                    ):
+                        raise RiskDeniedError(
+                            "ORDER_EXPOSURE_REVISION_STALE", "provider order revision regressed"
+                        )
+                    if prior is not None:
+                        if (
+                            proof.state is not OrderExposureState.UNKNOWN
+                            and proof.fill_watermark_revision
+                            < int(prior["fill_watermark_revision"])
+                        ):
+                            raise RiskDeniedError(
+                                "ORDER_EXPOSURE_FILL_WATERMARK_REGRESSION",
+                                "complete fill-history watermark regressed",
+                            )
+                        if prior["fill_trade_count"] is None or prior["fill_ids_sha256"] is None:
+                            raise RiskDeniedError(
+                                "ORDER_EXPOSURE_SCHEMA_UNPROVEN",
+                                "prior row lacks durable fill identity facts",
+                            )
+                        previous_fill_count = int(prior["fill_trade_count"])
+                        previous_fill_quantity = _as_decimal(prior["cumulative_filled_quantity"])
+                        if (
+                            proof.state is not OrderExposureState.UNKNOWN
+                            and proof.fill_trade_count < previous_fill_count
+                        ):
+                            raise RiskDeniedError(
+                                "ORDER_EXPOSURE_FILL_HISTORY_REGRESSION",
+                                "complete fill-trade count regressed",
+                            )
+                        if (
+                            proof.state is not OrderExposureState.UNKNOWN
+                            and proof.cumulative_filled_quantity == previous_fill_quantity
+                        ):
+                            if (
+                                proof.fill_trade_count != previous_fill_count
+                                or proof.fill_ids_sha256 != prior["fill_ids_sha256"]
+                            ):
+                                raise RiskDeniedError(
+                                    "ORDER_EXPOSURE_FILL_IDENTITY_CONFLICT",
+                                    "fill identities changed without a cumulative quantity increase",
+                                )
+                        elif proof.state is not OrderExposureState.UNKNOWN and (
+                            proof.fill_trade_count <= previous_fill_count
+                            or proof.fill_ids_sha256 == prior["fill_ids_sha256"]
+                        ):
+                            raise RiskDeniedError(
+                                "ORDER_EXPOSURE_FILL_HISTORY_INCOMPLETE",
+                                "new cumulative fills require new immutable fill identities",
+                            )
+                        if (
+                            proof.state is not OrderExposureState.UNKNOWN
+                            and prior["state"] != OrderExposureState.UNKNOWN.value
+                        ):
+                            self._assert_order_contract_stable(proof, prior)
+                        prior_fence = int(prior["writer_fencing_token"])
+                        if proof.writer_fencing_token < prior_fence or (
+                            proof.writer_fencing_token == prior_fence
+                            and (
+                                proof.writer_owner_id != prior["writer_owner_id"]
+                                or proof.writer_fence_sha256 != prior["writer_fence_sha256"]
+                            )
+                        ):
+                            raise RiskDeniedError(
+                                "ORDER_EXPOSURE_WRITER_FENCE_STALE",
+                                "order observation writer fence regressed or changed without fencing",
+                            )
+                    if proof.state is not OrderExposureState.UNKNOWN:
+                        self._assert_order_fills_extend_prior(connection, proof, prior)
+                    latest = connection.execute(
+                        "SELECT journal_revision FROM risk_gross_scope_revisions WHERE scope_key = ?",
+                        (proof.scope.key,),
+                    ).fetchone()
+                    if latest is None or proof.journal_revision <= int(latest["journal_revision"]):
+                        raise RiskDeniedError(
+                            "ORDER_EXPOSURE_JOURNAL_REVISION_STALE",
+                            "account journal revision must advance monotonically",
+                        )
+                    self._assert_order_observation_identity(proof, reservation)
+                    if self._dispatch_latch_active(connection, proof.scope, current_claim.cause_id):
+                        raise RiskDeniedError(
+                            "ORDER_EXPOSURE_DISPATCH_UNRESOLVED",
+                            "ACKED tracking must resolve the dispatch latch before exposure updates",
+                        )
+                    snapshot = self._apply_order_exposure_in_transaction(
+                        connection, proof, reservation, prior, committed_at_ns
+                    )
+                    if proof.state is not OrderExposureState.UNKNOWN:
+                        self._persist_order_fill_facts(connection, proof)
+                    connection.execute(
+                        """UPDATE risk_gross_scope_revisions SET journal_revision = ?
+                           WHERE scope_key = ?""",
+                        (proof.journal_revision, proof.scope.key),
+                    )
+                    unknown_cause = self._gross_unknown_cause(proof.permit_id)
+                    if proof.state is OrderExposureState.UNKNOWN:
+                        self._freeze_in_transaction(
+                            connection,
+                            proof.scope,
+                            unknown_cause,
+                            "order_exposure_unknown",
+                            self._clock(),
+                        )
+                    else:
+                        connection.execute(
+                            """UPDATE risk_freezes SET active = 0, updated_at = ?
+                               WHERE scope_key = ? AND cause_id = ? AND active = 1""",
+                            (self._clock(), proof.scope.key, unknown_cause),
+                        )
+                    if self._gross_scope_over_limit(connection, proof.scope):
+                        self._freeze_in_transaction(
+                            connection,
+                            proof.scope,
+                            "gross-exposure-over-cap",
+                            "gross_exposure_limit_exceeded",
+                            self._clock(),
+                        )
+                    elif baseline_fresh:
+                        connection.execute(
+                            "UPDATE risk_freezes SET active = 0, updated_at = ? "
+                            "WHERE scope_key = ? AND cause_id = 'gross-exposure-over-cap' AND active = 1",
+                            (self._clock(), proof.scope.key),
+                        )
+                    commit_at_ns = int(float(self._clock()) * 1_000_000_000)
+                    self._assert_order_exposure_freshness(proof, commit_at_ns)
+                    baseline_fresh_at_commit = self._gross_facts_are_fresh(
+                        int(baseline["observed_at_ns"]),
+                        int(baseline["valid_until_ns"]),
+                        commit_at_ns,
+                    )
+                    if baseline_fresh_at_commit:
+                        connection.execute(
+                            "UPDATE risk_freezes SET active = 0, updated_at = ? "
+                            "WHERE scope_key = ? AND cause_id = 'gross-exposure-baseline-stale' "
+                            "AND active = 1",
+                            (self._clock(), proof.scope.key),
+                        )
+                    else:
+                        self._freeze_in_transaction(
+                            connection,
+                            proof.scope,
+                            "gross-exposure-baseline-stale",
+                            "gross_exposure_baseline_stale",
+                            self._clock(),
+                        )
+                    linearized_at_ns = int(float(self._clock()) * 1_000_000_000)
+                    self._assert_order_exposure_freshness(proof, linearized_at_ns)
+                    if not self._gross_facts_are_fresh(
+                        int(baseline["observed_at_ns"]),
+                        int(baseline["valid_until_ns"]),
+                        linearized_at_ns,
+                    ):
+                        self._freeze_in_transaction(
+                            connection,
+                            proof.scope,
+                            "gross-exposure-baseline-stale",
+                            "gross_exposure_baseline_stale",
+                            self._clock(),
+                        )
+                    return snapshot
+        except RiskDeniedError:
+            raise
+        except Exception as exc:
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_AUTHORITY_REJECTED",
+                "the order journal authority could not verify this observation",
+            ) from exc
+
+    def gross_exposure_snapshot(self, scope: AccountScope) -> dict[str, object]:
+        """Return the local durable gross projection without provider I/O."""
+        with self._connection() as connection:
+            baseline = connection.execute(
+                "SELECT * FROM risk_gross_exposure_baselines WHERE scope_key = ?",
+                (scope.key,),
+            ).fetchone()
+            strategies = connection.execute(
+                "SELECT strategy_id, gross_notional, active_increase_intent_count "
+                "FROM risk_gross_baseline_strategies "
+                "WHERE scope_key = ? ORDER BY strategy_id",
+                (scope.key,),
+            ).fetchall()
+            rows = connection.execute(
+                "SELECT * FROM risk_order_exposures WHERE scope_key = ? ORDER BY permit_id",
+                (scope.key,),
+            ).fetchall()
+            revision = connection.execute(
+                "SELECT journal_revision FROM risk_gross_scope_revisions WHERE scope_key = ?",
+                (scope.key,),
+            ).fetchone()
+        return {
+            "account_baseline_notional": (
+                None if baseline is None else _as_decimal(baseline["account_gross_notional"])
+            ),
+            "notional_unit": None if baseline is None else str(baseline["notional_unit"]),
+            "baseline_revision": None if baseline is None else int(baseline["account_revision"]),
+            "baseline_active_increase_intent_count": (
+                None
+                if baseline is None or baseline["account_active_increase_intent_count"] is None
+                else int(baseline["account_active_increase_intent_count"])
+            ),
+            "journal_revision": None if revision is None else int(revision["journal_revision"]),
+            "strategy_baselines": {
+                str(row["strategy_id"]): {
+                    "gross_notional": _as_decimal(row["gross_notional"]),
+                    "active_increase_intent_count": (
+                        None
+                        if row["active_increase_intent_count"] is None
+                        else int(row["active_increase_intent_count"])
+                    ),
+                }
+                for row in strategies
+            },
+            "orders": [self._order_exposure_snapshot(row, scope) for row in rows],
+            "active_freeze_reasons": self.active_freeze_reasons(scope),
+        }
 
     def validate_permit(
         self,
@@ -1370,7 +2112,10 @@ class DurableRiskGate:
         independently owned connections or databases.
         """
         now = self._clock()
+        live_gross = self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS
         with self._transaction() as connection:
+            if live_gross:
+                now = self._clock()
             row = connection.execute(
                 "SELECT * FROM risk_reservations WHERE permit_id = ?", (permit_id,)
             ).fetchone()
@@ -1400,6 +2145,48 @@ class DurableRiskGate:
                     )
             if permit.action is IntentAction.INCREASE:
                 self._assert_not_frozen(connection, permit.scope)
+                if live_gross:
+                    live_intent = intent or RiskIntent(
+                        intent_id=permit.intent_id,
+                        scope=permit.scope,
+                        action=permit.action,
+                        notional=permit.notional,
+                        strategy_id=permit.strategy_id,
+                        allocation_version=permit.allocation_version,
+                        instrument=permit.instrument,
+                        quantity=permit.quantity,
+                        quantity_unit=permit.quantity_unit,
+                        notional_unit=permit.notional_unit,
+                    )
+                    self._assert_live_gross_limits(
+                        connection, live_intent, now, include_intent=False
+                    )
+            if live_gross and permit.action is IntentAction.INCREASE:
+                final_now = self._clock()
+                self._expire_active(connection, final_now)
+                current = connection.execute(
+                    "SELECT * FROM risk_reservations WHERE permit_id = ?", (permit_id,)
+                ).fetchone()
+                assert current is not None
+                if current["status"] != self._ACTIVE:
+                    raise PermitInvalidError("PERMIT_NOT_ACTIVE", "permit is no longer active")
+                self._assert_reservation_allocation_current(connection, current, invalid=True)
+                self._assert_not_frozen(connection, permit.scope)
+                final_intent = intent or RiskIntent(
+                    intent_id=permit.intent_id,
+                    scope=permit.scope,
+                    action=permit.action,
+                    notional=permit.notional,
+                    strategy_id=permit.strategy_id,
+                    allocation_version=permit.allocation_version,
+                    instrument=permit.instrument,
+                    quantity=permit.quantity,
+                    quantity_unit=permit.quantity_unit,
+                    notional_unit=permit.notional_unit,
+                )
+                self._assert_live_gross_limits(
+                    connection, final_intent, final_now, include_intent=False
+                )
             return permit
 
     def claim_for_dispatch(self, permit_id: str, intent: RiskIntent) -> RiskPermit:
@@ -1426,7 +2213,10 @@ class DurableRiskGate:
             raise ValueError("intent must be a RiskIntent")
         cause_id = self._dispatch_freeze_cause(intent.intent_id)
         now = self._clock()
+        live_gross = self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS
         with self._transaction() as connection:
+            if live_gross:
+                now = self._clock()
             self._ensure_policy_binding(connection, intent.scope.key)
             self._expire_active(connection, now)
             claim = connection.execute(
@@ -1454,6 +2244,21 @@ class DurableRiskGate:
 
             if permit.action is IntentAction.INCREASE:
                 self._assert_not_frozen(connection, permit.scope)
+                if live_gross:
+                    self._assert_live_gross_limits(connection, intent, now, include_intent=False)
+                    # The permit, baseline, and prior order valuations may
+                    # expire while this transaction is doing its checks.  Run
+                    # the authoritative freshness check again immediately
+                    # before installing the dispatch claim.
+                    now = self._clock()
+                    self._expire_active(connection, now)
+                    permit = self._validate_active_permit(connection, permit_id, intent)
+                    if permit.expires_at <= now:
+                        raise PermitInvalidError(
+                            "PERMIT_NOT_ACTIVE", "permit expired before dispatch claim"
+                        )
+                    self._assert_not_frozen(connection, permit.scope)
+                    self._assert_live_gross_limits(connection, intent, now, include_intent=False)
             connection.execute(
                 """
                 INSERT INTO risk_dispatch_claims (
@@ -1470,6 +2275,13 @@ class DurableRiskGate:
                 ),
             )
             self._freeze_in_transaction(connection, permit.scope, cause_id, cause_id, now)
+            if live_gross and permit.action is IntentAction.INCREASE:
+                commit_now = self._clock()
+                if permit.expires_at <= commit_now:
+                    raise PermitInvalidError(
+                        "PERMIT_NOT_ACTIVE", "permit expired before dispatch claim committed"
+                    )
+                self._assert_live_gross_limits(connection, intent, commit_now, include_intent=False)
             return permit
 
     def dispatch_claim_binding(self, permit_id: str) -> DispatchClaimBinding:
@@ -2292,10 +3104,951 @@ class DurableRiskGate:
                 "ACCOUNT_LIMIT_EXHAUSTED", "account increase notional limit exceeded"
             )
 
+    def _gross_facts_are_fresh(self, observed_at_ns: int, valid_until_ns: int, now_ns: int) -> bool:
+        max_age_ns = int(self._active_gross_age_seconds * 1_000_000_000)
+        return observed_at_ns <= now_ns < valid_until_ns and now_ns - observed_at_ns <= max_age_ns
+
+    def _assert_order_exposure_freshness(
+        self, proof: OrderExposureObservationProof, now_ns: int
+    ) -> None:
+        if proof.state is OrderExposureState.UNKNOWN:
+            return
+        if not self._gross_facts_are_fresh(proof.observed_at_ns, proof.valid_until_ns, now_ns):
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_OBSERVATION_STALE", "order or valuation evidence is stale"
+            )
+        max_age_ns = int(self._active_gross_age_seconds * 1_000_000_000)
+        if not (
+            proof.instrument_metadata_observed_at_ns
+            <= now_ns
+            < proof.instrument_metadata_valid_until_ns
+            and now_ns - proof.instrument_metadata_observed_at_ns <= max_age_ns
+        ):
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_METADATA_STALE", "instrument metadata is stale or expired"
+            )
+        if not (
+            proof.valuation_observed_at_ns <= now_ns < proof.valuation_valid_until_ns
+            and now_ns - proof.valuation_observed_at_ns <= max_age_ns
+        ):
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_VALUATION_STALE", "valuation facts are stale or expired"
+            )
+        if proof.fx_observed_at_ns is not None and not (
+            proof.fx_observed_at_ns <= now_ns < int(proof.fx_valid_until_ns)
+            and now_ns - proof.fx_observed_at_ns <= max_age_ns
+        ):
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_FX_STALE", "FX valuation facts are stale or expired"
+            )
+        if proof.valid_until_ns > min(
+            proof.instrument_metadata_valid_until_ns,
+            proof.valuation_valid_until_ns,
+            proof.fx_valid_until_ns or proof.instrument_metadata_valid_until_ns,
+        ):
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_VALIDITY_MISMATCH",
+                "order fact validity outlives metadata or FX valuation facts",
+            )
+
+    @property
+    def _active_gross_age_seconds(self) -> float:
+        return float(self._policy.max_exposure_facts_age_seconds or 0.0)
+
+    def _assert_live_baseline_fresh(
+        self, connection: sqlite3.Connection, scope: AccountScope, now_ns: int
+    ) -> sqlite3.Row:
+        baseline = self._assert_live_baseline_bound(connection, scope)
+        if not self._gross_facts_are_fresh(
+            int(baseline["observed_at_ns"]), int(baseline["valid_until_ns"]), now_ns
+        ):
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_BASELINE_STALE", "LIVE_GROSS account baseline is stale or unbound"
+            )
+
+        return baseline
+
+    def _assert_live_baseline_bound(
+        self, connection: sqlite3.Connection, scope: AccountScope
+    ) -> sqlite3.Row:
+        baseline = connection.execute(
+            "SELECT * FROM risk_gross_exposure_baselines WHERE scope_key = ?",
+            (scope.key,),
+        ).fetchone()
+        if baseline is None:
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_BASELINE_REQUIRED", "LIVE_GROSS has no verified account baseline"
+            )
+        if (
+            baseline["policy_hash"] != self._policy.fingerprint
+            or baseline["notional_unit"] != self._policy.notional_unit
+            or baseline["account_active_increase_intent_count"] is None
+        ):
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_BASELINE_UNBOUND", "LIVE_GROSS account baseline is not bound"
+            )
+        unproven_strategy = connection.execute(
+            "SELECT 1 FROM risk_gross_baseline_strategies "
+            "WHERE scope_key = ? AND active_increase_intent_count IS NULL LIMIT 1",
+            (scope.key,),
+        ).fetchone()
+        if unproven_strategy is not None:
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_BASELINE_UNATTRIBUTED",
+                "a strategy baseline has no source-proven occupied intent count",
+            )
+        return baseline
+
+    def _live_gross_usage(
+        self, connection: sqlite3.Connection, scope: AccountScope
+    ) -> tuple[Decimal, int, dict[str, Decimal], dict[str, int]]:
+        baseline = connection.execute(
+            "SELECT account_gross_notional, account_active_increase_intent_count "
+            "FROM risk_gross_exposure_baselines WHERE scope_key = ?",
+            (scope.key,),
+        ).fetchone()
+        if baseline is None:
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_BASELINE_REQUIRED", "LIVE_GROSS has no verified account baseline"
+            )
+        account_gross = Fraction(_as_decimal(baseline["account_gross_notional"]))
+        if baseline["account_active_increase_intent_count"] is None:
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_BASELINE_UNATTRIBUTED",
+                "baseline has no source-proven occupied increase-intent count",
+            )
+        account_count = int(baseline["account_active_increase_intent_count"])
+        strategy_gross = {
+            str(row["strategy_id"]): Fraction(_as_decimal(row["gross_notional"]))
+            for row in connection.execute(
+                "SELECT strategy_id, gross_notional FROM risk_gross_baseline_strategies "
+                "WHERE scope_key = ?",
+                (scope.key,),
+            ).fetchall()
+        }
+        strategy_count = {
+            str(row["strategy_id"]): int(row["active_increase_intent_count"])
+            for row in connection.execute(
+                "SELECT strategy_id, active_increase_intent_count "
+                "FROM risk_gross_baseline_strategies WHERE scope_key = ?",
+                (scope.key,),
+            ).fetchall()
+        }
+        if (
+            sum(strategy_count.values()) != account_count
+            or sum(strategy_gross.values(), Fraction(0)) != account_gross
+        ):
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_BASELINE_UNATTRIBUTED",
+                "baseline account totals do not match the fully attributed strategy rows",
+            )
+        reservations = connection.execute(
+            """SELECT reservation.permit_id, reservation.intent_id, reservation.strategy_id,
+                      reservation.notional, exposure.permit_id AS exposure_permit_id
+               FROM risk_reservations AS reservation
+               LEFT JOIN risk_order_exposures AS exposure
+                 ON exposure.permit_id = reservation.permit_id
+               WHERE reservation.scope_key = ? AND reservation.action = ?
+                 AND reservation.status IN (?, ?)""",
+            (scope.key, IntentAction.INCREASE.value, self._ACTIVE, self._SETTLED),
+        ).fetchall()
+        for row in reservations:
+            if row["exposure_permit_id"] is not None:
+                continue
+            strategy_id = row["strategy_id"]
+            if strategy_id is None:
+                raise RiskDeniedError(
+                    "GROSS_EXPOSURE_STRATEGY_UNATTRIBUTED",
+                    "LIVE_GROSS reservation has no strategy attribution",
+                )
+            amount = Fraction(_as_decimal(row["notional"]))
+            account_gross += amount
+            if amount > 0:
+                account_count += 1
+            strategy_gross[strategy_id] = strategy_gross.get(strategy_id, Fraction(0)) + amount
+            if amount > 0:
+                strategy_count[strategy_id] = strategy_count.get(strategy_id, 0) + 1
+        exposures = connection.execute(
+            """SELECT permit_id, strategy_id, filled_gross_notional, open_gross_notional
+               FROM risk_order_exposures WHERE scope_key = ?""",
+            (scope.key,),
+        ).fetchall()
+        for row in exposures:
+            amount = Fraction(_as_decimal(row["filled_gross_notional"])) + Fraction(
+                _as_decimal(row["open_gross_notional"])
+            )
+            account_gross += amount
+            if amount > 0:
+                account_count += 1
+                strategy_id = str(row["strategy_id"])
+                strategy_count[strategy_id] = strategy_count.get(strategy_id, 0) + 1
+            strategy_id = str(row["strategy_id"])
+            strategy_gross[strategy_id] = strategy_gross.get(strategy_id, Fraction(0)) + amount
+        return (
+            _decimal_from_fraction(account_gross),
+            account_count,
+            {
+                strategy_id: _decimal_from_fraction(amount)
+                for strategy_id, amount in strategy_gross.items()
+            },
+            strategy_count,
+        )
+
+    def _assert_live_gross_limits(
+        self,
+        connection: sqlite3.Connection,
+        intent: RiskIntent,
+        now: float,
+        *,
+        include_intent: bool = True,
+    ) -> None:
+        now_ns = int(float(now) * 1_000_000_000)
+        self._assert_live_baseline_fresh(connection, intent.scope, now_ns)
+        pending = connection.execute(
+            """SELECT reservation.permit_id FROM risk_reservations AS reservation
+               JOIN risk_dispatch_resolutions AS resolution
+                 ON resolution.permit_id = reservation.permit_id
+               LEFT JOIN risk_order_exposures AS exposure
+                 ON exposure.permit_id = reservation.permit_id
+               WHERE reservation.scope_key = ? AND reservation.action = ?
+                 AND reservation.status = ? AND resolution.proof_kind = 'ACKED_TRACKED'
+                 AND exposure.permit_id IS NULL LIMIT 1""",
+            (intent.scope.key, IntentAction.INCREASE.value, self._SETTLED),
+        ).fetchone()
+        if pending is not None:
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_RECONCILIATION_REQUIRED",
+                "a tracked dispatched order has not been converted to a fresh observation",
+            )
+        for row in connection.execute(
+            "SELECT * FROM risk_order_exposures WHERE scope_key = ?",
+            (intent.scope.key,),
+        ).fetchall():
+            if any(
+                row[name] is None
+                for name in (
+                    "instrument_metadata_observed_at_ns",
+                    "instrument_metadata_valid_until_ns",
+                    "valuation_observed_at_ns",
+                    "valuation_valid_until_ns",
+                    "fill_trade_count",
+                    "fill_ids_sha256",
+                    "order_side",
+                    "position_effect",
+                )
+            ):
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_SCHEMA_UNPROVEN",
+                    "an existing order row lacks required fill or valuation facts",
+                )
+            if _as_decimal(row["leaves_quantity"]) > 0 and row["leaves_valuation_price"] is None:
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_SCHEMA_UNPROVEN",
+                    "an existing open order lacks source-backed leaves valuation",
+                )
+            if row["state"] == OrderExposureState.UNKNOWN.value or not self._gross_facts_are_fresh(
+                int(row["observed_at_ns"]), int(row["valid_until_ns"]), now_ns
+            ):
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_RECONCILIATION_REQUIRED",
+                    "an order exposure is unknown or stale; no wider increase is allowed",
+                )
+            max_age_ns = int(self._active_gross_age_seconds * 1_000_000_000)
+            timestamp_facts = (
+                (
+                    int(row["instrument_metadata_observed_at_ns"]),
+                    int(row["instrument_metadata_valid_until_ns"]),
+                ),
+                (int(row["valuation_observed_at_ns"]), int(row["valuation_valid_until_ns"])),
+            )
+            if any(
+                observed_at_ns > now_ns
+                or now_ns >= valid_until_ns
+                or now_ns - observed_at_ns > max_age_ns
+                for observed_at_ns, valid_until_ns in timestamp_facts
+            ):
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_RECONCILIATION_REQUIRED",
+                    "an order valuation fact is stale; no wider increase is allowed",
+                )
+            if row["quote_currency"] != row["valuation_unit"] and row["fx_pair"] is None:
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_SCHEMA_UNPROVEN",
+                    "an existing cross-currency order has no FX pair binding",
+                )
+            if row["fx_pair"] is not None:
+                if any(
+                    row[name] is None
+                    for name in ("fx_rate", "fx_observed_at_ns", "fx_valid_until_ns")
+                ):
+                    raise RiskDeniedError(
+                        "ORDER_EXPOSURE_SCHEMA_UNPROVEN",
+                        "an existing cross-currency order lacks complete FX facts",
+                    )
+                fx_observed_at_ns = int(row["fx_observed_at_ns"])
+                fx_valid_until_ns = int(row["fx_valid_until_ns"])
+                if (
+                    fx_observed_at_ns > now_ns
+                    or now_ns >= fx_valid_until_ns
+                    or now_ns - fx_observed_at_ns > max_age_ns
+                ):
+                    raise RiskDeniedError(
+                        "ORDER_EXPOSURE_RECONCILIATION_REQUIRED",
+                        "an order FX fact is stale; no wider increase is allowed",
+                    )
+
+        account_gross, account_count, strategy_gross, strategy_count = self._live_gross_usage(
+            connection, intent.scope
+        )
+        extra_notional = intent.notional if include_intent else Decimal(0)
+        extra_count = 1 if include_intent else 0
+        if Fraction(account_gross) + Fraction(extra_notional) > Fraction(
+            self._policy.max_gross_occupancy_notional
+        ):
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_ACCOUNT_LIMIT_EXHAUSTED",
+                "account gross occupancy exceeds its explicit LIVE_GROSS cap",
+            )
+        if account_count + extra_count > self._policy.max_gross_occupancy_intent_count:
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_ACCOUNT_COUNT_EXHAUSTED",
+                "account occupied increase-intent count exceeds its LIVE_GROSS cap",
+            )
+        if intent.action is IntentAction.INCREASE:
+            if intent.strategy_id is None:
+                raise RiskDeniedError(
+                    "STRATEGY_ALLOCATION_REQUIRED", "LIVE_GROSS increase needs strategy identity"
+                )
+            allocation = connection.execute(
+                "SELECT * FROM risk_strategy_allocations WHERE scope_key = ? AND strategy_id = ?",
+                (intent.scope.key, intent.strategy_id),
+            ).fetchone()
+            if (
+                allocation is None
+                or allocation["max_gross_occupancy_notional"] is None
+                or allocation["max_gross_occupancy_intent_count"] is None
+                or allocation["notional_unit"] != self._policy.notional_unit
+            ):
+                raise RiskDeniedError(
+                    "GROSS_EXPOSURE_STRATEGY_ALLOCATION_REQUIRED",
+                    "strategy gross occupancy caps are not explicitly configured",
+                )
+            strategy_amount = Fraction(
+                strategy_gross.get(intent.strategy_id, Decimal(0))
+            ) + Fraction(extra_notional)
+            strategy_intents = strategy_count.get(intent.strategy_id, 0) + extra_count
+            if strategy_amount > Fraction(_as_decimal(allocation["max_gross_occupancy_notional"])):
+                raise RiskDeniedError(
+                    "GROSS_EXPOSURE_STRATEGY_LIMIT_EXHAUSTED",
+                    "strategy gross occupancy exceeds its explicit cap",
+                )
+            if strategy_intents > int(allocation["max_gross_occupancy_intent_count"]):
+                raise RiskDeniedError(
+                    "GROSS_EXPOSURE_STRATEGY_COUNT_EXHAUSTED",
+                    "strategy occupied increase-intent count exceeds its explicit cap",
+                )
+
+    def _gross_scope_over_limit(self, connection: sqlite3.Connection, scope: AccountScope) -> bool:
+        account_gross, account_count, strategy_gross, strategy_count = self._live_gross_usage(
+            connection, scope
+        )
+        if (
+            account_gross > self._policy.max_gross_occupancy_notional
+            or account_count > self._policy.max_gross_occupancy_intent_count
+        ):
+            return True
+        for strategy_id, amount in strategy_gross.items():
+            allocation = connection.execute(
+                "SELECT max_gross_occupancy_notional, max_gross_occupancy_intent_count "
+                "FROM risk_strategy_allocations WHERE scope_key = ? AND strategy_id = ?",
+                (scope.key, strategy_id),
+            ).fetchone()
+            if (
+                allocation is None
+                or allocation["max_gross_occupancy_notional"] is None
+                or allocation["max_gross_occupancy_intent_count"] is None
+                or amount > _as_decimal(allocation["max_gross_occupancy_notional"])
+                or strategy_count.get(strategy_id, 0)
+                > int(allocation["max_gross_occupancy_intent_count"])
+            ):
+                return True
+        return False
+
+    def _assert_gross_baseline_refresh_safe(
+        self, connection: sqlite3.Connection, scope: AccountScope
+    ) -> None:
+        exposure_rows = connection.execute(
+            """SELECT filled_gross_notional, open_gross_notional
+               FROM risk_order_exposures WHERE scope_key = ?""",
+            (scope.key,),
+        ).fetchall()
+        if any(
+            _as_decimal(row["filled_gross_notional"]) > 0
+            or _as_decimal(row["open_gross_notional"]) > 0
+            for row in exposure_rows
+        ):
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_BASELINE_REFRESH_BLOCKED",
+                "a refreshed baseline cannot absorb live or filled order exposure",
+            )
+        pending = connection.execute(
+            """SELECT 1 FROM risk_reservations AS reservation
+               LEFT JOIN risk_order_exposures AS exposure
+                 ON exposure.permit_id = reservation.permit_id
+               WHERE reservation.scope_key = ? AND reservation.action = ?
+                 AND reservation.status IN (?, ?) AND exposure.permit_id IS NULL LIMIT 1""",
+            (scope.key, IntentAction.INCREASE.value, self._ACTIVE, self._SETTLED),
+        ).fetchone()
+        unresolved = connection.execute(
+            """SELECT 1 FROM risk_dispatch_claims AS claim
+               LEFT JOIN risk_dispatch_resolutions AS resolution
+                 ON resolution.permit_id = claim.permit_id
+               WHERE claim.scope_key = ? AND resolution.permit_id IS NULL LIMIT 1""",
+            (scope.key,),
+        ).fetchone()
+        if pending is not None or unresolved is not None:
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_BASELINE_REFRESH_BLOCKED",
+                "baseline refresh requires no unobserved risk reservation or dispatch claim",
+            )
+
+    def _tracked_order_binding(
+        self, permit_id: str
+    ) -> tuple[sqlite3.Row, DispatchClaimBinding, DispatchTrackedOrderProof]:
+        with self._connection() as connection:
+            return self._tracked_order_binding_in(connection, permit_id)
+
+    def _tracked_order_binding_in(
+        self, connection: sqlite3.Connection, permit_id: str
+    ) -> tuple[sqlite3.Row, DispatchClaimBinding, DispatchTrackedOrderProof]:
+        reservation = connection.execute(
+            "SELECT * FROM risk_reservations WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        if reservation is None:
+            raise RiskDeniedError("PERMIT_UNKNOWN", "tracked exposure permit does not exist")
+        if (
+            reservation["action"] != IntentAction.INCREASE.value
+            or reservation["status"] != self._SETTLED
+        ):
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_REQUIRES_SETTLED_INCREASE",
+                "order exposure requires an exact settled increase permit",
+            )
+        claim_row = connection.execute(
+            "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        resolution = connection.execute(
+            "SELECT * FROM risk_dispatch_resolutions WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        if claim_row is None or resolution is None or resolution["proof_kind"] != "ACKED_TRACKED":
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_ACKED_TRACKING_REQUIRED",
+                "only an ACKED_TRACKED dispatch resolution can enter exposure conversion",
+            )
+        claim = self._dispatch_claim_binding(reservation, claim_row)
+        tracked = DispatchTrackedOrderProof(
+            scope=claim.scope,
+            permit_id=str(resolution["permit_id"]),
+            intent_id=str(resolution["intent_id"]),
+            intent_hash=str(resolution["intent_hash"]),
+            cause_id=str(resolution["cause_id"]),
+            claim_digest=str(resolution["claim_digest"]),
+            evidence_class=DispatchEvidenceClass(str(resolution["evidence_class"])),
+            dispatch_attempt_count=int(resolution["dispatch_attempt_count"]),
+            journal_revision=int(resolution["journal_revision"]),
+            journal_record_sha256=str(resolution["journal_record_sha256"]),
+            reconciliation_evidence_sha256=str(resolution["reconciliation_evidence_sha256"]),
+            writer_fence_sha256=str(resolution["writer_fence_sha256"]),
+            provider_order_id=str(resolution["provider_order_id"]),
+            accepted_request_sha256=str(resolution["accepted_request_sha256"]),
+            exposure_reservation_id=str(resolution["exposure_reservation_id"]),
+            exposure_reservation_sha256=str(resolution["exposure_reservation_sha256"]),
+            filled_quantity=int(resolution["filled_quantity"]),
+            trade_count=int(resolution["trade_count"]),
+        )
+        return reservation, claim, tracked
+
+    @staticmethod
+    def _assert_order_exposure_proof_matches_binding(
+        proof: OrderExposureObservationProof,
+        claim: DispatchClaimBinding,
+        tracked: DispatchTrackedOrderProof,
+    ) -> None:
+        if not all(
+            (
+                proof.scope == claim.scope == tracked.scope,
+                proof.permit_id == claim.permit_id == tracked.permit_id,
+                proof.intent_id == claim.intent_id == tracked.intent_id,
+                proof.intent_hash == claim.intent_hash == tracked.intent_hash,
+                proof.dispatch_claim_digest == claim.claim_digest == tracked.claim_digest,
+                proof.dispatch_proof_sha256 == tracked.fingerprint,
+                proof.provider_order_id == tracked.provider_order_id,
+                proof.accepted_request_sha256 == tracked.accepted_request_sha256,
+                proof.exposure_reservation_id == tracked.exposure_reservation_id,
+                proof.exposure_reservation_sha256 == tracked.exposure_reservation_sha256,
+            )
+        ):
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_DISPATCH_BINDING_MISMATCH",
+                "observation does not bind the exact settled dispatch claim and ACKED order",
+            )
+
+    @staticmethod
+    def _assert_order_observation_identity(
+        proof: OrderExposureObservationProof, reservation: sqlite3.Row
+    ) -> None:
+        expected_quantity = (
+            None if reservation["quantity"] is None else _as_decimal(reservation["quantity"])
+        )
+        if (
+            proof.scope.key != reservation["scope_key"]
+            or proof.intent_id != reservation["intent_id"]
+            or proof.intent_hash != reservation["intent_hash"]
+            or proof.instrument_id != reservation["instrument"]
+            or proof.notional_unit != reservation["notional_unit"]
+            or expected_quantity is None
+            or proof.requested_quantity != expected_quantity
+        ):
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_REQUEST_MISMATCH",
+                "observation quantity/instrument/unit differ from the admitted request",
+            )
+
+    @staticmethod
+    def _same_order_revision_valuation_refresh(
+        proof: OrderExposureObservationProof, prior: sqlite3.Row
+    ) -> bool:
+        """Allow newer valuation evidence only when provider order facts are unchanged."""
+        if prior["fill_trade_count"] is None or prior["fill_ids_sha256"] is None:
+            return False
+        return all(
+            (
+                prior["state"] == proof.state.value,
+                prior["requested_quantity"] == _decimal_text(proof.requested_quantity),
+                prior["cumulative_filled_quantity"]
+                == _decimal_text(proof.cumulative_filled_quantity),
+                prior["leaves_quantity"] == _decimal_text(proof.leaves_quantity),
+                int(prior["fill_trade_count"]) == proof.fill_trade_count,
+                prior["fill_ids_sha256"] == proof.fill_ids_sha256,
+            )
+        )
+
+    @staticmethod
+    def _assert_order_contract_stable(
+        proof: OrderExposureObservationProof, prior: sqlite3.Row
+    ) -> None:
+        immutable_fields = (
+            ("provider_order_id", proof.provider_order_id),
+            ("exposure_reservation_id", proof.exposure_reservation_id),
+            ("exposure_reservation_sha256", proof.exposure_reservation_sha256),
+            ("dispatch_claim_digest", proof.dispatch_claim_digest),
+            ("dispatch_proof_sha256", proof.dispatch_proof_sha256),
+            ("accepted_request_sha256", proof.accepted_request_sha256),
+            ("source_contract_ref", proof.source_contract_ref),
+            ("source_contract_version", proof.source_contract_version),
+            ("provider_profile_version", proof.provider_profile_version),
+            ("normalizer_schema_version", proof.normalizer_schema_version),
+            ("source_alias_map_sha256", proof.source_alias_map_sha256),
+            ("order_side", proof.order_side),
+            ("position_effect", proof.position_effect),
+            ("instrument_id", proof.instrument_id),
+            ("instrument_version", proof.instrument_version),
+            ("instrument_multiplier", _decimal_text(proof.instrument_multiplier)),
+            ("quote_currency", proof.quote_currency),
+            ("valuation_unit", proof.valuation_unit),
+            ("instrument_metadata_sha256", proof.instrument_metadata_sha256),
+            ("notional_unit", proof.notional_unit),
+        )
+        if any(str(prior[name]) != value for name, value in immutable_fields):
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_CONTRACT_CHANGED",
+                "order source, contract, side, or valuation denomination changed",
+            )
+
+    @staticmethod
+    def _assert_order_fills_extend_prior(
+        connection: sqlite3.Connection,
+        proof: OrderExposureObservationProof,
+        prior: Optional[sqlite3.Row],  # noqa: UP045 -- Python 3.9 is supported.
+    ) -> None:
+        previous = ()
+        if prior is not None:
+            previous = connection.execute(
+                "SELECT * FROM risk_order_exposure_fills WHERE permit_id = ? ORDER BY trade_id",
+                (proof.permit_id,),
+            ).fetchall()
+            previous_count = prior["fill_trade_count"]
+            previous_ids_sha = prior["fill_ids_sha256"]
+            if previous_count is None or previous_ids_sha is None:
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_SCHEMA_UNPROVEN",
+                    "prior exposure row lacks immutable fill identity metadata",
+                )
+            previous_ids = tuple(str(row["trade_id"]) for row in previous)
+            if (
+                len(previous) != int(previous_count)
+                or fill_ids_sha256_from_ids(previous_ids) != previous_ids_sha
+            ):
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_FILL_STORE_UNPROVEN",
+                    "persisted fills do not match the last accepted complete fill set",
+                )
+        current = {fact.trade_id: fact for fact in proof.fills}
+        for row in previous:
+            fact = current.get(str(row["trade_id"]))
+            if fact is None or fact.fingerprint != row["fact_sha256"]:
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_FILL_IDENTITY_CONFLICT",
+                    "a previously accepted immutable fill is missing or changed",
+                )
+
+    @staticmethod
+    def _persist_order_fill_facts(
+        connection: sqlite3.Connection, proof: OrderExposureObservationProof
+    ) -> None:
+        for fact in proof.fills:
+            connection.execute(
+                """INSERT OR IGNORE INTO risk_order_exposure_fills (
+                       permit_id, trade_id, fact_sha256, quantity, price, side,
+                       position_effect, fee_amount, fee_currency,
+                       source_record_sha256, source_revision
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    proof.permit_id,
+                    fact.trade_id,
+                    fact.fingerprint,
+                    _decimal_text(fact.quantity),
+                    _decimal_text(fact.price),
+                    fact.side,
+                    fact.position_effect,
+                    _decimal_text(fact.fee_amount),
+                    fact.fee_currency,
+                    fact.source_record_sha256,
+                    fact.source_revision,
+                ),
+            )
+            stored = connection.execute(
+                "SELECT * FROM risk_order_exposure_fills WHERE permit_id = ? AND trade_id = ?",
+                (proof.permit_id, fact.trade_id),
+            ).fetchone()
+            assert stored is not None
+            expected = (
+                fact.fingerprint,
+                _decimal_text(fact.quantity),
+                _decimal_text(fact.price),
+                fact.side,
+                fact.position_effect,
+                _decimal_text(fact.fee_amount),
+                fact.fee_currency,
+                fact.source_record_sha256,
+                fact.source_revision,
+            )
+            actual = (
+                stored["fact_sha256"],
+                stored["quantity"],
+                stored["price"],
+                stored["side"],
+                stored["position_effect"],
+                stored["fee_amount"],
+                stored["fee_currency"],
+                stored["source_record_sha256"],
+                int(stored["source_revision"]),
+            )
+            if actual != expected:
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_FILL_IDENTITY_CONFLICT",
+                    "fill identity was reused with different immutable facts",
+                )
+
+    @staticmethod
+    def _dispatch_latch_active(
+        connection: sqlite3.Connection, scope: AccountScope, cause_id: str
+    ) -> bool:
+        row = connection.execute(
+            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+            (scope.key, cause_id),
+        ).fetchone()
+        return row is not None and int(row["active"]) == 1
+
+    @staticmethod
+    def _gross_unknown_cause(permit_id: str) -> str:
+        return "gross-order-unknown:" + permit_id
+
+    @staticmethod
+    def _filled_gross_from_fill_facts(proof: OrderExposureObservationProof) -> Decimal:
+        fx_rate = Fraction(1) if proof.fx_rate is None else Fraction(proof.fx_rate)
+        multiplier = Fraction(proof.instrument_multiplier)
+        total = sum(
+            (
+                Fraction(fact.quantity) * Fraction(fact.price) * multiplier * fx_rate
+                for fact in proof.fills
+            ),
+            Fraction(0),
+        )
+        return _decimal_upper_bound_from_fraction(total)
+
+    @staticmethod
+    def _leaves_gross_from_price(proof: OrderExposureObservationProof) -> Decimal:
+        if proof.leaves_quantity == 0:
+            return Decimal(0)
+        if proof.leaves_valuation_price is None:
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_LEAVES_PRICE_REQUIRED",
+                "open leaves require a source-backed valuation price",
+            )
+        fx_rate = Fraction(1) if proof.fx_rate is None else Fraction(proof.fx_rate)
+        gross = (
+            Fraction(proof.leaves_quantity)
+            * Fraction(proof.leaves_valuation_price)
+            * Fraction(proof.instrument_multiplier)
+            * fx_rate
+        )
+        return _decimal_upper_bound_from_fraction(gross)
+
+    def _apply_order_exposure_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        proof: OrderExposureObservationProof,
+        reservation: sqlite3.Row,
+        prior: Optional[sqlite3.Row],  # noqa: UP045 -- Python 3.9 is supported.
+        now_ns: int,
+    ) -> OrderExposureSnapshot:
+        requested = _as_decimal(reservation["quantity"])
+        original_notional = _as_decimal(reservation["notional"])
+        if prior is None:
+            previous_filled_quantity = Decimal(0)
+            previous_leaves_quantity = requested
+            previous_filled_gross = Decimal(0)
+            previous_open_gross = original_notional
+            previous_state = None
+        else:
+            previous_filled_quantity = _as_decimal(prior["cumulative_filled_quantity"])
+            previous_leaves_quantity = _as_decimal(prior["leaves_quantity"])
+            previous_filled_gross = _as_decimal(prior["filled_gross_notional"])
+            previous_open_gross = _as_decimal(prior["open_gross_notional"])
+            previous_state = OrderExposureState(str(prior["state"]))
+
+        if proof.state is OrderExposureState.UNKNOWN:
+            filled_quantity = previous_filled_quantity
+            leaves_quantity = previous_leaves_quantity
+            filled_gross = previous_filled_gross
+            conservative_remaining = max(
+                Fraction(0),
+                Fraction(original_notional) - Fraction(previous_filled_gross),
+            )
+            open_gross = max(
+                previous_open_gross,
+                _decimal_upper_bound_from_fraction(conservative_remaining),
+            )
+        else:
+            filled_quantity = proof.cumulative_filled_quantity
+            leaves_quantity = proof.leaves_quantity
+            fill_gross_from_facts = self._filled_gross_from_fill_facts(proof)
+            leaves_gross_from_price = self._leaves_gross_from_price(proof)
+            if filled_quantity < previous_filled_quantity:
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_FILL_REGRESSION", "cumulative fill quantity regressed"
+                )
+            if previous_state in (
+                OrderExposureState.FILLED,
+                OrderExposureState.CANCELLED,
+                OrderExposureState.REJECTED,
+            ) and proof.state not in (
+                OrderExposureState.FILLED,
+                OrderExposureState.CANCELLED,
+                OrderExposureState.REJECTED,
+            ):
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_TERMINAL_REGRESSION", "terminal provider order became open"
+                )
+            if proof.state is OrderExposureState.ACKED and filled_quantity != 0:
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_STATE_MISMATCH", "ACKED requires zero cumulative fills"
+                )
+            if proof.state is OrderExposureState.PARTIALLY_FILLED and (
+                filled_quantity <= 0 or leaves_quantity <= 0
+            ):
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_STATE_MISMATCH", "partial fill requires fills and open leaves"
+                )
+            if proof.state is OrderExposureState.FILLED and filled_quantity != requested:
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_STATE_MISMATCH", "FILLED must cover the requested quantity"
+                )
+
+            if leaves_quantity == 0:
+                open_gross = Decimal(0)
+            else:
+                old_open_share = Fraction(0)
+                if previous_leaves_quantity > 0:
+                    old_open_fraction = Fraction(previous_open_gross)
+                    fraction_left = Fraction(leaves_quantity) / Fraction(previous_leaves_quantity)
+                    old_open_share = old_open_fraction * fraction_left
+                proportional_floor = _decimal_upper_bound_from_fraction(
+                    Fraction(original_notional) * Fraction(leaves_quantity) / Fraction(requested)
+                )
+                open_gross = max(
+                    proof.leaves_gross_notional,
+                    leaves_gross_from_price,
+                    proportional_floor,
+                    _decimal_upper_bound_from_fraction(old_open_share),
+                )
+            filled_floor = _decimal_upper_bound_from_fraction(
+                Fraction(original_notional) * Fraction(filled_quantity) / Fraction(requested)
+            )
+            transferred_floor = Fraction(previous_filled_gross)
+            if filled_quantity > previous_filled_quantity and previous_leaves_quantity > 0:
+                transferred_floor += (
+                    Fraction(previous_open_gross)
+                    * Fraction(filled_quantity - previous_filled_quantity)
+                    / Fraction(previous_leaves_quantity)
+                )
+            filled_gross = max(
+                previous_filled_gross,
+                proof.filled_gross_notional,
+                fill_gross_from_facts,
+                filled_floor,
+                _decimal_upper_bound_from_fraction(transferred_floor),
+            )
+
+        values: dict[str, object] = {
+            "permit_id": proof.permit_id,
+            "scope_key": proof.scope.key,
+            "intent_id": proof.intent_id,
+            "strategy_id": str(reservation["strategy_id"]),
+            "provider_order_id": proof.provider_order_id,
+            "exposure_reservation_id": proof.exposure_reservation_id,
+            "exposure_reservation_sha256": proof.exposure_reservation_sha256,
+            "dispatch_claim_digest": proof.dispatch_claim_digest,
+            "dispatch_proof_sha256": proof.dispatch_proof_sha256,
+            "accepted_request_sha256": proof.accepted_request_sha256,
+            "order_revision": (
+                proof.order_revision
+                if prior is None
+                else max(proof.order_revision, int(prior["order_revision"]))
+            ),
+            "journal_revision": proof.journal_revision,
+            "journal_record_sha256": proof.journal_record_sha256,
+            "observation_sha256": proof.observation_sha256,
+            "fill_history_sha256": proof.fill_history_sha256,
+            "source_alias_map_sha256": proof.source_alias_map_sha256,
+            "proof_sha256": proof.fingerprint,
+            "state": proof.state.value,
+            "requested_quantity": _decimal_text(requested),
+            "cumulative_filled_quantity": _decimal_text(filled_quantity),
+            "leaves_quantity": _decimal_text(leaves_quantity),
+            "leaves_valuation_price": (
+                None
+                if proof.leaves_valuation_price is None
+                else _decimal_text(proof.leaves_valuation_price)
+            ),
+            "filled_gross_notional": _decimal_text(filled_gross),
+            "open_gross_notional": _decimal_text(open_gross),
+            "notional_unit": proof.notional_unit,
+            "complete_order_snapshot": int(proof.complete_order_snapshot),
+            "complete_fill_history": int(proof.complete_fill_history),
+            "fill_watermark_revision": (
+                proof.fill_watermark_revision
+                if proof.state is not OrderExposureState.UNKNOWN or prior is None
+                else int(prior["fill_watermark_revision"])
+            ),
+            "source_contract_ref": proof.source_contract_ref,
+            "source_contract_version": proof.source_contract_version,
+            "provider_profile_version": proof.provider_profile_version,
+            "normalizer_schema_version": proof.normalizer_schema_version,
+            "order_side": proof.order_side,
+            "position_effect": proof.position_effect,
+            "instrument_id": proof.instrument_id,
+            "instrument_version": proof.instrument_version,
+            "instrument_multiplier": _decimal_text(proof.instrument_multiplier),
+            "quote_currency": proof.quote_currency,
+            "valuation_unit": proof.valuation_unit,
+            "instrument_metadata_sha256": proof.instrument_metadata_sha256,
+            "instrument_metadata_observed_at_ns": proof.instrument_metadata_observed_at_ns,
+            "instrument_metadata_valid_until_ns": proof.instrument_metadata_valid_until_ns,
+            "valuation_facts_sha256": proof.valuation_facts_sha256,
+            "valuation_observed_at_ns": proof.valuation_observed_at_ns,
+            "valuation_valid_until_ns": proof.valuation_valid_until_ns,
+            "fill_trade_count": (
+                proof.fill_trade_count
+                if proof.state is not OrderExposureState.UNKNOWN
+                else 0
+                if prior is None
+                else int(prior["fill_trade_count"])
+            ),
+            "fill_ids_sha256": (
+                proof.fill_ids_sha256
+                if proof.state is not OrderExposureState.UNKNOWN
+                else fill_ids_sha256(())
+                if prior is None
+                else str(prior["fill_ids_sha256"])
+            ),
+            "fx_pair": proof.fx_pair,
+            "fx_rate": None if proof.fx_rate is None else _decimal_text(proof.fx_rate),
+            "fx_observed_at_ns": proof.fx_observed_at_ns,
+            "fx_valid_until_ns": proof.fx_valid_until_ns,
+            "observed_at_ns": proof.observed_at_ns,
+            "valid_until_ns": proof.valid_until_ns,
+            "writer_owner_id": proof.writer_owner_id,
+            "writer_fencing_token": proof.writer_fencing_token,
+            "writer_fence_sha256": proof.writer_fence_sha256,
+        }
+        existing_order = connection.execute(
+            """SELECT permit_id FROM risk_order_exposures
+               WHERE scope_key = ? AND provider_order_id = ? AND permit_id != ? LIMIT 1""",
+            (proof.scope.key, proof.provider_order_id, proof.permit_id),
+        ).fetchone()
+        if existing_order is not None:
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_PROVIDER_ID_REUSED",
+                "provider order identity is already bound to another Risk permit",
+            )
+        columns = tuple(values)
+        update = ", ".join(name + " = excluded." + name for name in columns if name != "permit_id")
+        connection.execute(
+            "INSERT INTO risk_order_exposures ("  # noqa: S608 -- projection columns are fixed typed keys.
+            + ", ".join(columns)
+            + ") VALUES ("
+            + ", ".join("?" for _ in columns)
+            + ") ON CONFLICT(permit_id) DO UPDATE SET "
+            + update,
+            tuple(values[name] for name in columns),
+        )
+        row = connection.execute(
+            "SELECT * FROM risk_order_exposures WHERE permit_id = ?", (proof.permit_id,)
+        ).fetchone()
+        assert row is not None
+        return self._order_exposure_snapshot(row, proof.scope)
+
+    @staticmethod
+    def _order_exposure_snapshot(row: sqlite3.Row, scope: AccountScope) -> OrderExposureSnapshot:
+        return OrderExposureSnapshot(
+            scope=scope,
+            permit_id=str(row["permit_id"]),
+            intent_id=str(row["intent_id"]),
+            order_revision=int(row["order_revision"]),
+            journal_revision=int(row["journal_revision"]),
+            state=OrderExposureState(str(row["state"])),
+            requested_quantity=_as_decimal(row["requested_quantity"]),
+            cumulative_filled_quantity=_as_decimal(row["cumulative_filled_quantity"]),
+            leaves_quantity=_as_decimal(row["leaves_quantity"]),
+            filled_gross_notional=_as_decimal(row["filled_gross_notional"]),
+            open_gross_notional=_as_decimal(row["open_gross_notional"]),
+            leaves_valuation_price=(
+                None
+                if row["leaves_valuation_price"] is None
+                else _as_decimal(row["leaves_valuation_price"])
+            ),
+            notional_unit=str(row["notional_unit"]),
+            proof_sha256=str(row["proof_sha256"]),
+            observed_at_ns=int(row["observed_at_ns"]),
+            valid_until_ns=int(row["valid_until_ns"]),
+        )
+
     def _policy_binding_facts(self) -> tuple[object, ...]:
         """Return every policy fact that changes the meaning of one scope ledger."""
 
-        return (
+        base = (
             self._policy.fingerprint,
             self._policy.policy_id,
             _decimal_text(self._policy.max_increase_notional),
@@ -2303,6 +4056,17 @@ class DurableRiskGate:
             format(float(self._policy.permit_ttl_seconds), ".17g"),
             int(self._policy.require_strategy_allocation),
             self._policy.notional_unit,
+        )
+        if self._policy.exposure_accounting_mode is ExposureAccountingMode.RESERVATIONS_ONLY:
+            # Keep legacy binding facts exactly as they were serialized before
+            # LIVE_GROSS existed; added SQL columns remain NULL for this mode.
+            return base + (None, None, None, None, None)
+        return base + (
+            ExposureAccountingMode.LIVE_GROSS.value,
+            2,
+            _decimal_text(self._policy.max_gross_occupancy_notional),
+            self._policy.max_gross_occupancy_intent_count,
+            format(float(self._policy.max_exposure_facts_age_seconds), ".17g"),
         )
 
     def _policy_binding_read_error(
@@ -2323,6 +4087,11 @@ class DurableRiskGate:
                 row["permit_ttl_seconds"],
                 row["require_strategy_allocation"],
                 row["notional_unit"],
+                row["exposure_accounting_mode"],
+                row["exposure_schema_version"],
+                row["max_gross_occupancy_notional"],
+                row["max_gross_occupancy_intent_count"],
+                row["max_exposure_facts_age_seconds"],
             )
             return None if stored == facts else "RISK_POLICY_BINDING_MISMATCH"
 
@@ -2368,6 +4137,11 @@ class DurableRiskGate:
                 row["permit_ttl_seconds"],
                 row["require_strategy_allocation"],
                 row["notional_unit"],
+                row["exposure_accounting_mode"],
+                row["exposure_schema_version"],
+                row["max_gross_occupancy_notional"],
+                row["max_gross_occupancy_intent_count"],
+                row["max_exposure_facts_age_seconds"],
             )
             if stored != facts:
                 raise RiskDeniedError(
@@ -2405,8 +4179,11 @@ class DurableRiskGate:
             """INSERT INTO risk_policy_bindings (
                    scope_key, policy_hash, policy_id, max_increase_notional,
                    max_increase_count, permit_ttl_seconds,
-                   require_strategy_allocation, notional_unit, updated_at
-               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   require_strategy_allocation, notional_unit,
+                   exposure_accounting_mode, exposure_schema_version,
+                   max_gross_occupancy_notional, max_gross_occupancy_intent_count,
+                   max_exposure_facts_age_seconds, updated_at
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 scope_key,
                 *facts,
@@ -3008,6 +4785,11 @@ class DurableRiskGate:
                     permit_ttl_seconds TEXT NOT NULL,
                     require_strategy_allocation INTEGER NOT NULL,
                     notional_unit TEXT,
+                    exposure_accounting_mode TEXT,
+                    exposure_schema_version INTEGER,
+                    max_gross_occupancy_notional TEXT,
+                    max_gross_occupancy_intent_count INTEGER,
+                    max_exposure_facts_age_seconds TEXT,
                     updated_at REAL NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS risk_strategy_allocations (
@@ -3019,6 +4801,8 @@ class DurableRiskGate:
                     position_instrument TEXT,
                     position_unit TEXT,
                     notional_unit TEXT,
+                    max_gross_occupancy_notional TEXT,
+                    max_gross_occupancy_intent_count INTEGER,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY(scope_key, strategy_id)
                 );
@@ -3031,9 +4815,128 @@ class DurableRiskGate:
                     position_instrument TEXT,
                     position_unit TEXT,
                     notional_unit TEXT,
+                    max_gross_occupancy_notional TEXT,
+                    max_gross_occupancy_intent_count INTEGER,
                     created_at REAL NOT NULL,
                     PRIMARY KEY(scope_key, strategy_id, allocation_version)
                 );
+                CREATE TABLE IF NOT EXISTS risk_gross_exposure_baselines (
+                    scope_key TEXT PRIMARY KEY,
+                    policy_hash TEXT NOT NULL,
+                    proof_sha256 TEXT NOT NULL,
+                    account_revision INTEGER NOT NULL CHECK(account_revision > 0),
+                    notional_unit TEXT NOT NULL,
+                    account_gross_notional TEXT NOT NULL,
+                    account_active_increase_intent_count INTEGER NOT NULL,
+                    source_snapshot_sha256 TEXT NOT NULL,
+                    positions_sha256 TEXT NOT NULL,
+                    open_orders_sha256 TEXT NOT NULL,
+                    valuation_facts_sha256 TEXT NOT NULL,
+                    source_schema_version TEXT NOT NULL,
+                    observed_at_ns INTEGER NOT NULL,
+                    valid_until_ns INTEGER NOT NULL,
+                    writer_owner_id TEXT NOT NULL,
+                    writer_fencing_token INTEGER NOT NULL,
+                    writer_fence_sha256 TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS risk_gross_baseline_strategies (
+                    scope_key TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    gross_notional TEXT NOT NULL,
+                    active_increase_intent_count INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, strategy_id),
+                    FOREIGN KEY(scope_key) REFERENCES risk_gross_exposure_baselines(scope_key)
+                );
+                CREATE TABLE IF NOT EXISTS risk_gross_scope_revisions (
+                    scope_key TEXT PRIMARY KEY,
+                    journal_revision INTEGER NOT NULL CHECK(journal_revision > 0)
+                );
+                CREATE TABLE IF NOT EXISTS risk_order_exposures (
+                    permit_id TEXT PRIMARY KEY,
+                    scope_key TEXT NOT NULL,
+                    intent_id TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    provider_order_id TEXT NOT NULL,
+                    exposure_reservation_id TEXT NOT NULL,
+                    exposure_reservation_sha256 TEXT NOT NULL,
+                    dispatch_claim_digest TEXT NOT NULL,
+                    dispatch_proof_sha256 TEXT NOT NULL,
+                    accepted_request_sha256 TEXT NOT NULL,
+                    order_revision INTEGER NOT NULL CHECK(order_revision > 0),
+                    journal_revision INTEGER NOT NULL CHECK(journal_revision > 0),
+                    journal_record_sha256 TEXT NOT NULL,
+                    observation_sha256 TEXT NOT NULL,
+                    fill_history_sha256 TEXT NOT NULL,
+                    source_alias_map_sha256 TEXT NOT NULL,
+                    proof_sha256 TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    requested_quantity TEXT NOT NULL,
+                    cumulative_filled_quantity TEXT NOT NULL,
+                    leaves_quantity TEXT NOT NULL,
+                    leaves_valuation_price TEXT,
+                    filled_gross_notional TEXT NOT NULL,
+                    open_gross_notional TEXT NOT NULL,
+                    notional_unit TEXT NOT NULL,
+                    complete_order_snapshot INTEGER NOT NULL,
+                    complete_fill_history INTEGER NOT NULL,
+                    fill_watermark_revision INTEGER NOT NULL,
+                    source_contract_ref TEXT NOT NULL,
+                    source_contract_version TEXT NOT NULL,
+                    provider_profile_version TEXT NOT NULL,
+                    normalizer_schema_version TEXT NOT NULL,
+                    order_side TEXT NOT NULL CHECK(order_side IN ('BUY', 'SELL')),
+                    position_effect TEXT NOT NULL CHECK(position_effect = 'OPEN'),
+                    instrument_id TEXT NOT NULL,
+                    instrument_version TEXT NOT NULL,
+                    instrument_multiplier TEXT NOT NULL,
+                    quote_currency TEXT NOT NULL,
+                    valuation_unit TEXT NOT NULL,
+                    instrument_metadata_sha256 TEXT NOT NULL,
+                    instrument_metadata_observed_at_ns INTEGER NOT NULL,
+                    instrument_metadata_valid_until_ns INTEGER NOT NULL,
+                    valuation_facts_sha256 TEXT NOT NULL,
+                    valuation_observed_at_ns INTEGER NOT NULL,
+                    valuation_valid_until_ns INTEGER NOT NULL,
+                    fill_trade_count INTEGER NOT NULL,
+                    fill_ids_sha256 TEXT NOT NULL,
+                    fx_pair TEXT,
+                    fx_rate TEXT,
+                    fx_observed_at_ns INTEGER,
+                    fx_valid_until_ns INTEGER,
+                    observed_at_ns INTEGER NOT NULL,
+                    valid_until_ns INTEGER NOT NULL,
+                    writer_owner_id TEXT NOT NULL,
+                    writer_fencing_token INTEGER NOT NULL,
+                    writer_fence_sha256 TEXT NOT NULL,
+                    FOREIGN KEY(permit_id) REFERENCES risk_reservations(permit_id)
+                );
+                CREATE TABLE IF NOT EXISTS risk_order_exposure_fills (
+                    permit_id TEXT NOT NULL,
+                    trade_id TEXT NOT NULL,
+                    fact_sha256 TEXT NOT NULL,
+                    quantity TEXT NOT NULL,
+                    price TEXT NOT NULL,
+                    side TEXT NOT NULL CHECK(side IN ('BUY', 'SELL')),
+                    position_effect TEXT NOT NULL CHECK(position_effect = 'OPEN'),
+                    fee_amount TEXT NOT NULL,
+                    fee_currency TEXT NOT NULL,
+                    source_record_sha256 TEXT NOT NULL,
+                    source_revision INTEGER NOT NULL CHECK(source_revision > 0),
+                    PRIMARY KEY(permit_id, trade_id),
+                    FOREIGN KEY(permit_id) REFERENCES risk_order_exposures(permit_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS risk_order_exposure_fills_immutable_update
+                BEFORE UPDATE ON risk_order_exposure_fills
+                BEGIN
+                    SELECT RAISE(ABORT, 'order exposure fill facts are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS risk_order_exposure_fills_immutable_delete
+                BEFORE DELETE ON risk_order_exposure_fills
+                BEGIN
+                    SELECT RAISE(ABORT, 'order exposure fill facts are immutable');
+                END;
+                CREATE INDEX IF NOT EXISTS idx_risk_order_exposures_scope
+                    ON risk_order_exposures(scope_key, state, journal_revision);
                 """
             )
             reservation_columns = {
@@ -3062,6 +4965,62 @@ class DurableRiskGate:
                 }
                 if "notional_unit" not in allocation_columns:
                     connection.execute("ALTER TABLE " + table + " ADD COLUMN notional_unit TEXT")
+                if "max_gross_occupancy_notional" not in allocation_columns:
+                    connection.execute(
+                        "ALTER TABLE " + table + " ADD COLUMN max_gross_occupancy_notional TEXT"
+                    )
+                if "max_gross_occupancy_intent_count" not in allocation_columns:
+                    connection.execute(
+                        "ALTER TABLE "
+                        + table
+                        + " ADD COLUMN max_gross_occupancy_intent_count INTEGER"
+                    )
+            for table, name in (
+                ("risk_gross_exposure_baselines", "account_active_increase_intent_count"),
+                ("risk_gross_baseline_strategies", "active_increase_intent_count"),
+            ):
+                columns = {
+                    str(row["name"])
+                    for row in connection.execute("PRAGMA table_info(" + table + ")").fetchall()
+                }
+                if name not in columns:
+                    # Existing rows receive NULL and are deliberately unusable
+                    # for LIVE_GROSS until replaced by a new attributed baseline.
+                    connection.execute("ALTER TABLE " + table + " ADD COLUMN " + name + " INTEGER")
+            exposure_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(risk_order_exposures)").fetchall()
+            }
+            for name, column_type in (
+                ("instrument_metadata_observed_at_ns", "INTEGER"),
+                ("valuation_observed_at_ns", "INTEGER"),
+                ("valuation_valid_until_ns", "INTEGER"),
+                ("fill_trade_count", "INTEGER"),
+                ("fill_ids_sha256", "TEXT"),
+                ("order_side", "TEXT"),
+                ("position_effect", "TEXT"),
+                ("leaves_valuation_price", "TEXT"),
+            ):
+                if name not in exposure_columns:
+                    # Never infer missing history/valuation from an old row.
+                    connection.execute(
+                        "ALTER TABLE risk_order_exposures ADD COLUMN " + name + " " + column_type
+                    )
+            policy_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(risk_policy_bindings)").fetchall()
+            }
+            for name, column_type in (
+                ("exposure_accounting_mode", "TEXT"),
+                ("exposure_schema_version", "INTEGER"),
+                ("max_gross_occupancy_notional", "TEXT"),
+                ("max_gross_occupancy_intent_count", "INTEGER"),
+                ("max_exposure_facts_age_seconds", "TEXT"),
+            ):
+                if name not in policy_columns:
+                    connection.execute(
+                        "ALTER TABLE risk_policy_bindings ADD COLUMN " + name + " " + column_type
+                    )
             connection.execute(
                 """CREATE INDEX IF NOT EXISTS idx_risk_reservations_strategy_status
                    ON risk_reservations(scope_key, strategy_id, status, action)"""
@@ -3131,6 +5090,19 @@ def _decimal_from_fraction(value: Fraction) -> Decimal:
     digits = tuple(int(character) for character in str(scaled))
     sign = 1 if numerator < 0 else 0
     return Decimal((sign, digits, -places))
+
+
+def _decimal_upper_bound_from_fraction(value: Fraction, *, places: int = 28) -> Decimal:
+    """Round a non-negative gross-occupancy ratio upward without Decimal context."""
+
+    if value < 0 or type(places) is not int or places <= 0:
+        raise ValueError("gross occupancy rounding requires a non-negative amount and scale")
+    scaled_numerator = value.numerator * (10**places)
+    scaled, remainder = divmod(scaled_numerator, value.denominator)
+    if remainder:
+        scaled += 1
+    digits = tuple(int(character) for character in str(scaled))
+    return Decimal((0, digits, -places))
 
 
 def _decimal_text(value: Decimal) -> str:

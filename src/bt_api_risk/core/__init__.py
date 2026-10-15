@@ -37,6 +37,19 @@ from .admission import (
     VerifiedDispatchResolution,
     VerifiedExecutionJournalAuthority,
 )
+from .exposure import (
+    ExposureAccountingMode,
+    GrossExposureAuthority,
+    GrossExposureBaselineProof,
+    OrderExposureObservationProof,
+    OrderExposureSnapshot,
+    OrderExposureState,
+    OrderFillFact,
+    StrategyGrossBaseline,
+    VerifiedGrossExposureBaseline,
+    VerifiedOrderExposureObservation,
+    fill_ids_sha256,
+)
 from .instrument import (
     INSTRUMENT_METADATA_DIGEST_TAG,
     InstrumentRiskAdmissionMapper,
@@ -73,6 +86,17 @@ def __dir__() -> list[str]:
 __all__ = [
     "RiskManager",
     "RiskAssessor",
+    "ExposureAccountingMode",
+    "GrossExposureAuthority",
+    "GrossExposureBaselineProof",
+    "OrderExposureObservationProof",
+    "OrderExposureSnapshot",
+    "OrderExposureState",
+    "OrderFillFact",
+    "StrategyGrossBaseline",
+    "VerifiedGrossExposureBaseline",
+    "VerifiedOrderExposureObservation",
+    "fill_ids_sha256",
     "RiskCalculator",
     "LimitsManager",
     "PolicyEngine",
