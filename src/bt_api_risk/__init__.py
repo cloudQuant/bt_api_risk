@@ -74,10 +74,16 @@ _ANALYSIS_EXPORTS = {
     "RiskEnsembleModel": ".ml_models.ensemble_model",
 }
 
+_ADMISSION_EXPORTS = {
+    "DurableRiskAdmissionAdapter": ".order_admission",
+    "RiskAdmissionAdapterError": ".order_admission",
+    "RiskAdmissionDeniedError": ".order_admission",
+}
+
 
 def __getattr__(name: str):
-    """Load analytical features only when explicitly requested by the caller."""
-    module = _ANALYSIS_EXPORTS.get(name)
+    """Load optional features only when explicitly requested by the caller."""
+    module = _ANALYSIS_EXPORTS.get(name) or _ADMISSION_EXPORTS.get(name)
     if module is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
     value = getattr(import_module(module, __name__), name)
@@ -133,6 +139,9 @@ __all__ = [
     "InstrumentRiskMetadata",
     "InstrumentRiskOrder",
     "InstrumentRiskRegistry",
+    "DurableRiskAdmissionAdapter",
+    "RiskAdmissionAdapterError",
+    "RiskAdmissionDeniedError",
 ]
 
 # 版本信息

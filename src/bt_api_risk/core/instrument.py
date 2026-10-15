@@ -589,6 +589,11 @@ class InstrumentRiskAdmissionMapper:
             notional = assessment.gross_notional
             payload_fingerprint = assessment.bound_payload_fingerprint(intent_fingerprint)
             quantity_unit = assessment.metadata.quantity_unit
+            # The valuation unit is a trusted instrument fact, independent of
+            # whether this order has a separate strategy allocation.  Carry it
+            # into the account reservation so a fixed-unit account policy can
+            # enforce its denomination on account-only risk admission too.
+            notional_unit = assessment.metadata.valuation_unit
             if self._allocation_reader is not None:
                 execution_scope = getattr(intent, "scope", None)
                 if execution_scope is None:

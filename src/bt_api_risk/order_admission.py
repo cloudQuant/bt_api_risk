@@ -1,0 +1,171 @@
+"""Bind neutral account orders to the durable risk admission gate.
+
+This module is the risk-side adapter for an account owner's order entry.  The
+caller supplies the owner-configured mapper that derives a trusted
+``RiskIntent`` from its immutable order contract.  The adapter keeps risk
+optional for the execution package: it imports neither execution nor gateway
+and performs no provider or network I/O.
+
+The adapter is admission only.  A successful dispatch claim installs the
+gate's durable account freeze; settlement does not clear that freeze.  Order
+observation and evidence-bound freeze resolution remain the account owner's
+responsibility.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Callable
+from typing import Any, NoReturn
+
+from .core.admission import (
+    AccountScope,
+    DurableRiskGate,
+    PermitInvalidError,
+    RiskDeniedError,
+    RiskIntent,
+    RiskPermit,
+)
+
+_RISK_DENIAL_CODE = re.compile(r"^[A-Z][A-Z0-9_]{0,95}$")
+
+
+class RiskAdmissionAdapterError(ValueError):
+    """Finite composition error raised before the durable gate is called."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+class RiskAdmissionDeniedError(PermissionError):
+    """Finite, risk-neutral projection for an expected admission rejection."""
+
+    def __init__(self, code: str) -> None:
+        if type(code) is not str or not _RISK_DENIAL_CODE.fullmatch(code):
+            raise ValueError("invalid risk admission denial code")
+        self.code = code
+        super().__init__(code)
+
+
+class DurableRiskAdmissionAdapter:
+    """Expose ``DurableRiskGate`` through an account owner's order port.
+
+    ``map_intent`` belongs to the trusted account-service composition.  It
+    binds order identity, account scope, position effect, trusted instrument
+    facts, and any configured strategy allocation into one ``RiskIntent``.
+    The neutral order object is deliberately accepted by structural contract,
+    so installing this adapter does not add an execution-package dependency.
+
+    The incoming order's provider, environment, and account reference must
+    match the scope produced by the mapper on every operation.  This prevents
+    a correctly configured account adapter from silently re-binding an order
+    routed for a different account.
+    """
+
+    def __init__(
+        self,
+        gate: DurableRiskGate,
+        map_intent: Callable[[Any], RiskIntent],
+    ) -> None:
+        if type(gate) is not DurableRiskGate:
+            raise RiskAdmissionAdapterError("INVALID_RISK_GATE")
+        if not callable(map_intent):
+            raise RiskAdmissionAdapterError("INTENT_MAPPER_REQUIRED")
+        self._gate = gate
+        self._map_intent = map_intent
+
+    def reserve(self, intent: Any) -> RiskPermit:
+        """Durably reserve capacity for one immutable account order."""
+
+        try:
+            return self._gate.reserve(self._map_order(intent))
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
+    def validate(self, permit_reference: str, intent: Any) -> RiskPermit:
+        """Revalidate a pending permit against the same immutable order."""
+
+        try:
+            return self._gate.validate_permit(permit_reference, self._map_order(intent))
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
+    def claim_for_dispatch(self, permit_reference: str, intent: Any) -> RiskPermit:
+        """Atomically claim the single dispatch attempt immediately before I/O."""
+
+        try:
+            return self._gate.claim_for_dispatch(permit_reference, self._map_order(intent))
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
+    def settle(self, permit_reference: str) -> RiskPermit:
+        """Consume a claimed permit after the account owner records its outcome."""
+
+        return self._gate.settle(permit_reference)
+
+    def ensure_settled(self, permit_reference: str) -> RiskPermit:
+        """Prove recovery settlement after the owner records a known outcome."""
+
+        return self._gate.ensure_settled(permit_reference)
+
+    def release(self, permit_reference: str, reason: str) -> None:
+        """Release only an unclaimed reservation the owner did not dispatch."""
+
+        self._gate.release(permit_reference, reason)
+
+    @staticmethod
+    def _raise_neutral_denial(error: Exception) -> NoReturn:
+        """Project only exact, coded gate decisions into the order-port contract."""
+
+        if type(error) not in (RiskDeniedError, PermitInvalidError):
+            raise error
+        code = getattr(error, "code", None)
+        if type(code) is not str or not _RISK_DENIAL_CODE.fullmatch(code):
+            raise error
+        raise RiskAdmissionDeniedError(code) from None
+
+    def _map_order(self, intent: Any) -> RiskIntent:
+        mapped = self._map_intent(intent)
+        if type(mapped) is not RiskIntent:
+            raise RiskAdmissionAdapterError("MAPPED_RISK_INTENT_REQUIRED")
+
+        order_intent_id = getattr(intent, "intent_id", None)
+        if type(order_intent_id) is not str or mapped.intent_id != order_intent_id:
+            raise RiskDeniedError(
+                "ORDER_INTENT_ID_MISMATCH",
+                "mapped risk intent does not match the order intent identity",
+            )
+
+        order_scope = getattr(intent, "scope", None)
+        try:
+            input_scope = AccountScope(
+                provider=order_scope.provider,
+                account_id=order_scope.account_ref,
+                environment=order_scope.environment,
+            )
+        except (AttributeError, TypeError, ValueError):
+            raise RiskDeniedError(
+                "ACCOUNT_SCOPE_UNPROVEN",
+                "order does not carry a valid account scope",
+            ) from None
+
+        if mapped.scope != input_scope:
+            raise RiskDeniedError(
+                "ACCOUNT_SCOPE_MISMATCH",
+                "mapped risk scope does not match the order account scope",
+            )
+        strategy_id = getattr(order_scope, "strategy_id", None)
+        if mapped.strategy_id is not None and mapped.strategy_id != strategy_id:
+            raise RiskDeniedError(
+                "STRATEGY_SCOPE_MISMATCH",
+                "mapped strategy allocation does not match the order strategy scope",
+            )
+        return mapped
+
+
+__all__ = [
+    "DurableRiskAdmissionAdapter",
+    "RiskAdmissionAdapterError",
+    "RiskAdmissionDeniedError",
+]
