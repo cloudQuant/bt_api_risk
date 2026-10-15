@@ -15,7 +15,7 @@ responsibility.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any, NoReturn
 
 from .core.admission import (
@@ -23,6 +23,9 @@ from .core.admission import (
     DurableRiskGate,
     PermitInvalidError,
     RiskDeniedError,
+    RiskGroupLegClaimReceipt,
+    RiskGroupLegIntent,
+    RiskGroupReservationReceipt,
     RiskIntent,
     RiskPermit,
 )
@@ -114,6 +117,91 @@ class DurableRiskAdmissionAdapter:
 
         self._gate.release(permit_reference, reason)
 
+    def reserve_group_vector(
+        self,
+        scope: AccountScope,
+        group_id: str,
+        members: Sequence[tuple[str, Any]],
+        *,
+        deadline_ns: int,
+    ) -> RiskGroupReservationReceipt:
+        """Map a complete trusted leg vector and reserve it in one gate txn."""
+
+        try:
+            if type(scope) is not AccountScope:
+                raise RiskDeniedError("GROUP_SCOPE_MISMATCH", "a trusted account scope is required")
+            if isinstance(members, (str, bytes)) or not isinstance(members, Sequence):
+                raise RiskDeniedError(
+                    "GROUP_INVALID_LEG", "a complete sequence of raw order members is required"
+                )
+            mapped_members: list[RiskGroupLegIntent] = []
+            for member in members:
+                if type(member) is not tuple or len(member) != 2:
+                    raise RiskDeniedError(
+                        "GROUP_INVALID_LEG", "each group member must be (leg_id, order)"
+                    )
+                leg_id, order = member
+                mapped = self._map_group_order(order)
+                if mapped.scope != scope:
+                    raise RiskDeniedError(
+                        "GROUP_SCOPE_MISMATCH", "every mapped order must use the requested account"
+                    )
+                try:
+                    mapped_members.append(RiskGroupLegIntent(leg_id=leg_id, intent=mapped))
+                except (TypeError, ValueError):
+                    raise RiskDeniedError(
+                        "GROUP_INVALID_LEG", "group leg identity or mapping is invalid"
+                    ) from None
+            return self._gate.reserve_group_vector(
+                scope, group_id, tuple(mapped_members), deadline_ns=deadline_ns
+            )
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
+    def query_group_vector(self, scope: AccountScope, group_id: str) -> RiskGroupReservationReceipt:
+        """Read the durable full-vector receipt for one exact account/group."""
+
+        try:
+            return self._gate.query_group_vector(scope, group_id)
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
+    def release_group_unclaimed(
+        self, scope: AccountScope, group_id: str, reason: str
+    ) -> RiskGroupReservationReceipt:
+        """Release only the unclaimed siblings permitted by durable group rules."""
+
+        try:
+            return self._gate.release_group_unclaimed(scope, group_id, reason)
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
+    def claim_group_leg(
+        self,
+        intent: Any,
+        *,
+        group_id: str,
+        leg_id: str,
+        permit_reference: str,
+        group_fingerprint: str,
+        deadline_ns: int,
+    ) -> RiskGroupLegClaimReceipt:
+        """Claim one mapper-verified child order under its reserved group leg."""
+
+        try:
+            mapped = self._map_group_order(intent)
+            return self._gate.claim_group_leg(
+                mapped.scope,
+                group_id,
+                leg_id,
+                permit_reference,
+                mapped,
+                expected_group_fingerprint=group_fingerprint,
+                expected_deadline_ns=deadline_ns,
+            )
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
     @staticmethod
     def _raise_neutral_denial(error: Exception) -> NoReturn:
         """Project only exact, coded gate decisions into the order-port contract."""
@@ -126,7 +214,24 @@ class DurableRiskAdmissionAdapter:
         raise RiskAdmissionDeniedError(code) from None
 
     def _map_order(self, intent: Any) -> RiskIntent:
-        mapped = self._map_intent(intent)
+        return self._bind_mapped_order(intent, self._map_intent(intent))
+
+    def _map_group_order(self, intent: Any) -> RiskIntent:
+        mapper = self._map_intent
+        group_mapper = getattr(mapper, "map_group_intent", None)
+        if not callable(group_mapper):
+            owner = getattr(mapper, "__self__", None)
+            group_mapper = getattr(owner, "map_group_intent", None)
+        mapped = group_mapper(intent) if callable(group_mapper) else mapper(intent)
+        mapped = self._bind_mapped_order(intent, mapped)
+        if mapped.exposure_profile_fingerprint is None:
+            raise RiskDeniedError(
+                "GROUP_PROFILE_UNAVAILABLE",
+                "group orders require a trusted mapper-owned exposure profile",
+            )
+        return mapped
+
+    def _bind_mapped_order(self, intent: Any, mapped: Any) -> RiskIntent:
         if type(mapped) is not RiskIntent:
             raise RiskAdmissionAdapterError("MAPPED_RISK_INTENT_REQUIRED")
 

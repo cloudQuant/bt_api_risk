@@ -23,7 +23,7 @@ import math
 import re
 import sqlite3
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -78,6 +78,7 @@ _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _NOTIONAL_UNIT = re.compile(r"^[A-Z][A-Z0-9]{2,11}$")
 _ALLOCATION_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _ALLOCATION_INSTRUMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$")
+_RISK_GROUP_MAX_LEGS = 3
 
 
 def _require_sha256(value: object, name: str) -> str:
@@ -265,6 +266,9 @@ class RiskIntent:
     quantity: Optional[Decimal] = None  # noqa: UP045 -- Python 3.9 is supported.
     quantity_unit: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
     notional_unit: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+    exposure_profile_fingerprint: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+    instrument_facts_observed_at_ns: Optional[int] = None  # noqa: UP045 -- Python 3.9 is supported.
+    instrument_facts_valid_until_ns: Optional[int] = None  # noqa: UP045 -- Python 3.9 is supported.
 
     def __post_init__(self) -> None:
         if not self.intent_id.strip():
@@ -280,6 +284,21 @@ class RiskIntent:
             or not _NOTIONAL_UNIT.fullmatch(self.notional_unit)
         ):
             raise ValueError("notional_unit must be a canonical uppercase unit code")
+        if self.exposure_profile_fingerprint is not None:
+            _require_sha256(self.exposure_profile_fingerprint, "exposure_profile_fingerprint")
+        if any(
+            value is not None
+            for value in (
+                self.instrument_facts_observed_at_ns,
+                self.instrument_facts_valid_until_ns,
+            )
+        ) and (
+            type(self.instrument_facts_observed_at_ns) is not int
+            or type(self.instrument_facts_valid_until_ns) is not int
+            or self.instrument_facts_observed_at_ns <= 0
+            or self.instrument_facts_valid_until_ns <= self.instrument_facts_observed_at_ns
+        ):
+            raise ValueError("instrument fact timestamps must be a positive ordered pair")
         if (self.strategy_id is None) != (self.allocation_version is None):
             raise ValueError("strategy_id and allocation_version must be supplied together")
         for name in ("strategy_id", "allocation_version"):
@@ -344,6 +363,8 @@ class RiskIntent:
             payload["quantity_unit"] = self.quantity_unit
         if self.notional_unit is not None:
             payload["notional_unit"] = self.notional_unit
+        if self.exposure_profile_fingerprint is not None:
+            payload["exposure_profile_fingerprint"] = self.exposure_profile_fingerprint
         return _sha256(_canonical_json(payload))
 
 
@@ -490,6 +511,175 @@ class DispatchClaimBinding:
         _require_sha256(self.claim_digest, "claim_digest")
         if not isinstance(self.claimed_at, (int, float)) or not math.isfinite(self.claimed_at):
             raise ValueError("invalid dispatch claim timestamp")
+
+
+class RiskGroupReservationState(str, Enum):
+    """Durable state of one member in an atomic account reservation vector."""
+
+    ACTIVE = "active"
+    SETTLED = "settled"
+    RELEASED = "released"
+    EXPIRED = "expired"
+    NO_FILL_TERMINAL = "no_fill_terminal"
+
+
+@dataclass(frozen=True)
+class RiskGroupLegIntent:
+    """One trusted, maximum-size increase reserved as part of a full vector."""
+
+    leg_id: str
+    intent: RiskIntent
+
+    def __post_init__(self) -> None:
+        if type(self.leg_id) is not str or not _ALLOCATION_ID.fullmatch(self.leg_id):
+            raise ValueError("invalid group leg_id")
+        if type(self.intent) is not RiskIntent:
+            raise ValueError("group leg requires a RiskIntent")
+
+
+@dataclass(frozen=True)
+class RiskGroupReservationLeg:
+    """Read-only durable status and identity of one reserved group leg.
+
+    ``reserved_intent_hash`` identifies the immutable maximum exposure
+    reservation. ``actual_intent_hash`` is populated only after a one-shot
+    dispatch claim and identifies the trusted mapper's actual child intent.
+    The execution request fingerprint is a separate journal-owned value.
+    """
+
+    leg_id: str
+    permit_id: str
+    intent_id: str
+    reserved_intent_hash: str
+    exposure_profile_fingerprint: str
+    actual_intent_hash: Optional[str]  # noqa: UP045 -- Python 3.9 is supported.
+    state: RiskGroupReservationState
+    claimed: bool
+    resolved: bool
+    expires_at_ns: int
+
+    def __post_init__(self) -> None:
+        if type(self.leg_id) is not str or not _ALLOCATION_ID.fullmatch(self.leg_id):
+            raise ValueError("invalid group leg_id")
+        for name in ("permit_id", "intent_id"):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError("invalid group leg " + name)
+        _require_sha256(self.reserved_intent_hash, "reserved_intent_hash")
+        _require_sha256(self.exposure_profile_fingerprint, "exposure_profile_fingerprint")
+        if self.actual_intent_hash is not None:
+            _require_sha256(self.actual_intent_hash, "actual_intent_hash")
+        if type(self.state) is not RiskGroupReservationState:
+            raise ValueError("invalid group reservation state")
+        if type(self.claimed) is not bool or type(self.resolved) is not bool:
+            raise ValueError("group claim/resolution flags must be boolean")
+        if type(self.expires_at_ns) is not int or self.expires_at_ns <= 0:
+            raise ValueError("invalid group permit expiry")
+        if self.resolved and not self.claimed:
+            raise ValueError("an unclaimed group leg cannot be resolved")
+        if self.claimed != (self.actual_intent_hash is not None):
+            raise ValueError("group actual intent hash must match claim presence")
+
+
+@dataclass(frozen=True)
+class RiskGroupReservationReceipt:
+    """Consistent SQLite snapshot of a complete same-account leg vector."""
+
+    scope: AccountScope
+    group_id: str
+    group_fingerprint: str
+    policy_fingerprint: str
+    deadline_ns: int
+    legs: tuple[RiskGroupReservationLeg, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.scope) is not AccountScope:
+            raise ValueError("invalid group reservation scope")
+        if type(self.group_id) is not str or not _ALLOCATION_ID.fullmatch(self.group_id):
+            raise ValueError("invalid group_id")
+        _require_sha256(self.group_fingerprint, "group_fingerprint")
+        _require_sha256(self.policy_fingerprint, "policy_fingerprint")
+        if type(self.deadline_ns) is not int or self.deadline_ns <= 0:
+            raise ValueError("invalid group deadline")
+        if type(self.legs) is not tuple or not 1 <= len(self.legs) <= _RISK_GROUP_MAX_LEGS:
+            raise ValueError("invalid group reservation leg vector")
+        if any(type(leg) is not RiskGroupReservationLeg for leg in self.legs):
+            raise ValueError("invalid group reservation leg")
+        if tuple(sorted(leg.leg_id for leg in self.legs)) != tuple(
+            leg.leg_id for leg in self.legs
+        ) or len({leg.leg_id for leg in self.legs}) != len(self.legs):
+            raise ValueError("group reservation legs must be uniquely sorted")
+
+
+@dataclass(frozen=True)
+class RiskGroupLegClaimReceipt:
+    """Exact one-shot claim for a bounded child order of a reserved group leg."""
+
+    scope: AccountScope
+    group_id: str
+    group_fingerprint: str
+    policy_fingerprint: str
+    deadline_ns: int
+    leg_id: str
+    permit: RiskPermit
+    reserved_intent_hash: str
+    actual_intent_hash: str
+    exposure_profile_fingerprint: str
+    actual_quantity: Decimal
+    actual_notional: Decimal
+    claim: DispatchClaimBinding
+
+    def __post_init__(self) -> None:
+        if type(self.scope) is not AccountScope or type(self.permit) is not RiskPermit:
+            raise ValueError("invalid group leg claim scope or permit")
+        if type(self.group_id) is not str or not _ALLOCATION_ID.fullmatch(self.group_id):
+            raise ValueError("invalid group_id")
+        if type(self.leg_id) is not str or not _ALLOCATION_ID.fullmatch(self.leg_id):
+            raise ValueError("invalid group leg_id")
+        _require_sha256(self.group_fingerprint, "group_fingerprint")
+        _require_sha256(self.policy_fingerprint, "policy_fingerprint")
+        _require_sha256(self.reserved_intent_hash, "reserved_intent_hash")
+        _require_sha256(self.actual_intent_hash, "actual_intent_hash")
+        _require_sha256(self.exposure_profile_fingerprint, "exposure_profile_fingerprint")
+        if type(self.deadline_ns) is not int or self.deadline_ns <= 0:
+            raise ValueError("invalid group deadline")
+        if type(self.claim) is not DispatchClaimBinding:
+            raise ValueError("invalid group dispatch claim")
+        if self.claim.scope != self.scope or self.permit.scope != self.scope:
+            raise ValueError("group claim scope mismatch")
+        if (
+            self.permit.intent_id != self.claim.intent_id
+            or self.permit.permit_id != self.claim.permit_id
+            or self.claim.intent_hash != self.reserved_intent_hash
+        ):
+            raise ValueError("group claim does not bind its reserved permit")
+        try:
+            quantity = _as_decimal(self.actual_quantity)
+            notional = _as_decimal(self.actual_notional)
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("invalid group child quantity/notional") from exc
+        if quantity <= 0 or notional <= 0:
+            raise ValueError("group child quantity/notional must be positive")
+        object.__setattr__(self, "actual_quantity", quantity)
+        object.__setattr__(self, "actual_notional", notional)
+
+    @property
+    def permit_reference(self) -> str:
+        """Return the account owner's opaque durable permit reference."""
+
+        return self.permit.permit_id
+
+    @property
+    def claimed(self) -> bool:
+        """A returned claim receipt always represents the consumed one-shot claim."""
+
+        return True
+
+    @property
+    def resolved(self) -> bool:
+        """A fresh dispatch claim has not yet received terminal evidence."""
+
+        return False
 
 
 @dataclass(frozen=True)
@@ -1816,6 +2006,11 @@ class DurableRiskGate:
                 (intent.intent_id,),
             ).fetchone()
             if existing is not None:
+                if existing["group_id"] is not None:
+                    raise RiskDeniedError(
+                        "GROUP_PERMIT_REQUIRED",
+                        "group permit must be used through its explicit group operation",
+                    )
                 permit = self._existing_permit_or_raise(existing, intent, now)
                 self._assert_reservation_allocation_current(connection, existing)
                 if permit.action is IntentAction.INCREASE:
@@ -1869,8 +2064,11 @@ class DurableRiskGate:
                     permit_id, intent_id, intent_hash, scope_key, provider, account_id, environment,
                     action, notional, policy_hash, generation, issued_at, expires_at, status, reason,
                     strategy_id, allocation_version, instrument, quantity, quantity_unit,
-                    notional_unit
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?)
+                    notional_unit, group_id, group_fingerprint, group_leg_id,
+                    group_deadline_ns, group_expires_at_ns, group_leg_count,
+                    group_exposure_profile_fingerprint
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?,
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL)
                 """,
                 (
                     permit.permit_id,
@@ -1908,6 +2106,479 @@ class DurableRiskGate:
                     )
                 self._assert_live_gross_limits(connection, intent, final_now, include_intent=False)
             return permit
+
+    def reserve_group_vector(
+        self,
+        scope: AccountScope,
+        group_id: str,
+        legs: Sequence[RiskGroupLegIntent],
+        *,
+        deadline_ns: int,
+    ) -> RiskGroupReservationReceipt:
+        """Atomically reserve a complete same-account vector of opening legs.
+
+        The immutable group identity includes the full, mapper-produced
+        maximum-size intent for every leg and one absolute UTC deadline.  A
+        retry with the same identity returns the existing receipt; it never
+        renews permit TTLs or creates replacement permits.  All budget checks
+        and all inserts share one ``BEGIN IMMEDIATE`` transaction.
+        """
+
+        if type(scope) is not AccountScope:
+            raise RiskDeniedError("GROUP_SCOPE_MISMATCH", "a trusted account scope is required")
+        if type(group_id) is not str or not _ALLOCATION_ID.fullmatch(group_id):
+            raise RiskDeniedError("GROUP_INVALID_LEG", "group_id is invalid")
+        if type(deadline_ns) is not int or not 0 < deadline_ns <= 9_223_372_036_854_775_807:
+            raise RiskDeniedError("GROUP_DEADLINE_INVALID", "group deadline must be UTC epoch ns")
+        if isinstance(legs, (str, bytes)) or not isinstance(legs, Sequence):
+            raise RiskDeniedError("GROUP_INVALID_LEG", "a complete leg sequence is required")
+        if not 1 <= len(legs) <= _RISK_GROUP_MAX_LEGS:
+            raise RiskDeniedError(
+                "GROUP_INVALID_LEG", "group vector leg count is outside its bound"
+            )
+        ordered_legs = tuple(sorted(legs, key=lambda leg: getattr(leg, "leg_id", "")))
+        if any(type(leg) is not RiskGroupLegIntent for leg in ordered_legs):
+            raise RiskDeniedError(
+                "GROUP_INVALID_LEG", "every member must be a typed RiskGroupLegIntent"
+            )
+        leg_ids = [leg.leg_id for leg in ordered_legs]
+        intent_ids = [leg.intent.intent_id for leg in ordered_legs]
+        if len(set(leg_ids)) != len(leg_ids) or len(set(intent_ids)) != len(intent_ids):
+            raise RiskDeniedError("GROUP_INVALID_LEG", "group leg and intent IDs must be unique")
+        for leg in ordered_legs:
+            intent = leg.intent
+            if intent.scope != scope:
+                raise RiskDeniedError(
+                    "GROUP_SCOPE_MISMATCH", "every group leg must use one account scope"
+                )
+            if intent.action is not IntentAction.INCREASE:
+                raise RiskDeniedError(
+                    "GROUP_INVALID_LEG", "group reservations only admit increases"
+                )
+            if (
+                intent.strategy_id is None
+                or intent.allocation_version is None
+                or intent.instrument is None
+                or intent.quantity is None
+                or intent.quantity_unit is None
+                or intent.notional_unit is None
+                or intent.exposure_profile_fingerprint is None
+                or intent.instrument_facts_observed_at_ns is None
+                or intent.instrument_facts_valid_until_ns is None
+            ):
+                raise RiskDeniedError(
+                    "GROUP_INVALID_LEG",
+                    "group legs require strategy, instrument, quantity, unit, and profile bindings",
+                )
+            if not _SHA256_HEX.fullmatch(intent.payload_fingerprint):
+                raise RiskDeniedError(
+                    "GROUP_INVALID_LEG", "group leg payload fingerprint must be SHA-256"
+                )
+            if self._policy.require_strategy_allocation and intent.strategy_id is None:
+                raise RiskDeniedError(
+                    "STRATEGY_ALLOCATION_REQUIRED", "group leg lacks strategy allocation identity"
+                )
+
+        group_fingerprint = _risk_group_fingerprint(
+            scope,
+            group_id,
+            self._policy.fingerprint,
+            deadline_ns,
+            tuple(
+                (
+                    leg.leg_id,
+                    leg.intent.intent_id,
+                    leg.intent.fingerprint,
+                    str(leg.intent.exposure_profile_fingerprint),
+                )
+                for leg in ordered_legs
+            ),
+        )
+        live_gross = self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS
+        with self._transaction() as connection:
+            now = self._clock()
+            now_ns = int(now * 1_000_000_000)
+            self._ensure_policy_binding(connection, scope.key)
+            self._expire_active(connection, now)
+            existing_rows = connection.execute(
+                """SELECT * FROM risk_reservations
+                   WHERE scope_key = ? AND group_id = ? ORDER BY group_leg_id""",
+                (scope.key, group_id),
+            ).fetchall()
+            if existing_rows:
+                if not self._stored_group_matches(
+                    existing_rows,
+                    scope=scope,
+                    group_id=group_id,
+                    group_fingerprint=group_fingerprint,
+                    policy_fingerprint=self._policy.fingerprint,
+                    deadline_ns=deadline_ns,
+                    expected_legs=tuple(
+                        (
+                            leg.leg_id,
+                            leg.intent.intent_id,
+                            leg.intent.fingerprint,
+                            str(leg.intent.exposure_profile_fingerprint),
+                        )
+                        for leg in ordered_legs
+                    ),
+                ):
+                    raise RiskDeniedError(
+                        "GROUP_ID_REUSED", "group ID is already bound to another vector or deadline"
+                    )
+                return self._group_receipt_in_transaction(
+                    connection, scope, group_id, existing_rows
+                )
+            if now_ns >= deadline_ns:
+                raise RiskDeniedError("GROUP_DEADLINE_ELAPSED", "group deadline already elapsed")
+
+            for leg in ordered_legs:
+                prior = connection.execute(
+                    "SELECT group_id FROM risk_reservations WHERE intent_id = ?",
+                    (leg.intent.intent_id,),
+                ).fetchone()
+                if prior is not None:
+                    raise RiskDeniedError(
+                        "GROUP_INTENT_REUSED", "a group leg intent ID is already reserved"
+                    )
+
+            ttl_ns = int(math.ceil(self._policy.permit_ttl_seconds * 1_000_000_000))
+            facts_expiry_ns = min(
+                int(leg.intent.instrument_facts_valid_until_ns) for leg in ordered_legs
+            )
+            expires_at_ns = min(deadline_ns, now_ns + ttl_ns, facts_expiry_ns)
+            if expires_at_ns <= now_ns:
+                raise RiskDeniedError(
+                    "GROUP_EXPOSURE_FACTS_STALE", "group instrument facts have no live interval"
+                )
+            expires_at = expires_at_ns / 1_000_000_000
+            for leg in ordered_legs:
+                intent = leg.intent
+                self._assert_group_exposure_facts(intent, now_ns)
+                self._assert_not_frozen(connection, scope)
+                self._assert_intent_notional_unit(intent)
+                self._assert_increase_limit(connection, intent)
+                self._assert_strategy_allocation_limit(connection, intent)
+                if live_gross:
+                    self._assert_live_gross_limits(connection, intent, now)
+                generation = self._next_generation(connection, scope.key)
+                permit = RiskPermit(
+                    permit_id=str(uuid.uuid4()),
+                    intent_id=intent.intent_id,
+                    scope=scope,
+                    action=IntentAction.INCREASE,
+                    notional=intent.notional,
+                    policy_fingerprint=self._policy.fingerprint,
+                    generation=generation,
+                    issued_at=now_ns / 1_000_000_000,
+                    expires_at=expires_at,
+                    strategy_id=intent.strategy_id,
+                    allocation_version=intent.allocation_version,
+                    instrument=intent.instrument,
+                    quantity=intent.quantity,
+                    quantity_unit=intent.quantity_unit,
+                    notional_unit=intent.notional_unit,
+                )
+                connection.execute(
+                    """INSERT INTO risk_reservations (
+                           permit_id, intent_id, intent_hash, scope_key, provider, account_id,
+                           environment, action, notional, policy_hash, generation, issued_at,
+                           expires_at, status, reason, strategy_id, allocation_version,
+                           instrument, quantity, quantity_unit, notional_unit, group_id,
+                           group_fingerprint, group_leg_id, group_deadline_ns,
+                           group_expires_at_ns, group_leg_count,
+                           group_exposure_profile_fingerprint
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?,
+                                 ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        permit.permit_id,
+                        permit.intent_id,
+                        intent.fingerprint,
+                        scope.key,
+                        scope.provider,
+                        scope.account_id,
+                        scope.environment,
+                        IntentAction.INCREASE.value,
+                        _decimal_text(intent.notional),
+                        self._policy.fingerprint,
+                        generation,
+                        permit.issued_at,
+                        permit.expires_at,
+                        self._ACTIVE,
+                        intent.strategy_id,
+                        intent.allocation_version,
+                        intent.instrument,
+                        _decimal_text(intent.quantity),
+                        intent.quantity_unit,
+                        intent.notional_unit,
+                        group_id,
+                        group_fingerprint,
+                        leg.leg_id,
+                        deadline_ns,
+                        expires_at_ns,
+                        len(ordered_legs),
+                        intent.exposure_profile_fingerprint,
+                    ),
+                )
+            commit_now_ns = int(self._clock() * 1_000_000_000)
+            for leg in ordered_legs:
+                self._assert_group_exposure_facts(leg.intent, commit_now_ns)
+            if commit_now_ns >= deadline_ns:
+                raise RiskDeniedError(
+                    "GROUP_DEADLINE_ELAPSED", "group deadline elapsed before commit"
+                )
+            if commit_now_ns >= now_ns + ttl_ns:
+                raise RiskDeniedError("GROUP_PERMIT_EXPIRED", "group TTL elapsed before commit")
+            if live_gross:
+                commit_now = commit_now_ns / 1_000_000_000
+                self._expire_active(connection, commit_now)
+                for leg in ordered_legs:
+                    self._assert_live_gross_limits(
+                        connection, leg.intent, commit_now, include_intent=False
+                    )
+            rows = connection.execute(
+                """SELECT * FROM risk_reservations
+                   WHERE scope_key = ? AND group_id = ? ORDER BY group_leg_id""",
+                (scope.key, group_id),
+            ).fetchall()
+            return self._group_receipt_in_transaction(connection, scope, group_id, rows)
+
+    def query_group_vector(self, scope: AccountScope, group_id: str) -> RiskGroupReservationReceipt:
+        """Return one transactional projection of every member in a group."""
+
+        self._validate_group_key(scope, group_id)
+        with self._transaction() as connection:
+            now = self._clock()
+            self._ensure_policy_binding(connection, scope.key)
+            self._expire_active(connection, now)
+            rows = connection.execute(
+                """SELECT * FROM risk_reservations
+                   WHERE scope_key = ? AND group_id = ? ORDER BY group_leg_id""",
+                (scope.key, group_id),
+            ).fetchall()
+            if not rows:
+                raise RiskDeniedError("GROUP_NOT_FOUND", "group reservation does not exist")
+            return self._group_receipt_in_transaction(connection, scope, group_id, rows)
+
+    def release_group_unclaimed(
+        self, scope: AccountScope, group_id: str, reason: str
+    ) -> RiskGroupReservationReceipt:
+        """Release only unclaimed ACTIVE members after claimed members resolve.
+
+        Claimed permits remain occupied forever in this group ledger; this
+        operation can only release never-claimed sibling permits.  An
+        unresolved claim prevents even those siblings from being released.
+        """
+
+        self._validate_group_key(scope, group_id)
+        if type(reason) is not str or not reason.strip():
+            raise ValueError("release reason is required")
+        with self._transaction() as connection:
+            now = self._clock()
+            self._ensure_policy_binding(connection, scope.key)
+            self._expire_active(connection, now)
+            rows = connection.execute(
+                """SELECT * FROM risk_reservations
+                   WHERE scope_key = ? AND group_id = ? ORDER BY group_leg_id""",
+                (scope.key, group_id),
+            ).fetchall()
+            if not rows:
+                raise RiskDeniedError("GROUP_NOT_FOUND", "group reservation does not exist")
+            receipt = self._group_receipt_in_transaction(connection, scope, group_id, rows)
+            if any(leg.claimed and not leg.resolved for leg in receipt.legs):
+                raise RiskDeniedError(
+                    "GROUP_CLAIM_UNRESOLVED",
+                    "unclaimed group members cannot release while a claimed member is unresolved",
+                )
+            connection.execute(
+                """UPDATE risk_reservations SET status = ?, reason = ?
+                   WHERE scope_key = ? AND group_id = ? AND status = ?
+                     AND NOT EXISTS (
+                       SELECT 1 FROM risk_dispatch_claims
+                       WHERE risk_dispatch_claims.permit_id = risk_reservations.permit_id
+                     )""",
+                (self._RELEASED, reason, scope.key, group_id, self._ACTIVE),
+            )
+            rows = connection.execute(
+                """SELECT * FROM risk_reservations
+                   WHERE scope_key = ? AND group_id = ? ORDER BY group_leg_id""",
+                (scope.key, group_id),
+            ).fetchall()
+            return self._group_receipt_in_transaction(connection, scope, group_id, rows)
+
+    def claim_group_leg(
+        self,
+        scope: AccountScope,
+        group_id: str,
+        leg_id: str,
+        permit_id: str,
+        actual_intent: RiskIntent,
+        *,
+        expected_group_fingerprint: str,
+        expected_deadline_ns: int,
+    ) -> RiskGroupLegClaimReceipt:
+        """Claim one bounded child order under an exact persisted group leg.
+
+        The reservation's maximum-size intent hash is never replaced.  The
+        trusted mapper supplies a separate actual child intent, whose immutable
+        profile must match and whose quantity and notional may not exceed the
+        reserved maxima.  Its risk-intent fingerprint and normalized facts are
+        stored in the same one-shot dispatch claim row.
+        """
+
+        self._validate_group_key(scope, group_id)
+        if type(leg_id) is not str or not _ALLOCATION_ID.fullmatch(leg_id):
+            raise PermitInvalidError("GROUP_MEMBER_MISMATCH", "group leg identity is invalid")
+        if type(permit_id) is not str or not permit_id or permit_id != permit_id.strip():
+            raise PermitInvalidError("GROUP_MEMBER_MISMATCH", "permit identity is invalid")
+        try:
+            _require_sha256(expected_group_fingerprint, "group_fingerprint")
+        except ValueError as exc:
+            raise PermitInvalidError(
+                "GROUP_MEMBER_MISMATCH", "group fingerprint is invalid"
+            ) from exc
+        if type(expected_deadline_ns) is not int or expected_deadline_ns <= 0:
+            raise PermitInvalidError("GROUP_MEMBER_MISMATCH", "group deadline is invalid")
+        if type(actual_intent) is not RiskIntent:
+            raise PermitInvalidError(
+                "GROUP_INVALID_LEG", "actual child must be a mapped RiskIntent"
+            )
+        if actual_intent.scope != scope:
+            raise PermitInvalidError(
+                "GROUP_SCOPE_MISMATCH", "actual child belongs to another account"
+            )
+
+        live_gross = self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS
+        with self._transaction() as connection:
+            now = self._clock()
+            now_ns = int(now * 1_000_000_000)
+            self._ensure_policy_binding(connection, scope.key)
+            self._expire_active(connection, now)
+            rows = connection.execute(
+                """SELECT * FROM risk_reservations
+                   WHERE scope_key = ? AND group_id = ? ORDER BY group_leg_id""",
+                (scope.key, group_id),
+            ).fetchall()
+            if not rows:
+                raise PermitInvalidError("GROUP_NOT_FOUND", "group reservation does not exist")
+            receipt = self._group_receipt_in_transaction(connection, scope, group_id, rows)
+            if (
+                receipt.group_fingerprint != expected_group_fingerprint
+                or receipt.deadline_ns != expected_deadline_ns
+            ):
+                raise PermitInvalidError(
+                    "GROUP_MEMBER_MISMATCH", "caller binding does not match the durable group"
+                )
+            reservation = next((row for row in rows if row["group_leg_id"] == leg_id), None)
+            if reservation is None or reservation["permit_id"] != permit_id:
+                raise PermitInvalidError(
+                    "GROUP_MEMBER_MISMATCH", "permit does not identify this durable group leg"
+                )
+            self._validate_group_child_intent(reservation, actual_intent)
+
+            existing_claim = connection.execute(
+                "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?", (permit_id,)
+            ).fetchone()
+            if existing_claim is not None:
+                self._validate_group_claim_row(reservation, existing_claim)
+                if existing_claim["actual_intent_hash"] != actual_intent.fingerprint:
+                    raise PermitInvalidError(
+                        "GROUP_CLAIM_REPLAY_MISMATCH",
+                        "group leg already claimed with a different actual child intent",
+                    )
+                raise PermitInvalidError(
+                    "DISPATCH_CLAIM_ALREADY_ISSUED",
+                    "a group dispatch claim is single-use and cannot authorize a retry",
+                )
+
+            if reservation["status"] != self._ACTIVE:
+                raise PermitInvalidError(
+                    "PERMIT_NOT_ACTIVE", "group leg permit is no longer active"
+                )
+            deadline_ns = int(reservation["group_deadline_ns"])
+            expires_at_ns = int(reservation["group_expires_at_ns"])
+            if now_ns >= deadline_ns:
+                raise PermitInvalidError("GROUP_DEADLINE_ELAPSED", "group deadline has elapsed")
+            if now_ns >= expires_at_ns:
+                raise PermitInvalidError("GROUP_PERMIT_EXPIRED", "group permit TTL has elapsed")
+            self._assert_group_exposure_facts(actual_intent, now_ns, invalid=True)
+            self._assert_reservation_allocation_current(connection, reservation, invalid=True)
+            self._assert_intent_notional_unit(actual_intent)
+            self._assert_not_frozen(connection, scope)
+            if live_gross:
+                self._assert_live_gross_limits(connection, actual_intent, now, include_intent=False)
+
+            cause_id = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+            connection.execute(
+                """INSERT INTO risk_dispatch_claims (
+                       permit_id, intent_id, intent_hash, scope_key, cause_id, claimed_at,
+                       group_id, group_leg_id, group_fingerprint, group_deadline_ns,
+                       reserved_intent_hash, actual_intent_hash, actual_intent_json,
+                       actual_quantity, actual_notional, actual_exposure_profile_fingerprint,
+                       actual_instrument_facts_observed_at_ns,
+                       actual_instrument_facts_valid_until_ns
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    permit_id,
+                    reservation["intent_id"],
+                    reservation["intent_hash"],
+                    scope.key,
+                    cause_id,
+                    now_ns / 1_000_000_000,
+                    group_id,
+                    leg_id,
+                    reservation["group_fingerprint"],
+                    deadline_ns,
+                    reservation["intent_hash"],
+                    actual_intent.fingerprint,
+                    _risk_intent_json(actual_intent),
+                    _decimal_text(actual_intent.quantity),
+                    _decimal_text(actual_intent.notional),
+                    actual_intent.exposure_profile_fingerprint,
+                    actual_intent.instrument_facts_observed_at_ns,
+                    actual_intent.instrument_facts_valid_until_ns,
+                ),
+            )
+            self._freeze_in_transaction(connection, scope, cause_id, cause_id, now_ns / 1e9)
+
+            commit_now_ns = int(self._clock() * 1_000_000_000)
+            self._assert_group_exposure_facts(actual_intent, commit_now_ns, invalid=True)
+            if commit_now_ns >= deadline_ns:
+                raise PermitInvalidError(
+                    "GROUP_DEADLINE_ELAPSED", "group deadline elapsed before claim committed"
+                )
+            if commit_now_ns >= expires_at_ns:
+                raise PermitInvalidError(
+                    "GROUP_PERMIT_EXPIRED", "group permit expired before claim committed"
+                )
+            if live_gross:
+                self._assert_live_gross_limits(
+                    connection,
+                    actual_intent,
+                    commit_now_ns / 1_000_000_000,
+                    include_intent=False,
+                )
+            claim = connection.execute(
+                "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?", (permit_id,)
+            ).fetchone()
+            assert claim is not None
+            permit = self._permit_from_row(reservation)
+            binding = self._dispatch_claim_binding(reservation, claim)
+            return RiskGroupLegClaimReceipt(
+                scope=scope,
+                group_id=group_id,
+                group_fingerprint=str(reservation["group_fingerprint"]),
+                policy_fingerprint=str(reservation["policy_hash"]),
+                deadline_ns=deadline_ns,
+                leg_id=leg_id,
+                permit=permit,
+                reserved_intent_hash=str(reservation["intent_hash"]),
+                actual_intent_hash=actual_intent.fingerprint,
+                exposure_profile_fingerprint=str(reservation["group_exposure_profile_fingerprint"]),
+                actual_quantity=actual_intent.quantity,
+                actual_notional=actual_intent.notional,
+                claim=binding,
+            )
 
     def install_gross_exposure_baseline(
         self, proof: GrossExposureBaselineProof
@@ -2498,6 +3169,11 @@ class DurableRiskGate:
             ).fetchone()
             if row is None:
                 raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+            if row["group_id"] is not None:
+                raise PermitInvalidError(
+                    "GROUP_PERMIT_REQUIRED",
+                    "group permit must be validated through its explicit group operation",
+                )
             permit = self._permit_from_row(row)
             if permit.policy_fingerprint != self._policy.fingerprint:
                 raise PermitInvalidError("POLICY_CHANGED", "permit was issued under another policy")
@@ -2594,6 +3270,16 @@ class DurableRiskGate:
         with self._transaction() as connection:
             if live_gross:
                 now = self._clock()
+            reservation_row = connection.execute(
+                "SELECT group_id FROM risk_reservations WHERE permit_id = ?", (permit_id,)
+            ).fetchone()
+            if reservation_row is None:
+                raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+            if reservation_row["group_id"] is not None:
+                raise PermitInvalidError(
+                    "GROUP_CLAIM_REQUIRED",
+                    "group permit can only claim through claim_group_leg",
+                )
             self._ensure_policy_binding(connection, intent.scope.key)
             self._expire_active(connection, now)
             claim = connection.execute(
@@ -2992,6 +3678,15 @@ class DurableRiskGate:
             if row is None:
                 raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
             self._ensure_policy_binding(connection, str(row["scope_key"]))
+            group_row = connection.execute(
+                "SELECT group_id FROM risk_reservations WHERE permit_id = ?", (permit_id,)
+            ).fetchone()
+            assert group_row is not None
+            if group_row["group_id"] is not None:
+                raise PermitInvalidError(
+                    "GROUP_RELEASE_REQUIRED",
+                    "group permit release must be resolved through release_group_unclaimed",
+                )
             if row["dispatch_claimed"]:
                 raise PermitInvalidError(
                     "PERMIT_DISPATCH_CLAIMED",
@@ -3855,6 +4550,362 @@ class DurableRiskGate:
                 ),
                 "policy_fingerprint": self._policy.fingerprint,
             }
+
+    @staticmethod
+    def _validate_group_key(scope: AccountScope, group_id: str) -> None:
+        if type(scope) is not AccountScope:
+            raise RiskDeniedError("GROUP_SCOPE_MISMATCH", "a trusted account scope is required")
+        if type(group_id) is not str or not _ALLOCATION_ID.fullmatch(group_id):
+            raise RiskDeniedError("GROUP_INVALID_LEG", "group_id is invalid")
+
+    def _stored_group_matches(
+        self,
+        rows: Sequence[sqlite3.Row],
+        *,
+        scope: AccountScope,
+        group_id: str,
+        group_fingerprint: str,
+        policy_fingerprint: str,
+        deadline_ns: int,
+        expected_legs: Sequence[tuple[str, str, str, str]],
+    ) -> bool:
+        if len(rows) != len(expected_legs) or not rows:
+            return False
+        actual_members: list[tuple[str, str, str, str]] = []
+        for row, expected in zip(rows, expected_legs):
+            try:
+                profile = str(row["group_exposure_profile_fingerprint"])
+                actual = (
+                    str(row["group_leg_id"]),
+                    str(row["intent_id"]),
+                    str(row["intent_hash"]),
+                    profile,
+                )
+                if (
+                    actual != expected
+                    or row["scope_key"] != scope.key
+                    or row["group_id"] != group_id
+                    or row["group_fingerprint"] != group_fingerprint
+                    or row["policy_hash"] != policy_fingerprint
+                    or row["group_deadline_ns"] != deadline_ns
+                    or row["group_leg_count"] != len(expected_legs)
+                    or row["action"] != IntentAction.INCREASE.value
+                    or row["group_expires_at_ns"] is None
+                    or int(row["group_expires_at_ns"]) > deadline_ns
+                ):
+                    return False
+                actual_members.append(actual)
+            except (KeyError, TypeError, ValueError):
+                return False
+        try:
+            return (
+                _risk_group_fingerprint(
+                    scope,
+                    group_id,
+                    policy_fingerprint,
+                    deadline_ns,
+                    actual_members,
+                )
+                == group_fingerprint
+            )
+        except (TypeError, ValueError):
+            return False
+
+    def _group_receipt_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        scope: AccountScope,
+        group_id: str,
+        rows: Sequence[sqlite3.Row],
+    ) -> RiskGroupReservationReceipt:
+        """Validate and project every stored group row within the caller's txn."""
+
+        def conflict() -> RiskDeniedError:
+            return RiskDeniedError(
+                "GROUP_STATE_CONFLICT", "group membership or claim state is inconsistent"
+            )
+
+        if not rows:
+            raise conflict()
+        try:
+            first = rows[0]
+            group_fingerprint = str(first["group_fingerprint"])
+            policy_fingerprint = str(first["policy_hash"])
+            deadline_ns = int(first["group_deadline_ns"])
+            leg_count = int(first["group_leg_count"])
+            if (
+                first["scope_key"] != scope.key
+                or first["group_id"] != group_id
+                or not 1 <= leg_count <= _RISK_GROUP_MAX_LEGS
+                or deadline_ns <= 0
+                or len(rows) != leg_count
+            ):
+                raise conflict()
+            members: list[tuple[str, str, str, str]] = []
+            for row in rows:
+                profile = str(row["group_exposure_profile_fingerprint"])
+                if (
+                    row["scope_key"] != scope.key
+                    or row["group_id"] != group_id
+                    or row["group_fingerprint"] != group_fingerprint
+                    or row["policy_hash"] != policy_fingerprint
+                    or int(row["group_deadline_ns"]) != deadline_ns
+                    or int(row["group_leg_count"]) != leg_count
+                    or int(row["group_expires_at_ns"]) <= 0
+                    or int(row["group_expires_at_ns"]) > deadline_ns
+                    or row["action"] != IntentAction.INCREASE.value
+                ):
+                    raise conflict()
+                _require_sha256(profile, "exposure_profile_fingerprint")
+                _require_sha256(str(row["intent_hash"]), "reserved_intent_hash")
+                members.append(
+                    (
+                        str(row["group_leg_id"]),
+                        str(row["intent_id"]),
+                        str(row["intent_hash"]),
+                        profile,
+                    )
+                )
+            if tuple(sorted(item[0] for item in members)) != tuple(item[0] for item in members):
+                raise conflict()
+            if len({int(row["group_expires_at_ns"]) for row in rows}) != 1:
+                raise conflict()
+            if len({item[0] for item in members}) != len(members):
+                raise conflict()
+            if (
+                _risk_group_fingerprint(scope, group_id, policy_fingerprint, deadline_ns, members)
+                != group_fingerprint
+            ):
+                raise conflict()
+            result: list[RiskGroupReservationLeg] = []
+            for row in rows:
+                try:
+                    state = RiskGroupReservationState(str(row["status"]))
+                except ValueError as exc:
+                    raise conflict() from exc
+                permit_id = str(row["permit_id"])
+                intent_id = str(row["intent_id"])
+                cause_id = self._dispatch_freeze_cause(intent_id)
+                claim = connection.execute(
+                    "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?", (permit_id,)
+                ).fetchone()
+                resolution = connection.execute(
+                    "SELECT * FROM risk_dispatch_resolutions WHERE permit_id = ?", (permit_id,)
+                ).fetchone()
+                freeze = connection.execute(
+                    "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+                    (scope.key, cause_id),
+                ).fetchone()
+                if claim is None:
+                    if resolution is not None or (
+                        freeze is not None and int(freeze["active"]) == 1
+                    ):
+                        raise conflict()
+                    if state in (
+                        RiskGroupReservationState.SETTLED,
+                        RiskGroupReservationState.NO_FILL_TERMINAL,
+                    ):
+                        raise conflict()
+                    claimed = False
+                    resolved = False
+                    actual_hash = None
+                else:
+                    actual = self._validate_group_claim_row(row, claim)
+                    claimed = True
+                    actual_hash = actual.fingerprint
+                    binding = self._dispatch_claim_binding(row, claim)
+                    if resolution is None:
+                        if freeze is None or int(freeze["active"]) != 1:
+                            raise conflict()
+                        if state in (
+                            RiskGroupReservationState.RELEASED,
+                            RiskGroupReservationState.EXPIRED,
+                            RiskGroupReservationState.NO_FILL_TERMINAL,
+                        ):
+                            raise conflict()
+                        resolved = False
+                    else:
+                        proof_kind = str(resolution["proof_kind"])
+                        expected_state = (
+                            RiskGroupReservationState.SETTLED
+                            if proof_kind == "ACKED_TRACKED"
+                            else RiskGroupReservationState.NO_FILL_TERMINAL
+                            if proof_kind in {item.value for item in DispatchTerminalState}
+                            else None
+                        )
+                        if (
+                            expected_state is None
+                            or state is not expected_state
+                            or freeze is None
+                            or int(freeze["active"]) != 0
+                            or resolution["scope_key"] != scope.key
+                            or resolution["intent_id"] != intent_id
+                            or resolution["intent_hash"] != row["intent_hash"]
+                            or resolution["cause_id"] != cause_id
+                            or resolution["claim_digest"] != binding.claim_digest
+                        ):
+                            raise conflict()
+                        resolved = True
+                result.append(
+                    RiskGroupReservationLeg(
+                        leg_id=str(row["group_leg_id"]),
+                        permit_id=permit_id,
+                        intent_id=intent_id,
+                        reserved_intent_hash=str(row["intent_hash"]),
+                        exposure_profile_fingerprint=str(row["group_exposure_profile_fingerprint"]),
+                        actual_intent_hash=actual_hash,
+                        state=state,
+                        claimed=claimed,
+                        resolved=resolved,
+                        expires_at_ns=int(row["group_expires_at_ns"]),
+                    )
+                )
+            return RiskGroupReservationReceipt(
+                scope=scope,
+                group_id=group_id,
+                group_fingerprint=group_fingerprint,
+                policy_fingerprint=policy_fingerprint,
+                deadline_ns=deadline_ns,
+                legs=tuple(result),
+            )
+        except RiskDeniedError:
+            raise
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise conflict() from exc
+
+    def _validate_group_child_intent(
+        self,
+        reservation: sqlite3.Row,
+        actual_intent: RiskIntent,
+        *,
+        stored: bool = False,
+    ) -> None:
+        """Check a mapped child against its persisted maximum-size envelope."""
+
+        error_type = PermitInvalidError if stored else RiskDeniedError
+
+        def reject(code: str, message: str) -> None:
+            raise error_type(code, message)
+
+        try:
+            expected_profile = str(reservation["group_exposure_profile_fingerprint"])
+            _require_sha256(expected_profile, "exposure_profile_fingerprint")
+            if (
+                actual_intent.intent_id != reservation["intent_id"]
+                or actual_intent.scope.key != reservation["scope_key"]
+                or actual_intent.action.value != reservation["action"]
+                or actual_intent.strategy_id != reservation["strategy_id"]
+                or actual_intent.allocation_version != reservation["allocation_version"]
+                or actual_intent.instrument != reservation["instrument"]
+                or actual_intent.quantity_unit != reservation["quantity_unit"]
+                or actual_intent.notional_unit != reservation["notional_unit"]
+            ):
+                reject(
+                    "GROUP_LEG_PROFILE_MISMATCH",
+                    "child order changes reserved account, strategy, instrument, or units",
+                )
+            if actual_intent.exposure_profile_fingerprint != expected_profile:
+                reject(
+                    "GROUP_LEG_PROFILE_MISMATCH",
+                    "child order economic profile differs from its reserved leg",
+                )
+            if (
+                actual_intent.quantity is None
+                or reservation["quantity"] is None
+                or not _SHA256_HEX.fullmatch(actual_intent.payload_fingerprint)
+            ):
+                reject(
+                    "GROUP_INVALID_LEG",
+                    "child requires an exact mapped payload hash and positive quantity",
+                )
+            reserved_quantity = _as_decimal(reservation["quantity"])
+            reserved_notional = _as_decimal(reservation["notional"])
+            if (
+                actual_intent.quantity <= 0
+                or actual_intent.notional <= 0
+                or actual_intent.quantity > reserved_quantity
+                or actual_intent.notional > reserved_notional
+            ):
+                reject(
+                    "GROUP_LEG_EXCEEDS_RESERVED",
+                    "child quantity or trusted notional exceeds the reserved maximum",
+                )
+        except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
+            if stored:
+                raise PermitInvalidError(
+                    "GROUP_STATE_CONFLICT", "stored group child binding is invalid"
+                ) from exc
+            raise RiskDeniedError(
+                "GROUP_INVALID_LEG", "child order does not carry trusted bounded risk facts"
+            ) from exc
+
+    @staticmethod
+    def _assert_group_exposure_facts(
+        intent: RiskIntent,
+        now_ns: int,
+        *,
+        invalid: bool = False,
+    ) -> None:
+        """Recheck trusted mapper facts at the transaction's admission cut."""
+
+        error_type = PermitInvalidError if invalid else RiskDeniedError
+        observed_at_ns = intent.instrument_facts_observed_at_ns
+        valid_until_ns = intent.instrument_facts_valid_until_ns
+        if (
+            type(observed_at_ns) is not int
+            or type(valid_until_ns) is not int
+            or observed_at_ns <= 0
+            or valid_until_ns <= observed_at_ns
+        ):
+            raise error_type(
+                "GROUP_EXPOSURE_FACTS_UNPROVEN",
+                "group intent lacks a trusted instrument-fact validity interval",
+            )
+        if not observed_at_ns <= now_ns < valid_until_ns:
+            raise error_type(
+                "GROUP_EXPOSURE_FACTS_STALE",
+                "group instrument facts are not current at the Risk transaction boundary",
+            )
+
+    def _validate_group_claim_row(self, reservation: sqlite3.Row, claim: sqlite3.Row) -> RiskIntent:
+        """Verify the immutable reservation-to-child claim row binding."""
+
+        try:
+            if (
+                reservation["group_id"] is None
+                or claim["group_id"] != reservation["group_id"]
+                or claim["group_leg_id"] != reservation["group_leg_id"]
+                or claim["group_fingerprint"] != reservation["group_fingerprint"]
+                or int(claim["group_deadline_ns"]) != int(reservation["group_deadline_ns"])
+                or claim["reserved_intent_hash"] != reservation["intent_hash"]
+                or claim["intent_id"] != reservation["intent_id"]
+                or claim["intent_hash"] != reservation["intent_hash"]
+                or claim["scope_key"] != reservation["scope_key"]
+                or claim["cause_id"] != self._dispatch_freeze_cause(str(reservation["intent_id"]))
+            ):
+                raise ValueError("claim identity mismatch")
+            actual_json = str(claim["actual_intent_json"])
+            actual_intent = _risk_intent_from_json(actual_json)
+            if (
+                actual_intent.fingerprint != claim["actual_intent_hash"]
+                or claim["actual_exposure_profile_fingerprint"]
+                != actual_intent.exposure_profile_fingerprint
+                or _as_decimal(claim["actual_quantity"]) != actual_intent.quantity
+                or _as_decimal(claim["actual_notional"]) != actual_intent.notional
+                or int(claim["actual_instrument_facts_observed_at_ns"])
+                != actual_intent.instrument_facts_observed_at_ns
+                or int(claim["actual_instrument_facts_valid_until_ns"])
+                != actual_intent.instrument_facts_valid_until_ns
+            ):
+                raise ValueError("child claim facts mismatch")
+            self._validate_group_child_intent(reservation, actual_intent, stored=True)
+            return actual_intent
+        except PermitInvalidError:
+            raise
+        except (KeyError, TypeError, ValueError, OverflowError) as exc:
+            raise PermitInvalidError(
+                "GROUP_STATE_CONFLICT", "stored group claim binding is invalid"
+            ) from exc
 
     def close(self) -> None:
         """Provide a symmetry hook; connections are per-operation and already closed."""
@@ -5179,6 +6230,11 @@ class DurableRiskGate:
         ).fetchone()
         if row is None:
             raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+        if row["group_id"] is not None:
+            raise PermitInvalidError(
+                "GROUP_CLAIM_REQUIRED",
+                "group permit can only claim through claim_group_leg",
+            )
         permit = self._permit_from_row(row)
         if row["status"] != self._ACTIVE:
             raise PermitInvalidError("PERMIT_NOT_ACTIVE", "permit is no longer active")
@@ -5207,20 +6263,39 @@ class DurableRiskGate:
         scope_key: str,
         cause_id: str,
         claimed_at: float,
+        group_claim: Optional[sqlite3.Row] = None,  # noqa: UP045 -- Python 3.9 is supported.
     ) -> str:
-        return _sha256(
-            _canonical_json(
-                {
-                    "cause_id": cause_id,
-                    "claimed_at": format(float(claimed_at), ".17g"),
-                    "intent_hash": intent_hash,
-                    "intent_id": intent_id,
-                    "permit_id": permit_id,
-                    "scope_key": scope_key,
-                    "schema": "bt-api-risk-dispatch-claim-v1",
-                }
-            )
-        )
+        payload: dict[str, object] = {
+            "cause_id": cause_id,
+            "claimed_at": format(float(claimed_at), ".17g"),
+            "intent_hash": intent_hash,
+            "intent_id": intent_id,
+            "permit_id": permit_id,
+            "scope_key": scope_key,
+            "schema": "bt-api-risk-dispatch-claim-v1",
+        }
+        if group_claim is not None and group_claim["group_id"] is not None:
+            payload["group_child_claim"] = {
+                "actual_exposure_profile_fingerprint": str(
+                    group_claim["actual_exposure_profile_fingerprint"]
+                ),
+                "actual_intent_hash": str(group_claim["actual_intent_hash"]),
+                "actual_instrument_facts_observed_at_ns": int(
+                    group_claim["actual_instrument_facts_observed_at_ns"]
+                ),
+                "actual_instrument_facts_valid_until_ns": int(
+                    group_claim["actual_instrument_facts_valid_until_ns"]
+                ),
+                "actual_notional": str(group_claim["actual_notional"]),
+                "actual_quantity": str(group_claim["actual_quantity"]),
+                "group_deadline_ns": int(group_claim["group_deadline_ns"]),
+                "group_fingerprint": str(group_claim["group_fingerprint"]),
+                "group_id": str(group_claim["group_id"]),
+                "group_leg_id": str(group_claim["group_leg_id"]),
+                "reserved_intent_hash": str(group_claim["reserved_intent_hash"]),
+                "schema": "bt-api-risk-group-child-claim-v1",
+            }
+        return _sha256(_canonical_json(payload))
 
     @staticmethod
     def _is_dispatch_freeze_cause(cause_id: str) -> bool:
@@ -5245,6 +6320,12 @@ class DurableRiskGate:
             raise PermitInvalidError(
                 "PERMIT_NOT_DISPATCH_CLAIMED",
                 "settlement requires the exact durable dispatch claim",
+            )
+        if row["group_id"] is not None:
+            self._validate_group_claim_row(row, claim)
+        elif claim["group_id"] is not None:
+            raise PermitInvalidError(
+                "GROUP_STATE_CONFLICT", "singleton reservation has a grouped dispatch claim"
             )
         freeze = connection.execute(
             "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
@@ -5280,6 +6361,7 @@ class DurableRiskGate:
                 scope_key=str(reservation["scope_key"]),
                 cause_id=str(claim["cause_id"]),
                 claimed_at=claimed_at,
+                group_claim=claim,
             ),
         )
 
@@ -5422,13 +6504,26 @@ class DurableRiskGate:
         connection.execute(
             """
             UPDATE risk_reservations SET status = ?, reason = ?
-            WHERE status = ? AND expires_at <= ?
+            WHERE status = ? AND (
+              (group_id IS NULL AND expires_at <= ?)
+              OR (group_id IS NOT NULL AND group_expires_at_ns <= ? AND NOT EXISTS (
+                  SELECT 1 FROM risk_dispatch_claims AS group_claim
+                  WHERE group_claim.scope_key = risk_reservations.scope_key
+                    AND group_claim.group_id = risk_reservations.group_id
+              ))
+            )
               AND NOT EXISTS (
                   SELECT 1 FROM risk_dispatch_claims
                   WHERE risk_dispatch_claims.permit_id = risk_reservations.permit_id
               )
             """,
-            (self._EXPIRED, "permit_ttl_elapsed", self._ACTIVE, now),
+            (
+                self._EXPIRED,
+                "permit_ttl_elapsed",
+                self._ACTIVE,
+                now,
+                int(now * 1_000_000_000),
+            ),
         )
 
     def _permit_from_row(self, row: sqlite3.Row) -> RiskPermit:
@@ -5480,7 +6575,14 @@ class DurableRiskGate:
                     instrument TEXT,
                     quantity TEXT,
                     quantity_unit TEXT,
-                    notional_unit TEXT
+                    notional_unit TEXT,
+                    group_id TEXT,
+                    group_fingerprint TEXT,
+                    group_leg_id TEXT,
+                    group_deadline_ns INTEGER,
+                    group_expires_at_ns INTEGER,
+                    group_leg_count INTEGER,
+                    group_exposure_profile_fingerprint TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_risk_reservations_scope_status
                     ON risk_reservations(scope_key, status, action);
@@ -5499,6 +6601,18 @@ class DurableRiskGate:
                     scope_key TEXT NOT NULL,
                     cause_id TEXT NOT NULL,
                     claimed_at REAL NOT NULL,
+                    group_id TEXT,
+                    group_leg_id TEXT,
+                    group_fingerprint TEXT,
+                    group_deadline_ns INTEGER,
+                    reserved_intent_hash TEXT,
+                    actual_intent_hash TEXT,
+                    actual_intent_json TEXT,
+                    actual_quantity TEXT,
+                    actual_notional TEXT,
+                    actual_exposure_profile_fingerprint TEXT,
+                    actual_instrument_facts_observed_at_ns INTEGER,
+                    actual_instrument_facts_valid_until_ns INTEGER,
                     FOREIGN KEY(permit_id) REFERENCES risk_reservations(permit_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_risk_dispatch_claims_scope
@@ -5784,10 +6898,39 @@ class DurableRiskGate:
                 ("quantity", "TEXT"),
                 ("quantity_unit", "TEXT"),
                 ("notional_unit", "TEXT"),
+                ("group_id", "TEXT"),
+                ("group_fingerprint", "TEXT"),
+                ("group_leg_id", "TEXT"),
+                ("group_deadline_ns", "INTEGER"),
+                ("group_expires_at_ns", "INTEGER"),
+                ("group_leg_count", "INTEGER"),
+                ("group_exposure_profile_fingerprint", "TEXT"),
             ):
                 if name not in reservation_columns:
                     connection.execute(
                         "ALTER TABLE risk_reservations ADD COLUMN " + name + " " + column_type
+                    )
+            claim_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(risk_dispatch_claims)").fetchall()
+            }
+            for name, column_type in (
+                ("group_id", "TEXT"),
+                ("group_leg_id", "TEXT"),
+                ("group_fingerprint", "TEXT"),
+                ("group_deadline_ns", "INTEGER"),
+                ("reserved_intent_hash", "TEXT"),
+                ("actual_intent_hash", "TEXT"),
+                ("actual_intent_json", "TEXT"),
+                ("actual_quantity", "TEXT"),
+                ("actual_notional", "TEXT"),
+                ("actual_exposure_profile_fingerprint", "TEXT"),
+                ("actual_instrument_facts_observed_at_ns", "INTEGER"),
+                ("actual_instrument_facts_valid_until_ns", "INTEGER"),
+            ):
+                if name not in claim_columns:
+                    connection.execute(
+                        "ALTER TABLE risk_dispatch_claims ADD COLUMN " + name + " " + column_type
                     )
             for table in (
                 "risk_strategy_allocations",
@@ -5859,6 +7002,33 @@ class DurableRiskGate:
                 """CREATE INDEX IF NOT EXISTS idx_risk_reservations_strategy_status
                    ON risk_reservations(scope_key, strategy_id, status, action)"""
             )
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_risk_reservations_group_leg
+                   ON risk_reservations(scope_key, group_id, group_leg_id)
+                   WHERE group_id IS NOT NULL"""
+            )
+            connection.execute(
+                """CREATE INDEX IF NOT EXISTS idx_risk_reservations_group
+                   ON risk_reservations(scope_key, group_id)"""
+            )
+            connection.execute(
+                """CREATE TRIGGER IF NOT EXISTS risk_group_reservation_identity_immutable
+                   BEFORE UPDATE OF group_id, group_fingerprint, group_leg_id,
+                       group_deadline_ns, group_expires_at_ns, group_leg_count,
+                       group_exposure_profile_fingerprint ON risk_reservations
+                   WHEN OLD.group_id IS NOT NULL
+                   BEGIN
+                       SELECT RAISE(ABORT, 'group reservation identity is immutable');
+                   END"""
+            )
+            connection.execute(
+                """CREATE TRIGGER IF NOT EXISTS risk_group_dispatch_claim_immutable
+                   BEFORE UPDATE ON risk_dispatch_claims
+                   WHEN OLD.group_id IS NOT NULL
+                   BEGIN
+                       SELECT RAISE(ABORT, 'group dispatch claims are immutable');
+                   END"""
+            )
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -5896,6 +7066,126 @@ def _as_decimal(value: object) -> Decimal:
     if not result.is_finite():
         raise ValueError("decimal amount must be finite")
     return result
+
+
+def _risk_intent_json(intent: RiskIntent) -> str:
+    """Canonical storage for the exact mapped child RiskIntent of a group claim."""
+
+    return _canonical_json(
+        {
+            "action": intent.action.value,
+            "allocation_version": intent.allocation_version,
+            "exposure_profile_fingerprint": intent.exposure_profile_fingerprint,
+            "instrument_facts_observed_at_ns": intent.instrument_facts_observed_at_ns,
+            "instrument_facts_valid_until_ns": intent.instrument_facts_valid_until_ns,
+            "instrument": intent.instrument,
+            "intent_id": intent.intent_id,
+            "notional": _decimal_text(intent.notional),
+            "notional_unit": intent.notional_unit,
+            "payload_fingerprint": intent.payload_fingerprint,
+            "quantity": None if intent.quantity is None else _decimal_text(intent.quantity),
+            "quantity_unit": intent.quantity_unit,
+            "scope": {
+                "account_id": intent.scope.account_id,
+                "environment": intent.scope.environment,
+                "provider": intent.scope.provider,
+            },
+            "strategy_id": intent.strategy_id,
+        }
+    )
+
+
+def _risk_intent_from_json(raw: str) -> RiskIntent:
+    """Restore only a canonical, exact-shape child RiskIntent document."""
+
+    parsed = json.loads(raw)
+    expected_keys = {
+        "action",
+        "allocation_version",
+        "exposure_profile_fingerprint",
+        "instrument_facts_observed_at_ns",
+        "instrument_facts_valid_until_ns",
+        "instrument",
+        "intent_id",
+        "notional",
+        "notional_unit",
+        "payload_fingerprint",
+        "quantity",
+        "quantity_unit",
+        "scope",
+        "strategy_id",
+    }
+    if type(parsed) is not dict or set(parsed) != expected_keys:
+        raise ValueError("invalid stored child intent shape")
+    scope_raw = parsed["scope"]
+    if type(scope_raw) is not dict or set(scope_raw) != {
+        "account_id",
+        "environment",
+        "provider",
+    }:
+        raise ValueError("invalid stored child scope shape")
+    intent = RiskIntent(
+        intent_id=parsed["intent_id"],
+        scope=AccountScope(
+            provider=scope_raw["provider"],
+            account_id=scope_raw["account_id"],
+            environment=scope_raw["environment"],
+        ),
+        action=IntentAction(parsed["action"]),
+        notional=Decimal(parsed["notional"]),
+        payload_fingerprint=parsed["payload_fingerprint"],
+        strategy_id=parsed["strategy_id"],
+        allocation_version=parsed["allocation_version"],
+        instrument=parsed["instrument"],
+        quantity=(None if parsed["quantity"] is None else Decimal(parsed["quantity"])),
+        quantity_unit=parsed["quantity_unit"],
+        notional_unit=parsed["notional_unit"],
+        exposure_profile_fingerprint=parsed["exposure_profile_fingerprint"],
+        instrument_facts_observed_at_ns=parsed["instrument_facts_observed_at_ns"],
+        instrument_facts_valid_until_ns=parsed["instrument_facts_valid_until_ns"],
+    )
+    if _risk_intent_json(intent) != raw:
+        raise ValueError("stored child intent is not canonical")
+    return intent
+
+
+def _risk_group_fingerprint(
+    scope: AccountScope,
+    group_id: str,
+    policy_fingerprint: str,
+    deadline_ns: int,
+    members: Sequence[tuple[str, str, str, str]],
+) -> str:
+    ordered = sorted(members, key=lambda item: item[0])
+    if not 1 <= len(ordered) <= _RISK_GROUP_MAX_LEGS:
+        raise ValueError("invalid group member count")
+    for leg_id, intent_id, intent_hash, profile_hash in ordered:
+        if type(leg_id) is not str or not _ALLOCATION_ID.fullmatch(leg_id):
+            raise ValueError("invalid group leg identity")
+        if type(intent_id) is not str or not intent_id:
+            raise ValueError("invalid group intent identity")
+        _require_sha256(intent_hash, "reserved_intent_hash")
+        _require_sha256(profile_hash, "exposure_profile_fingerprint")
+    return _sha256(
+        _canonical_json(
+            {
+                "deadline_ns": deadline_ns,
+                "group_id": group_id,
+                "legs": [
+                    {
+                        "exposure_profile_fingerprint": profile_hash,
+                        "intent_id": intent_id,
+                        "leg_id": leg_id,
+                        "reserved_intent_hash": intent_hash,
+                    }
+                    for leg_id, intent_id, intent_hash, profile_hash in ordered
+                ],
+                "policy_fingerprint": policy_fingerprint,
+                "schema": "bt-api-risk-group-reservation-v1",
+                "scope": scope.key,
+            }
+        )
+    )
 
 
 def _sum_decimal_exact(values: Iterator[Decimal]) -> Decimal:
@@ -5959,6 +7249,7 @@ def _wall_clock() -> float:
 
 __all__ = [
     "AccountScope",
+    "DispatchClaimBinding",
     "DurableRiskGate",
     "FreezeActivationResult",
     "FreezeActivationStatus",
@@ -5966,6 +7257,11 @@ __all__ = [
     "PermitInvalidError",
     "RiskDeniedError",
     "RiskGateError",
+    "RiskGroupLegClaimReceipt",
+    "RiskGroupLegIntent",
+    "RiskGroupReservationLeg",
+    "RiskGroupReservationReceipt",
+    "RiskGroupReservationState",
     "RiskIntent",
     "RiskPermit",
     "RiskPolicy",

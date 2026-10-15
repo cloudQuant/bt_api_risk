@@ -18,7 +18,7 @@ import hashlib
 import json
 import re
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation, localcontext
 from fractions import Fraction
 from typing import Any, Optional
@@ -786,6 +786,64 @@ class InstrumentRiskAdmissionMapper:
                 else None
             ),
             notional_unit=notional_unit,
+        )
+
+    def map_group_intent(self, intent: Any) -> RiskIntent:
+        """Map an opening group order and bind its mapper-owned economic profile.
+
+        This opt-in entry point leaves normal order mappings and their legacy
+        fingerprints byte-compatible.  Quantity, price, and the current
+        metadata validity interval are excluded from the profile digest;
+        the mapped child still carries a separately recomputed trusted notional
+        and is checked against the reserved maxima at claim time.
+        """
+
+        mapped = self(intent)
+        if (
+            mapped.action is not IntentAction.INCREASE
+            or mapped.strategy_id is None
+            or mapped.allocation_version is None
+            or mapped.instrument is None
+            or mapped.quantity_unit is None
+            or mapped.notional_unit is None
+        ):
+            raise RiskDeniedError(
+                "GROUP_STRATEGY_ALLOCATION_REQUIRED",
+                "group legs require a mapped opening intent with strategy allocation",
+            )
+        order = self._order_from_intent(intent)
+        observed_at_ns = self._clock_ns()
+        assessment = self._registry.assess(order, observed_at_ns)
+        metadata = assessment.metadata
+        side = getattr(getattr(intent, "side", None), "value", None)
+        if side not in {"BUY", "SELL"}:
+            raise RiskDeniedError(
+                "GROUP_EXPOSURE_SIDE_UNPROVEN",
+                "group order side is not a supported canonical value",
+            )
+        profile = _sha256(
+            _canonical_json(
+                {
+                    "contract_multiplier": _decimal_text(metadata.contract_multiplier),
+                    "exposure_profile_schema": "bt_api_risk.group-exposure-profile.v1",
+                    "fixed_fee": _decimal_text(metadata.fixed_fee),
+                    "instrument": metadata.instrument,
+                    "max_slippage_bps": _decimal_text(metadata.max_slippage_bps),
+                    "notional_unit": metadata.valuation_unit,
+                    "position_effect": "OPEN",
+                    "quantity_step": _decimal_text(metadata.quantity_step),
+                    "quantity_unit": metadata.quantity_unit,
+                    "side": side,
+                    "taker_fee_bps": _decimal_text(metadata.taker_fee_bps),
+                    "tick_size": _decimal_text(metadata.tick_size),
+                }
+            )
+        )
+        return replace(
+            mapped,
+            exposure_profile_fingerprint=profile,
+            instrument_facts_observed_at_ns=observed_at_ns,
+            instrument_facts_valid_until_ns=metadata.expires_at_ns,
         )
 
 
