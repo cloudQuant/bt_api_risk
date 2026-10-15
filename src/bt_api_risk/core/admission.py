@@ -628,6 +628,7 @@ class RiskGroupLegClaimReceipt:
     actual_quantity: Decimal
     actual_notional: Decimal
     claim: DispatchClaimBinding
+    resolved: bool = False
 
     def __post_init__(self) -> None:
         if type(self.scope) is not AccountScope or type(self.permit) is not RiskPermit:
@@ -645,6 +646,8 @@ class RiskGroupLegClaimReceipt:
             raise ValueError("invalid group deadline")
         if type(self.claim) is not DispatchClaimBinding:
             raise ValueError("invalid group dispatch claim")
+        if type(self.resolved) is not bool:
+            raise ValueError("group claim resolution flag must be boolean")
         if self.claim.scope != self.scope or self.permit.scope != self.scope:
             raise ValueError("group claim scope mismatch")
         if (
@@ -675,12 +678,6 @@ class RiskGroupLegClaimReceipt:
 
         return True
 
-    @property
-    def resolved(self) -> bool:
-        """A fresh dispatch claim has not yet received terminal evidence."""
-
-        return False
-
 
 @dataclass(frozen=True)
 class DispatchTerminalProof:
@@ -704,6 +701,8 @@ class DispatchTerminalProof:
     journal_record_sha256: str
     reconciliation_evidence_sha256: str
     writer_fence_sha256: str
+    fee_record_count: int
+    fee_history_complete: bool
     filled_quantity: int = 0
     trade_count: int = 0
 
@@ -735,6 +734,10 @@ class DispatchTerminalProof:
             raise ValueError("terminal proof requires zero filled quantity")
         if type(self.trade_count) is not int or self.trade_count != 0:
             raise ValueError("terminal proof requires zero verified trades")
+        if type(self.fee_record_count) is not int or self.fee_record_count != 0:
+            raise ValueError("terminal proof requires an explicit zero-fee record count")
+        if type(self.fee_history_complete) is not bool or self.fee_history_complete is not True:
+            raise ValueError("terminal proof requires complete explicit fee history")
 
     @property
     def fingerprint(self) -> str:
@@ -1311,6 +1314,97 @@ class DispatchResolutionReceipt:
         return self.claim.claim_digest
 
 
+class DispatchTerminalResolutionReceiptStatus(str, Enum):
+    """Durable state of one exact no-fill terminal dispatch decision."""
+
+    UNRESOLVED_ACTIVE = "UNRESOLVED_ACTIVE"
+    NO_FILL_TERMINAL_RESOLVED = "NO_FILL_TERMINAL_RESOLVED"
+
+
+@dataclass(frozen=True)
+class DispatchTerminalResolutionReceipt:
+    """Same-snapshot Risk receipt for an exact no-fill terminal proof."""
+
+    status: DispatchTerminalResolutionReceiptStatus
+    claim: DispatchClaimBinding
+    proof: Optional[DispatchTerminalProof] = None  # noqa: UP045 -- Python 3.9 is supported.
+    proof_sha256: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+    group_claim: Optional[RiskGroupLegClaimReceipt] = None  # noqa: UP045
+    dispatch_latch_active: bool = True
+    has_other_active_freezes: bool = False
+    fee_record_count: Optional[int] = None  # noqa: UP045 -- Python 3.9 is supported.
+    fee_history_complete: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.status) is not DispatchTerminalResolutionReceiptStatus:
+            raise ValueError("invalid terminal dispatch receipt status")
+        if type(self.claim) is not DispatchClaimBinding:
+            raise ValueError("invalid terminal dispatch receipt claim")
+        if type(self.dispatch_latch_active) is not bool or type(
+            self.has_other_active_freezes
+        ) is not bool:
+            raise ValueError("invalid terminal dispatch receipt freeze state")
+        if type(self.fee_history_complete) is not bool:
+            raise ValueError("invalid terminal dispatch fee-history flag")
+        if self.group_claim is not None and (
+            type(self.group_claim) is not RiskGroupLegClaimReceipt
+            or self.group_claim.claim != self.claim
+        ):
+            raise ValueError("terminal receipt group claim does not match the dispatch claim")
+
+        if self.status is DispatchTerminalResolutionReceiptStatus.UNRESOLVED_ACTIVE:
+            if (
+                self.proof is not None
+                or self.proof_sha256 is not None
+                or self.dispatch_latch_active is not True
+                or self.fee_record_count is not None
+                or self.fee_history_complete is not False
+                or (self.group_claim is not None and self.group_claim.resolved)
+            ):
+                raise ValueError("unresolved terminal receipt cannot carry resolution evidence")
+            return
+
+        if (
+            type(self.proof) is not DispatchTerminalProof
+            or self.proof_sha256 != self.proof.fingerprint
+            or self.dispatch_latch_active is not False
+            or type(self.fee_record_count) is not int
+            or self.fee_record_count != 0
+            or self.fee_history_complete is not True
+            or (self.group_claim is not None and not self.group_claim.resolved)
+        ):
+            raise ValueError("resolved terminal receipt lacks exact complete no-fill evidence")
+        if (
+            self.proof.scope != self.claim.scope
+            or self.proof.permit_id != self.claim.permit_id
+            or self.proof.intent_id != self.claim.intent_id
+            or self.proof.intent_hash != self.claim.intent_hash
+            or self.proof.cause_id != self.claim.cause_id
+            or self.proof.claim_digest != self.claim.claim_digest
+        ):
+            raise ValueError("terminal receipt proof does not match its exact claim")
+
+    @property
+    def scope(self) -> AccountScope:
+        return self.claim.scope
+
+    @property
+    def permit_id(self) -> str:
+        return self.claim.permit_id
+
+    @property
+    def intent_id(self) -> str:
+        return self.claim.intent_id
+
+    @property
+    def terminal_state(self) -> Optional[DispatchTerminalState]:  # noqa: UP045 -- Python 3.9 is supported.
+        return None if self.proof is None else self.proof.terminal_state
+
+    @property
+    def journal_revision(self) -> Optional[int]:  # noqa: UP045 -- Python 3.9 is supported.
+        return None if self.proof is None else self.proof.journal_revision
+
+
 @dataclass(frozen=True)
 class VerifiedDispatchRecoveryResolution:
     """Typed proof that the old journal evidence and new fence were verified."""
@@ -1650,7 +1744,12 @@ def _dispatch_resolution_proof_sha256(proof: DispatchResolutionProof) -> str:
         "writer_fence_sha256": proof.writer_fence_sha256,
     }
     if type(proof) is DispatchTerminalProof:
-        payload.update(kind="TERMINAL", terminal_state=proof.terminal_state.value)
+        payload.update(
+            kind="TERMINAL",
+            terminal_state=proof.terminal_state.value,
+            fee_record_count=proof.fee_record_count,
+            fee_history_complete=proof.fee_history_complete,
+        )
     else:
         payload.update(
             kind="ACKED_TRACKED",
@@ -2680,6 +2779,150 @@ class DurableRiskGate:
             if not rows:
                 raise RiskDeniedError("GROUP_NOT_FOUND", "group reservation does not exist")
             return self._group_receipt_in_transaction(connection, scope, group_id, rows)
+
+    def query_group_leg_claim(
+        self, scope: AccountScope, group_id: str, leg_id: str
+    ) -> Optional[RiskGroupLegClaimReceipt]:  # noqa: UP045 -- Python 3.9 is supported.
+        """Read one group's exact claim from a read-only SQLite snapshot.
+
+        ``None`` means only that the validated target member is still ACTIVE,
+        unclaimed, and within both its persisted TTL and group deadline. A
+        missing, expired, released, corrupt, or otherwise non-claimable member
+        is a typed refusal rather than an empty result.
+        """
+
+        self._validate_group_key(scope, group_id)
+        if type(leg_id) is not str or not _ALLOCATION_ID.fullmatch(leg_id):
+            raise PermitInvalidError("GROUP_MEMBER_MISMATCH", "group leg identity is invalid")
+        with self._connection() as connection:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            try:
+                policy_error = self._policy_binding_read_error(connection, scope.key)
+                if policy_error is not None:
+                    raise PermitInvalidError(
+                        policy_error, "risk database is bound to another or unknown policy"
+                    )
+                rows = connection.execute(
+                    """SELECT * FROM risk_reservations
+                       WHERE scope_key = ? AND group_id = ? ORDER BY group_leg_id""",
+                    (scope.key, group_id),
+                ).fetchall()
+                if not rows:
+                    raise RiskDeniedError("GROUP_NOT_FOUND", "group reservation does not exist")
+                group_receipt = self._group_receipt_in_transaction(
+                    connection, scope, group_id, rows
+                )
+                leg = next((item for item in group_receipt.legs if item.leg_id == leg_id), None)
+                row = next((item for item in rows if item["group_leg_id"] == leg_id), None)
+                if leg is None or row is None:
+                    raise PermitInvalidError(
+                        "GROUP_MEMBER_MISMATCH", "group leg is not part of the durable vector"
+                    )
+                claim_row = connection.execute(
+                    "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?",
+                    (leg.permit_id,),
+                ).fetchone()
+                if not leg.claimed:
+                    if leg.state is not RiskGroupReservationState.ACTIVE or claim_row is not None:
+                        raise PermitInvalidError(
+                            "GROUP_MEMBER_NOT_CLAIMABLE",
+                            "only a valid active unclaimed member has no claim receipt",
+                        )
+                    unresolved_markers = connection.execute(
+                        """SELECT
+                               (SELECT COUNT(*) FROM risk_dispatch_resolutions
+                                WHERE permit_id = ?) AS resolutions,
+                               (SELECT COUNT(*) FROM risk_freezes
+                                WHERE scope_key = ? AND cause_id = ?) AS latches""",
+                        (
+                            leg.permit_id,
+                            scope.key,
+                            self._dispatch_freeze_cause(leg.intent_id),
+                        ),
+                    ).fetchone()
+                    if (
+                        unresolved_markers is None
+                        or int(unresolved_markers["resolutions"]) != 0
+                        or int(unresolved_markers["latches"]) != 0
+                    ):
+                        raise PermitInvalidError(
+                            "GROUP_STATE_CONFLICT",
+                            "an unclaimed member cannot carry a claim resolution or dispatch latch",
+                        )
+                    now_ns = int(self._clock() * 1_000_000_000)
+                    if now_ns >= group_receipt.deadline_ns:
+                        raise PermitInvalidError(
+                            "GROUP_DEADLINE_ELAPSED", "group deadline has elapsed"
+                        )
+                    if now_ns >= leg.expires_at_ns:
+                        raise PermitInvalidError(
+                            "GROUP_PERMIT_EXPIRED", "group permit TTL has elapsed"
+                        )
+                    result = None
+                else:
+                    if claim_row is None:
+                        raise PermitInvalidError(
+                            "GROUP_STATE_CONFLICT", "claimed vector member has no claim row"
+                        )
+                    result = self._group_leg_claim_receipt_in_transaction(
+                        row, claim_row, resolved=leg.resolved
+                    )
+                    if leg.resolved:
+                        resolution = connection.execute(
+                            "SELECT proof_kind FROM risk_dispatch_resolutions WHERE permit_id = ?",
+                            (leg.permit_id,),
+                        ).fetchone()
+                        if resolution is None:
+                            raise PermitInvalidError(
+                                "GROUP_STATE_CONFLICT", "resolved claim has no exact resolution"
+                            )
+                        proof_kind = str(resolution["proof_kind"])
+                        if proof_kind in {item.value for item in DispatchTerminalState}:
+                            terminal = self._dispatch_terminal_resolution_receipt_in_transaction(
+                                connection, leg.permit_id
+                            )
+                            valid_resolution = (
+                                terminal.status
+                                is DispatchTerminalResolutionReceiptStatus.NO_FILL_TERMINAL_RESOLVED
+                                and terminal.claim == result.claim
+                                and terminal.group_claim == result
+                            )
+                        elif proof_kind == "ACKED_TRACKED":
+                            tracked = self._dispatch_resolution_receipt_in_transaction(
+                                connection, leg.permit_id
+                            )
+                            valid_resolution = (
+                                tracked.status is DispatchResolutionReceiptStatus.ACKED_TRACKED_RESOLVED
+                                and tracked.claim == result.claim
+                                and tracked.dispatch_latch_active is False
+                            )
+                        elif proof_kind == "TERMINAL_EXPOSURE":
+                            exposure = self._dispatch_exposure_resolution_receipt_in_transaction(
+                                connection, leg.permit_id
+                            )
+                            valid_resolution = (
+                                exposure.status
+                                is DispatchExposureResolutionReceiptStatus.TERMINAL_EXPOSURE_RESOLVED
+                                and exposure.claim == result.claim
+                                and exposure.dispatch_latch_active is False
+                            )
+                        else:
+                            valid_resolution = False
+                        if not valid_resolution:
+                            raise PermitInvalidError(
+                                "GROUP_STATE_CONFLICT",
+                                "group claim does not have a verified exact resolution receipt",
+                            )
+                    result = self._group_leg_claim_receipt_in_transaction(
+                        row, claim_row, resolved=leg.resolved
+                    )
+                connection.execute("COMMIT")
+                return result
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
 
     def release_group_unclaimed(
         self, scope: AccountScope, group_id: str, reason: str
@@ -3875,6 +4118,251 @@ class DurableRiskGate:
             recovery_attestation=recovery_attestation,
         )
 
+    def dispatch_terminal_resolution_receipt(
+        self, permit_id: str
+    ) -> DispatchTerminalResolutionReceipt:
+        """Read one exact no-fill terminal result without changing Risk state."""
+
+        if type(permit_id) is not str or not permit_id or permit_id != permit_id.strip():
+            raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+        with self._connection() as connection:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            try:
+                receipt = self._dispatch_terminal_resolution_receipt_in_transaction(
+                    connection, permit_id
+                )
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            else:
+                connection.execute("COMMIT")
+                return receipt
+
+    def _dispatch_terminal_resolution_receipt_in_transaction(
+        self, connection: sqlite3.Connection, permit_id: str
+    ) -> DispatchTerminalResolutionReceipt:
+        reservation = connection.execute(
+            "SELECT * FROM risk_reservations WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        if reservation is None:
+            raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+        policy_error = self._policy_binding_read_error(connection, str(reservation["scope_key"]))
+        if policy_error is not None:
+            raise PermitInvalidError(
+                policy_error, "risk database is bound to another or unknown policy"
+            )
+        if reservation["action"] != IntentAction.INCREASE.value:
+            raise PermitInvalidError(
+                "DISPATCH_TERMINAL_STATE_CONFLICT",
+                "no-fill terminal evidence requires an INCREASE reservation",
+            )
+        claim_row = connection.execute(
+            "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        if claim_row is None:
+            raise PermitInvalidError(
+                "PERMIT_NOT_DISPATCH_CLAIMED", "terminal receipt requires an exact durable claim"
+            )
+        expected_cause = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+        if (
+            claim_row["intent_id"] != reservation["intent_id"]
+            or claim_row["intent_hash"] != reservation["intent_hash"]
+            or claim_row["scope_key"] != reservation["scope_key"]
+            or claim_row["cause_id"] != expected_cause
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_CLAIM_CONFLICT", "durable claim does not match its reservation"
+            )
+        try:
+            claim = self._dispatch_claim_binding(reservation, claim_row)
+            if reservation["group_id"] is not None:
+                self._validate_group_claim_row(reservation, claim_row)
+            elif claim_row["group_id"] is not None:
+                raise ValueError("singleton claim carries group identity")
+        except (KeyError, TypeError, ValueError, RiskDeniedError, PermitInvalidError) as exc:
+            raise PermitInvalidError(
+                "DISPATCH_CLAIM_CONFLICT", "durable claim cannot be reconstructed"
+            ) from exc
+
+        freeze = connection.execute(
+            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+            (reservation["scope_key"], expected_cause),
+        ).fetchone()
+        if freeze is None or type(freeze["active"]) is not int or freeze["active"] not in (0, 1):
+            raise PermitInvalidError(
+                "DISPATCH_TERMINAL_STATE_CONFLICT", "exact dispatch latch is missing or invalid"
+            )
+        resolution = connection.execute(
+            "SELECT * FROM risk_dispatch_resolutions WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        audit = connection.execute(
+            "SELECT permit_id FROM risk_dispatch_recovery_audits WHERE permit_id = ?",
+            (permit_id,),
+        ).fetchone()
+        exposure = connection.execute(
+            "SELECT permit_id FROM risk_order_exposures WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        other_freezes = connection.execute(
+            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id <> ?",
+            (reservation["scope_key"], expected_cause),
+        ).fetchall()
+        if any(
+            type(row["active"]) is not int or row["active"] not in (0, 1)
+            for row in other_freezes
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_TERMINAL_STATE_CONFLICT", "another account freeze state is invalid"
+            )
+        has_other_active_freezes = any(row["active"] == 1 for row in other_freezes)
+
+        def group_claim_receipt(
+            *, resolved: bool
+        ) -> Optional[RiskGroupLegClaimReceipt]:  # noqa: UP045 -- Python 3.9 is supported.
+            if reservation["group_id"] is None:
+                return None
+            rows = connection.execute(
+                """SELECT * FROM risk_reservations
+                   WHERE scope_key = ? AND group_id = ? ORDER BY group_leg_id""",
+                (reservation["scope_key"], reservation["group_id"]),
+            ).fetchall()
+            group = self._group_receipt_in_transaction(
+                connection,
+                claim.scope,
+                str(reservation["group_id"]),
+                rows,
+            )
+            leg = next(
+                (item for item in group.legs if item.leg_id == reservation["group_leg_id"]),
+                None,
+            )
+            if (
+                leg is None
+                or leg.permit_id != permit_id
+                or not leg.claimed
+                or leg.resolved is not resolved
+            ):
+                raise PermitInvalidError(
+                    "GROUP_STATE_CONFLICT", "group vector does not confirm the exact claim state"
+                )
+            return self._group_leg_claim_receipt_in_transaction(
+                reservation, claim_row, resolved=resolved
+            )
+
+        if resolution is None:
+            if (
+                reservation["status"] != self._SETTLED
+                or audit is not None
+                or exposure is not None
+                or freeze["active"] != 1
+            ):
+                raise PermitInvalidError(
+                    "DISPATCH_TERMINAL_STATE_CONFLICT",
+                    "unresolved terminal receipt requires a settled claim and active latch",
+                )
+            group_claim = group_claim_receipt(resolved=False)
+            return DispatchTerminalResolutionReceipt(
+                status=DispatchTerminalResolutionReceiptStatus.UNRESOLVED_ACTIVE,
+                claim=claim,
+                group_claim=group_claim,
+                dispatch_latch_active=True,
+                has_other_active_freezes=has_other_active_freezes,
+            )
+
+        if (
+            reservation["status"] != self._NO_FILL
+            or reservation["reason"] != resolution["proof_kind"]
+            or audit is not None
+            or exposure is not None
+            or freeze["active"] != 0
+            or resolution["proof_kind"] not in {item.value for item in DispatchTerminalState}
+            or resolution["scope_key"] != reservation["scope_key"]
+            or resolution["intent_id"] != reservation["intent_id"]
+            or resolution["intent_hash"] != reservation["intent_hash"]
+            or resolution["cause_id"] != expected_cause
+            or resolution["claim_digest"] != claim.claim_digest
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_TERMINAL_STATE_CONFLICT",
+                "stored resolution, terminal reservation, claim, or latch is inconsistent",
+            )
+        if any(
+            resolution[name] is not None
+            for name in (
+                "provider_order_id",
+                "accepted_request_sha256",
+                "exposure_reservation_id",
+                "exposure_reservation_sha256",
+                "exposure_proof_sha256",
+                "terminal_state",
+                "requested_quantity",
+                "cumulative_filled_quantity",
+                "exposure_fill_trade_count",
+                "exposure_fill_ids_sha256",
+                "exposure_order_revision",
+            )
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_TERMINAL_STATE_CONFLICT",
+                "no-fill resolution contains conflicting exposure fields",
+            )
+        if (
+            type(resolution["resolution_proof_sha256"]) is not str
+            or type(resolution["fee_record_count"]) is not int
+            or type(resolution["fee_history_complete"]) is not int
+            or resolution["fee_record_count"] != 0
+            or resolution["fee_history_complete"] != 1
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_TERMINAL_STATE_CONFLICT",
+                "stored no-fill resolution lacks explicit complete zero-fee proof facts",
+            )
+        try:
+            proof = DispatchTerminalProof(
+                scope=claim.scope,
+                permit_id=permit_id,
+                intent_id=str(resolution["intent_id"]),
+                intent_hash=str(resolution["intent_hash"]),
+                cause_id=str(resolution["cause_id"]),
+                claim_digest=str(resolution["claim_digest"]),
+                evidence_class=DispatchEvidenceClass(str(resolution["evidence_class"])),
+                terminal_state=DispatchTerminalState(str(resolution["proof_kind"])),
+                dispatch_attempt_count=int(resolution["dispatch_attempt_count"]),
+                journal_revision=int(resolution["journal_revision"]),
+                journal_record_sha256=str(resolution["journal_record_sha256"]),
+                reconciliation_evidence_sha256=str(
+                    resolution["reconciliation_evidence_sha256"]
+                ),
+                writer_fence_sha256=str(resolution["writer_fence_sha256"]),
+                fee_record_count=resolution["fee_record_count"],
+                fee_history_complete=resolution["fee_history_complete"] == 1,
+                filled_quantity=int(resolution["filled_quantity"]),
+                trade_count=int(resolution["trade_count"]),
+            )
+            self._assert_dispatch_proof_matches_claim(proof, claim)
+            stored_proof_sha256 = _require_sha256(
+                resolution["resolution_proof_sha256"], "resolution_proof_sha256"
+            )
+            if stored_proof_sha256 != proof.fingerprint:
+                raise ValueError("stored proof fingerprint differs")
+        except (KeyError, TypeError, ValueError, OverflowError, PermitInvalidError) as exc:
+            raise PermitInvalidError(
+                "DISPATCH_TERMINAL_STATE_CONFLICT", "stored no-fill proof is invalid"
+            ) from exc
+        group_claim = group_claim_receipt(resolved=True)
+        return DispatchTerminalResolutionReceipt(
+            status=DispatchTerminalResolutionReceiptStatus.NO_FILL_TERMINAL_RESOLVED,
+            claim=claim,
+            proof=proof,
+            proof_sha256=proof.fingerprint,
+            group_claim=group_claim,
+            dispatch_latch_active=False,
+            has_other_active_freezes=has_other_active_freezes,
+            fee_record_count=int(resolution["fee_record_count"]),
+            fee_history_complete=True,
+        )
+
     @staticmethod
     def _read_dispatch_recovery_audit(
         audit: sqlite3.Row,
@@ -4937,7 +5425,9 @@ class DurableRiskGate:
             has_other_active_freezes=has_other_active_freezes,
         )
 
-    def resolve_dispatch_freeze(self, proof: DispatchResolutionProof) -> None:
+    def resolve_dispatch_freeze(
+        self, proof: DispatchResolutionProof
+    ) -> Optional[DispatchTerminalResolutionReceipt]:  # noqa: UP045 -- Python 3.9 is supported.
         """Resolve dispatch uncertainty under a verified execution-journal fence.
 
         The injected authority must hold its account-wide writer fence while
@@ -5043,6 +5533,9 @@ class DurableRiskGate:
                         exposure_reservation_sha256 = None
                         filled_quantity = proof.filled_quantity
                         trade_count = proof.trade_count
+                        resolution_proof_sha256 = proof.fingerprint
+                        fee_record_count = proof.fee_record_count
+                        fee_history_complete = int(proof.fee_history_complete)
                     else:
                         proof_kind = "ACKED_TRACKED"
                         provider_order_id = proof.provider_order_id
@@ -5051,6 +5544,9 @@ class DurableRiskGate:
                         exposure_reservation_sha256 = proof.exposure_reservation_sha256
                         filled_quantity = proof.filled_quantity
                         trade_count = proof.trade_count
+                        resolution_proof_sha256 = None
+                        fee_record_count = None
+                        fee_history_complete = None
                     connection.execute(
                         """
                         INSERT INTO risk_dispatch_resolutions (
@@ -5061,8 +5557,9 @@ class DurableRiskGate:
                             reconciliation_evidence_sha256, writer_fence_sha256,
                             provider_order_id, accepted_request_sha256,
                             exposure_reservation_id, exposure_reservation_sha256,
-                            filled_quantity, trade_count, resolved_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                            filled_quantity, trade_count, resolution_proof_sha256,
+                            fee_record_count, fee_history_complete, resolved_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             proof.permit_id,
@@ -5084,6 +5581,9 @@ class DurableRiskGate:
                             exposure_reservation_sha256,
                             filled_quantity,
                             trade_count,
+                            resolution_proof_sha256,
+                            fee_record_count,
+                            fee_history_complete,
                             self._clock(),
                         ),
                     )
@@ -5117,6 +5617,20 @@ class DurableRiskGate:
                 "DISPATCH_RESOLUTION_PROOF_REJECTED",
                 "the execution-journal authority could not verify this proof",
             ) from exc
+        if type(proof) is DispatchTerminalProof:
+            receipt = self.dispatch_terminal_resolution_receipt(proof.permit_id)
+            if (
+                receipt.status
+                is not DispatchTerminalResolutionReceiptStatus.NO_FILL_TERMINAL_RESOLVED
+                or receipt.proof != proof
+                or receipt.proof_sha256 != proof.fingerprint
+            ):
+                raise PermitInvalidError(
+                    "DISPATCH_TERMINAL_STATE_CONFLICT",
+                    "committed no-fill resolution did not read back as the exact proof",
+                )
+            return receipt
+        return None
 
     def resolve_dispatch_freeze_recovered(
         self,
@@ -5563,6 +6077,43 @@ class DurableRiskGate:
             raise
         except (KeyError, TypeError, ValueError, OverflowError) as exc:
             raise conflict() from exc
+
+    def _group_leg_claim_receipt_in_transaction(
+        self,
+        reservation: sqlite3.Row,
+        claim_row: sqlite3.Row,
+        *,
+        resolved: bool,
+    ) -> RiskGroupLegClaimReceipt:
+        """Rebuild one immutable group claim from rows in the caller's snapshot."""
+
+        try:
+            actual = self._validate_group_claim_row(reservation, claim_row)
+            claim = self._dispatch_claim_binding(reservation, claim_row)
+            if type(resolved) is not bool:
+                raise ValueError("invalid resolution state")
+            return RiskGroupLegClaimReceipt(
+                scope=claim.scope,
+                group_id=str(reservation["group_id"]),
+                group_fingerprint=str(reservation["group_fingerprint"]),
+                policy_fingerprint=str(reservation["policy_hash"]),
+                deadline_ns=int(reservation["group_deadline_ns"]),
+                leg_id=str(reservation["group_leg_id"]),
+                permit=self._permit_from_row(reservation),
+                reserved_intent_hash=str(reservation["intent_hash"]),
+                actual_intent_hash=actual.fingerprint,
+                exposure_profile_fingerprint=str(
+                    reservation["group_exposure_profile_fingerprint"]
+                ),
+                actual_quantity=actual.quantity,
+                actual_notional=actual.notional,
+                claim=claim,
+                resolved=resolved,
+            )
+        except (KeyError, TypeError, ValueError, RiskDeniedError, PermitInvalidError) as exc:
+            raise PermitInvalidError(
+                "GROUP_STATE_CONFLICT", "stored group claim cannot be reconstructed"
+            ) from exc
 
     def _validate_group_child_intent(
         self,
@@ -7811,6 +8362,8 @@ class DurableRiskGate:
                 ("exposure_fill_trade_count", "INTEGER"),
                 ("exposure_fill_ids_sha256", "TEXT"),
                 ("exposure_order_revision", "INTEGER"),
+                ("fee_record_count", "INTEGER"),
+                ("fee_history_complete", "INTEGER"),
             ):
                 if name not in dispatch_resolution_columns:
                     connection.execute(

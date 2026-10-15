@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import re
 from collections.abc import Callable, Sequence
-from typing import Any, NoReturn
+from typing import Any, NoReturn, Optional
 
 from .core.admission import (
     AccountScope,
     DispatchExposureResolutionProof,
     DispatchExposureResolutionReceipt,
+    DispatchResolutionProof,
+    DispatchTerminalResolutionReceipt,
     DurableRiskGate,
     PermitInvalidError,
     RiskDeniedError,
@@ -129,6 +131,26 @@ class DurableRiskAdmissionAdapter:
         except (RiskDeniedError, PermitInvalidError) as error:
             self._raise_neutral_denial(error)
 
+    def resolve_dispatch_freeze(
+        self, proof: DispatchResolutionProof
+    ) -> Optional[DispatchTerminalResolutionReceipt]:  # noqa: UP045 -- Python 3.9 is supported.
+        """Resolve an exact journal proof; no-fill results are durably read back."""
+
+        try:
+            return self._gate.resolve_dispatch_freeze(proof)
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
+    def dispatch_terminal_resolution_receipt(
+        self, permit_reference: str
+    ) -> DispatchTerminalResolutionReceipt:
+        """Read the exact no-fill terminal resolution without mutation."""
+
+        try:
+            return self._gate.dispatch_terminal_resolution_receipt(permit_reference)
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
     def ensure_settled(self, permit_reference: str) -> RiskPermit:
         """Prove recovery settlement after the owner records a known outcome."""
 
@@ -163,11 +185,7 @@ class DurableRiskAdmissionAdapter:
                         "GROUP_INVALID_LEG", "each group member must be (leg_id, order)"
                     )
                 leg_id, order = member
-                mapped = self._map_group_order(order)
-                if mapped.scope != scope:
-                    raise RiskDeniedError(
-                        "GROUP_SCOPE_MISMATCH", "every mapped order must use the requested account"
-                    )
+                mapped = self.map_group_intent(order, scope=scope)
                 try:
                     mapped_members.append(RiskGroupLegIntent(leg_id=leg_id, intent=mapped))
                 except (TypeError, ValueError):
@@ -185,6 +203,16 @@ class DurableRiskAdmissionAdapter:
 
         try:
             return self._gate.query_group_vector(scope, group_id)
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
+    def query_group_leg_claim(
+        self, scope: AccountScope, group_id: str, leg_id: str
+    ) -> Optional[RiskGroupLegClaimReceipt]:  # noqa: UP045 -- Python 3.9 is supported.
+        """Read one exact group leg claim without creating or retrying a claim."""
+
+        try:
+            return self._gate.query_group_leg_claim(scope, group_id, leg_id)
         except (RiskDeniedError, PermitInvalidError) as error:
             self._raise_neutral_denial(error)
 
@@ -216,12 +244,7 @@ class DurableRiskAdmissionAdapter:
                 raise RiskDeniedError(
                     "GROUP_SCOPE_MISMATCH", "a trusted persisted account scope is required"
                 )
-            mapped = self._map_group_order(intent)
-            if mapped.scope != scope:
-                raise RiskDeniedError(
-                    "GROUP_SCOPE_MISMATCH",
-                    "mapped child does not use the exact trusted group account scope",
-                )
+            mapped = self.map_group_intent(intent, scope=scope)
             return self._gate.claim_group_leg(
                 scope,
                 group_id,
@@ -231,6 +254,29 @@ class DurableRiskAdmissionAdapter:
                 expected_group_fingerprint=group_fingerprint,
                 expected_deadline_ns=deadline_ns,
             )
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
+    def map_group_intent(self, intent: Any, *, scope: AccountScope) -> RiskIntent:
+        """Map one actual child through the trusted mapper without gate I/O.
+
+        ``scope`` is selected by the account owner and is checked against the
+        mapper result. It is never reconstructed from the wire account
+        reference, and the caller cannot supply Risk hashes or profiles.
+        """
+
+        try:
+            if type(scope) is not AccountScope:
+                raise RiskDeniedError(
+                    "GROUP_SCOPE_MISMATCH", "a trusted Risk account scope is required"
+                )
+            mapped = self._map_group_order(intent)
+            if mapped.scope != scope:
+                raise RiskDeniedError(
+                    "GROUP_SCOPE_MISMATCH",
+                    "mapped child does not use the exact trusted group account scope",
+                )
+            return mapped
         except (RiskDeniedError, PermitInvalidError) as error:
             self._raise_neutral_denial(error)
 

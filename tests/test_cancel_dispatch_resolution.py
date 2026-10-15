@@ -281,6 +281,8 @@ def test_generic_order_no_fill_proof_cannot_clear_cancel_action_latch(tmp_path, 
         journal_record_sha256=_digest("wrong-order-proof"),
         reconciliation_evidence_sha256=_digest("wrong-order-reconciliation"),
         writer_fence_sha256=_digest("wrong-order-fence"),
+        fee_record_count=0,
+        fee_history_complete=True,
     )
 
     with pytest.raises(PermitInvalidError, match="cancellation-action evidence"):

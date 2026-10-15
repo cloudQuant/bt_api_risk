@@ -22,6 +22,7 @@ from bt_api_risk import (
     AccountScope,
     DispatchEvidenceClass,
     DispatchTerminalProof,
+    DispatchTerminalResolutionReceiptStatus,
     DispatchTerminalState,
     DispatchTrackedOrderProof,
     DurableRiskGate,
@@ -101,6 +102,8 @@ class FakeVerifiedExecutionJournalAuthority:
             "writer_fence_sha256": proof.writer_fence_sha256,
             "filled_quantity": proof.filled_quantity,
             "trade_count": proof.trade_count,
+            "fee_record_count": getattr(proof, "fee_record_count", None),
+            "fee_history_complete": getattr(proof, "fee_history_complete", None),
             "kind": "terminal" if type(proof) is DispatchTerminalProof else "tracked",
         }
         if type(proof) is DispatchTerminalProof:
@@ -137,6 +140,12 @@ class FakeVerifiedExecutionJournalAuthority:
                     row["writer_fence_sha256"] == proof.writer_fence_sha256,
                     row["filled_quantity"] == proof.filled_quantity == 0,
                     row["trade_count"] == proof.trade_count == 0,
+                    row["fee_record_count"] == proof.fee_record_count == 0
+                    if type(proof) is DispatchTerminalProof
+                    else True,
+                    row["fee_history_complete"] == 1 and proof.fee_history_complete is True
+                    if type(proof) is DispatchTerminalProof
+                    else True,
                 )
             )
             if valid and type(proof) is DispatchTerminalProof:
@@ -224,6 +233,8 @@ def _terminal_proof(binding, **changes):
         "journal_record_sha256": _digest("journal-row"),
         "reconciliation_evidence_sha256": _digest("reconciliation"),
         "writer_fence_sha256": _digest("writer-fence"),
+        "fee_record_count": 0,
+        "fee_history_complete": True,
     }
     values.update(changes)
     return DispatchTerminalProof(**values)
@@ -250,6 +261,19 @@ def _tracked_proof(binding, **changes):
     }
     values.update(changes)
     return DispatchTrackedOrderProof(**values)
+
+
+def _dispatch_rows(gate):
+    with gate._connection() as connection:
+        return tuple(
+            tuple(tuple(row) for row in connection.execute(query).fetchall())
+            for query in (
+                "SELECT * FROM risk_reservations ORDER BY permit_id",
+                "SELECT * FROM risk_dispatch_claims ORDER BY permit_id",
+                "SELECT * FROM risk_dispatch_resolutions ORDER BY permit_id",
+                "SELECT * FROM risk_freezes ORDER BY scope_key, cause_id",
+            )
+        )
 
 
 def test_reservation_is_idempotent_and_enforces_shared_limit(
@@ -484,7 +508,7 @@ def test_exact_terminal_proof_clears_only_matching_latch_and_releases_no_fill_ca
     )
     authority.register(proof)
 
-    gate.resolve_dispatch_freeze(proof)
+    receipt = gate.resolve_dispatch_freeze(proof)
 
     assert gate.active_freeze_reasons(scope) == []
     assert gate.snapshot(scope)["increase_count"] == 0
@@ -492,6 +516,25 @@ def test_exact_terminal_proof_clears_only_matching_latch_and_releases_no_fill_ca
     assert gate.reserve(make_intent(scope, "after-no-fill", notional="100")).notional == Decimal(
         "100"
     )
+    assert receipt is not None
+    assert receipt.status is DispatchTerminalResolutionReceiptStatus.NO_FILL_TERMINAL_RESOLVED
+    assert receipt.claim.permit_id == proof.permit_id
+    assert receipt.proof == proof
+    assert receipt.proof_sha256 == proof.fingerprint
+    assert receipt.terminal_state is terminal_state
+    assert receipt.journal_revision == proof.journal_revision
+    assert receipt.dispatch_latch_active is False
+    assert receipt.has_other_active_freezes is False
+    assert receipt.fee_record_count == 0 and receipt.fee_history_complete is True
+
+    before = _dispatch_rows(gate)
+    restarted = DurableRiskGate(
+        gate._database_path, policy, execution_journal_authority=authority
+    )
+    replay = restarted.dispatch_terminal_resolution_receipt(proof.permit_id)
+    assert replay == receipt
+    assert _dispatch_rows(restarted) == before
+    restarted.close()
 
 
 def test_acked_tracked_proof_clears_uncertainty_but_keeps_risk_capacity_reserved(
@@ -603,6 +646,10 @@ def test_dispatch_proof_rejects_fills_unknown_state_and_simulation_ctp_scope(
         )
     with pytest.raises(ValueError, match="fake or fixture"):
         _terminal_proof(binding, evidence_class=DispatchEvidenceClass.NATIVE_PROVIDER_JOURNAL)
+    with pytest.raises(ValueError, match="zero-fee record count"):
+        _terminal_proof(binding, fee_record_count=1)
+    with pytest.raises(ValueError, match="complete explicit fee history"):
+        _terminal_proof(binding, fee_history_complete=False)
 
     proof = _terminal_proof(binding)
     with pytest.raises(PermitInvalidError) as unknown:
@@ -626,6 +673,31 @@ def test_dispatch_proof_replay_is_rejected_after_restart(tmp_path, scope, policy
     with pytest.raises(PermitInvalidError) as replay:
         restarted.resolve_dispatch_freeze(proof)
     assert replay.value.code == "DISPATCH_PROOF_REPLAYED"
+
+
+def test_terminal_resolution_readback_rejects_incomplete_persisted_fee_history(
+    tmp_path, scope, policy
+):
+    authority = FakeVerifiedExecutionJournalAuthority()
+    gate, _, permit, binding = _claimed_gate(
+        tmp_path, scope, policy, authority, name="terminal-fee-readback"
+    )
+    proof = _terminal_proof(binding)
+    authority.register(proof)
+    gate.resolve_dispatch_freeze(proof)
+    with gate._transaction() as connection:
+        connection.execute("DROP TRIGGER risk_dispatch_resolution_immutable_update")
+        connection.execute(
+            """UPDATE risk_dispatch_resolutions
+               SET fee_record_count = 1, fee_history_complete = 0 WHERE permit_id = ?""",
+            (permit.permit_id,),
+        )
+
+    with pytest.raises(PermitInvalidError) as incomplete:
+        gate.dispatch_terminal_resolution_receipt(permit.permit_id)
+
+    assert incomplete.value.code == "DISPATCH_TERMINAL_STATE_CONFLICT"
+    assert gate.active_freeze_reasons(scope) == []
 
 
 def test_concurrent_duplicate_dispatch_proofs_commit_only_once(tmp_path, scope, policy):

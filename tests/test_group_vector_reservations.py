@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import contextmanager
 from dataclasses import replace
 from decimal import Decimal
 from types import SimpleNamespace
@@ -11,6 +12,10 @@ import pytest
 
 from bt_api_risk import (
     AccountScope,
+    DispatchEvidenceClass,
+    DispatchTerminalProof,
+    DispatchTerminalResolutionReceiptStatus,
+    DispatchTerminalState,
     DurableRiskAdmissionAdapter,
     DurableRiskGate,
     InstrumentRiskAdmissionMapper,
@@ -18,10 +23,12 @@ from bt_api_risk import (
     InstrumentRiskRegistry,
     IntentAction,
     PermitInvalidError,
+    RiskAdmissionDeniedError,
     RiskDeniedError,
     RiskGroupReservationState,
     RiskIntent,
     RiskPolicy,
+    VerifiedDispatchResolution,
 )
 
 
@@ -74,6 +81,7 @@ def _gate(
     strategy_cap: str = "1000",
     ttl: float = 5.0,
     database: str = "risk.sqlite3",
+    authority=None,
 ) -> tuple[DurableRiskGate, AccountScope, _Clock]:
     clock = clock or _Clock()
     scope = AccountScope("fixture", "account-1", "sandbox")
@@ -88,6 +96,7 @@ def _gate(
             notional_unit="USD",
         ),
         clock=clock,
+        execution_journal_authority=authority,
     )
     gate.set_strategy_allocation(
         scope,
@@ -97,6 +106,34 @@ def _gate(
         notional_unit="USD",
     )
     return gate, scope, clock
+
+
+class _GroupTerminalAuthority:
+    """Synthetic exact proof verifier used only for Risk package tests."""
+
+    def __init__(self) -> None:
+        self.proofs: dict[str, DispatchTerminalProof] = {}
+
+    def register(self, proof: DispatchTerminalProof) -> None:
+        self.proofs[proof.journal_record_sha256] = proof
+
+    @contextmanager
+    def dispatch_resolution_guard(self, proof, *, claim):
+        exact = self.proofs.get(proof.journal_record_sha256) == proof
+        if not exact or proof.scope != claim.scope or proof.claim_digest != claim.claim_digest:
+            yield None
+            return
+        yield VerifiedDispatchResolution(
+            scope=claim.scope,
+            permit_id=claim.permit_id,
+            intent_id=claim.intent_id,
+            intent_hash=claim.intent_hash,
+            claim_digest=claim.claim_digest,
+            proof_sha256=proof.fingerprint,
+            journal_revision=proof.journal_revision,
+            journal_record_sha256=proof.journal_record_sha256,
+            writer_fence_sha256=proof.writer_fence_sha256,
+        )
 
 
 def _reserve(gate, scope, group_id="group-1", *, legs=None, deadline_ns=1_200_000_000_000):
@@ -299,6 +336,94 @@ def test_bounded_child_claim_keeps_reserved_identity_and_blocks_singleton_paths(
     gate.close()
 
 
+def test_group_claim_query_is_read_only_and_requires_a_durable_terminal_proof(tmp_path):
+    authority = _GroupTerminalAuthority()
+    gate, scope, clock = _gate(tmp_path, authority=authority, database="claim-query.sqlite3")
+    adapter = DurableRiskAdmissionAdapter(gate, _BoundMapper(scope))
+    reserved = _reserve(gate, scope, "claim-query")
+    leg = reserved.legs[0]
+    assert adapter.query_group_leg_claim(scope, reserved.group_id, leg.leg_id) is None
+
+    child = _intent(scope, leg.intent_id, "1", "100")
+    gate.claim_group_leg(
+        scope,
+        reserved.group_id,
+        leg.leg_id,
+        leg.permit_id,
+        child,
+        expected_group_fingerprint=reserved.group_fingerprint,
+        expected_deadline_ns=reserved.deadline_ns,
+    )
+    gate.settle(leg.permit_id)
+    pending = adapter.query_group_leg_claim(scope, reserved.group_id, leg.leg_id)
+    assert pending is not None
+    assert pending.claimed is True and pending.resolved is False
+    assert pending.actual_intent_hash == child.fingerprint
+    assert pending.actual_quantity == child.quantity
+    assert pending.actual_notional == child.notional
+    unresolved = adapter.dispatch_terminal_resolution_receipt(leg.permit_id)
+    assert unresolved.status is DispatchTerminalResolutionReceiptStatus.UNRESOLVED_ACTIVE
+    assert unresolved.claim == pending.claim
+    assert unresolved.proof is None and unresolved.proof_sha256 is None
+    assert unresolved.fee_record_count is None and unresolved.fee_history_complete is False
+    assert unresolved.group_claim == pending
+
+    gate.freeze(scope, "operator-hold", "operator hold")
+    proof = DispatchTerminalProof(
+        scope=scope,
+        permit_id=leg.permit_id,
+        intent_id=leg.intent_id,
+        intent_hash=leg.reserved_intent_hash,
+        cause_id=pending.claim.cause_id,
+        claim_digest=pending.claim.claim_digest,
+        evidence_class=DispatchEvidenceClass.SIMULATION_JOURNAL,
+        terminal_state=DispatchTerminalState.CANCELED_NO_FILL,
+        dispatch_attempt_count=1,
+        journal_revision=7,
+        journal_record_sha256=_sha("claim-query-terminal-row"),
+        reconciliation_evidence_sha256=_sha("claim-query-reconciliation"),
+        writer_fence_sha256=_sha("claim-query-writer-fence"),
+        fee_record_count=0,
+        fee_history_complete=True,
+    )
+    authority.register(proof)
+    committed = adapter.resolve_dispatch_freeze(proof)
+    assert committed is not None
+    assert committed.status is DispatchTerminalResolutionReceiptStatus.NO_FILL_TERMINAL_RESOLVED
+    assert committed.group_claim == replace(pending, resolved=True)
+    assert committed.dispatch_latch_active is False
+    assert committed.has_other_active_freezes is True
+
+    before = _group_claim_storage(gate)
+    restarted = DurableRiskGate(
+        gate._database_path,
+        gate._policy,
+        clock=clock,
+    )
+    replay = restarted.dispatch_terminal_resolution_receipt(leg.permit_id)
+    assert replay == committed
+    resolved_claim = restarted.query_group_leg_claim(scope, reserved.group_id, leg.leg_id)
+    assert resolved_claim == committed.group_claim
+    assert resolved_claim.resolved is True
+    assert restarted.query_group_leg_claim(scope, reserved.group_id, reserved.legs[1].leg_id) is None
+    assert _group_claim_storage(restarted) == before
+    restarted.close()
+    gate.close()
+
+
+def _group_claim_storage(gate):
+    with gate._connection() as connection:
+        return tuple(
+            tuple(tuple(row) for row in connection.execute(query).fetchall())
+            for query in (
+                "SELECT * FROM risk_reservations ORDER BY permit_id",
+                "SELECT * FROM risk_dispatch_claims ORDER BY permit_id",
+                "SELECT * FROM risk_dispatch_resolutions ORDER BY permit_id",
+                "SELECT * FROM risk_freezes ORDER BY scope_key, cause_id",
+            )
+        )
+
+
 def test_unclaimed_vector_expiry_is_absolute_and_restart_does_not_renew(tmp_path):
     gate, scope, clock = _gate(tmp_path, ttl=5.0)
     receipt = _reserve(gate, scope, deadline_ns=1_200_000_000_000)
@@ -469,6 +594,30 @@ def test_account_adapter_maps_group_reserve_and_actual_child_without_execution_i
     assert claim.reserved_intent_hash == receipt.legs[0].reserved_intent_hash
     assert claim.actual_intent_hash == actual_order.group_intent.fingerprint
     assert adapter.query_group_vector(scope, receipt.group_id).legs[0].claimed is True
+    gate.close()
+
+
+def test_public_group_mapper_uses_explicit_trusted_scope_without_gate_writes(tmp_path):
+    gate, scope, _ = _gate(tmp_path)
+    mapper = _BoundMapper(scope)
+    adapter = DurableRiskAdmissionAdapter(gate, mapper)
+    order = _raw_order(scope, _intent(scope, "wire-account-mismatch", "1", "100"))
+    order.scope.account_ref = "provider-wire-account"
+    before = _group_claim_storage(gate)
+
+    mapped = adapter.map_group_intent(order, scope=scope)
+
+    assert mapped == order.group_intent
+    assert mapped.scope == scope
+    assert mapper.calls == 1
+    assert _group_claim_storage(gate) == before
+    with pytest.raises(RiskAdmissionDeniedError) as mismatch:
+        adapter.map_group_intent(
+            order,
+            scope=AccountScope("fixture", "different-risk-account", "sandbox"),
+        )
+    assert mismatch.value.code == "GROUP_SCOPE_MISMATCH"
+    assert _group_claim_storage(gate) == before
     gate.close()
 
 

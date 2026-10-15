@@ -306,6 +306,7 @@ def test_receipt_rejects_unknown_resolution_kind_instead_of_acknowledging(tmp_pa
     proof = _proof(claim)
     gate.resolve_dispatch_freeze(proof)
     with gate._transaction() as connection:
+        connection.execute("DROP TRIGGER risk_dispatch_resolution_immutable_update")
         connection.execute(
             "UPDATE risk_dispatch_resolutions SET proof_kind = 'UNKNOWN' WHERE permit_id = ?",
             (permit.permit_id,),
