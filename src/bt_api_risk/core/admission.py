@@ -30,6 +30,12 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Optional, Protocol, Union
 
+from .freeze_activation import (
+    FreezeActivationResult,
+    FreezeActivationStatus,
+    activate_freeze_once as _activate_freeze_once,
+)
+
 
 class RiskGateError(RuntimeError):
     """Base error raised by the durable admission gate."""
@@ -1583,6 +1589,16 @@ class DurableRiskGate:
         with self._transaction() as connection:
             self._ensure_policy_binding(connection, scope.key)
             self._freeze_in_transaction(connection, scope, cause_id, reason, self._clock())
+
+    def activate_freeze_once(
+        self, scope: AccountScope, cause_id: str, reason: str
+    ) -> FreezeActivationResult:
+        """Apply one exact cause once and report other active causes atomically.
+
+        This API never reactivates a row on its own retries.  The legacy
+        :meth:`freeze` method retains its existing explicit-upsert behavior.
+        """
+        return _activate_freeze_once(self, scope, cause_id, reason)
 
     def resolve_freeze(self, scope: AccountScope, cause_id: str) -> None:
         """Resolve an ordinary freeze; dispatch latches need reconciliation."""
@@ -3138,6 +3154,8 @@ def _wall_clock() -> float:
 __all__ = [
     "AccountScope",
     "DurableRiskGate",
+    "FreezeActivationResult",
+    "FreezeActivationStatus",
     "IntentAction",
     "PermitInvalidError",
     "RiskDeniedError",
