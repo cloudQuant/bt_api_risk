@@ -350,6 +350,11 @@ def test_first_terminal_positive_fill_resolves_group_leg_and_seeds_once(
     assert first_after.state is RiskGroupReservationState.SETTLED
     assert first_after.reserved_intent_hash == first.reserved_intent_hash
     assert first_after.actual_intent_hash == actual.fingerprint
+    read_snapshot = gate.read_group_vector_snapshot(scope, vector.group_id)
+    assert read_snapshot.legs[0].claimed is True
+    assert read_snapshot.legs[0].resolved is True
+    assert read_snapshot.legs[0].state is RiskGroupReservationState.SETTLED
+    assert read_snapshot.legs[0].actual_intent_hash == actual.fingerprint
     assert gate.dispatch_exposure_resolution_receipt(first.permit_id) == receipt
 
     projection = gate.gross_exposure_snapshot(scope)["orders"]
@@ -404,6 +409,8 @@ def test_group_adapter_uses_explicit_trusted_risk_scope_not_wire_account_ref(tmp
 
     def trusted_mapper(order):
         return _intent(trusted_scope, order.intent_id, order.quantity, order.notional)
+
+    trusted_mapper.wire_account_ref = "wire-account-reference"
 
     adapter = DurableRiskAdmissionAdapter(gate, trusted_mapper)
     vector = adapter.reserve_group_vector(

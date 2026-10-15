@@ -504,7 +504,9 @@ class InstrumentRiskAdmissionMapper:
     This keeps the risk package independent while still letting a composition
     root pass it to ``SharedRiskAdmissionAdapter``.  The caller owns the
     account scope and metadata registry; arbitrary strategy tags cannot select
-    another profile because the digest must match that registry exactly.
+    another profile because the digest must match that registry exactly. A
+    composition root may configure ``wire_account_ref`` when the execution
+    order's routed account alias differs from the durable Risk account ID.
     """
 
     def __init__(
@@ -516,6 +518,7 @@ class InstrumentRiskAdmissionMapper:
         allocation_reader: Optional[  # noqa: UP045 -- Python 3.9 is supported.
             Callable[[Any], Any]
         ] = None,
+        wire_account_ref: Optional[str] = None,  # noqa: UP045 -- Python 3.9 is supported.
     ) -> None:
         if not isinstance(scope, AccountScope):
             raise ValueError("scope must be an AccountScope")
@@ -525,16 +528,59 @@ class InstrumentRiskAdmissionMapper:
             raise ValueError("clock_ns must be callable")
         if allocation_reader is not None and not callable(allocation_reader):
             raise ValueError("allocation_reader must be callable")
+        if wire_account_ref is None:
+            wire_account_ref = scope.account_id
+        elif (
+            type(wire_account_ref) is not str
+            or not wire_account_ref.strip()
+            or wire_account_ref != wire_account_ref.strip()
+        ):
+            raise ValueError("wire_account_ref must be a non-empty account alias")
         self._scope = scope
         self._registry = registry
         self._clock_ns = clock_ns or _wall_clock_ns
         self._allocation_reader = allocation_reader
+        self._wire_account_ref = wire_account_ref
 
     @property
     def registry(self) -> InstrumentRiskRegistry:
         """Return the immutable registry used by this mapper."""
 
         return self._registry
+
+    @property
+    def wire_account_ref(self) -> str:
+        """Return the exact routed account alias accepted for this Risk scope."""
+
+        return self._wire_account_ref
+
+    def _validated_execution_scope(self, intent: Any) -> Any:
+        execution_scope = getattr(intent, "scope", None)
+        if execution_scope is None:
+            if self._allocation_reader is not None:
+                raise RiskDeniedError(
+                    "STRATEGY_ALLOCATION_SCOPE_MISMATCH",
+                    "execution intent has no strategy allocation scope",
+                )
+            return None
+        try:
+            provider = execution_scope.provider
+            account_ref = execution_scope.account_ref
+            environment = execution_scope.environment
+        except AttributeError:
+            raise RiskDeniedError(
+                "ACCOUNT_SCOPE_MISMATCH", "execution intent has no valid routed account scope"
+            ) from None
+        if (
+            provider != self._scope.provider
+            or account_ref != self._wire_account_ref
+            or environment != self._scope.environment
+        ):
+            raise RiskDeniedError(
+                "ACCOUNT_SCOPE_MISMATCH",
+                "execution scope does not match the configured routed account alias",
+            )
+        return execution_scope
 
     def assessment_for(self, intent: Any) -> InstrumentRiskAssessment:
         """Assess one execution-shaped object and reject missing trusted facts."""
@@ -570,6 +616,7 @@ class InstrumentRiskAdmissionMapper:
     def __call__(self, intent: Any) -> RiskIntent:
         """Create the account-bound risk intent for one verified execution intent."""
 
+        execution_scope = self._validated_execution_scope(intent)
         order = self._order_from_intent(intent)
         try:
             intent_id = intent.intent_id
@@ -595,29 +642,20 @@ class InstrumentRiskAdmissionMapper:
             # enforce its denomination on account-only risk admission too.
             notional_unit = assessment.metadata.valuation_unit
             if self._allocation_reader is not None:
-                execution_scope = getattr(intent, "scope", None)
-                if execution_scope is None:
-                    raise RiskDeniedError(
-                        "STRATEGY_ALLOCATION_SCOPE_MISMATCH",
-                        "execution intent has no strategy allocation scope",
-                    )
                 try:
-                    allocation = self._allocation_reader(execution_scope)
-                    strategy_id = execution_scope.strategy_id
+                    strategy_id = _identifier(execution_scope.strategy_id, "strategy_id")
                 except (AttributeError, TypeError, ValueError) as error:
                     raise RiskDeniedError(
                         "STRATEGY_ALLOCATION_UNAVAILABLE",
                         "authoritative strategy allocation is unavailable or malformed",
                     ) from error
-                if (
-                    getattr(execution_scope, "provider", None) != self._scope.provider
-                    or getattr(execution_scope, "account_ref", None) != self._scope.account_id
-                    or getattr(execution_scope, "environment", None) != self._scope.environment
-                ):
+                try:
+                    allocation = self._allocation_reader(execution_scope)
+                except (AttributeError, TypeError, ValueError) as error:
                     raise RiskDeniedError(
-                        "STRATEGY_ALLOCATION_SCOPE_MISMATCH",
-                        "strategy allocation does not match the bound account and strategy",
-                    )
+                        "STRATEGY_ALLOCATION_UNAVAILABLE",
+                        "authoritative strategy allocation is unavailable or malformed",
+                    ) from error
                 if type(allocation) is StrategyAllocationSnapshot:
                     # The durable reader is account-scoped, while legacy SDK
                     # allocation DTOs are execution-scope-scoped. Handle the
@@ -697,7 +735,6 @@ class InstrumentRiskAdmissionMapper:
                             "strategy allocation does not match the bound account and strategy",
                         )
                 try:
-                    _identifier(strategy_id, "strategy_id")
                     _identifier(allocation_version, "allocation_version")
                     metadata_notional_unit = assessment.metadata.valuation_unit
                     if (

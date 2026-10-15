@@ -91,7 +91,7 @@ def _order(
     )
 
 
-def _mapper(account_scope, metadata, gate=None):
+def _mapper(account_scope, metadata, gate=None, *, wire_account_ref=None):
     allocation_reader = None
     if gate is not None:
         allocation_reader = lambda order_scope: gate.get_strategy_allocation(  # noqa: E731
@@ -102,6 +102,7 @@ def _mapper(account_scope, metadata, gate=None):
         InstrumentRiskRegistry((metadata,)),
         clock_ns=lambda: 1_500,
         allocation_reader=allocation_reader,
+        wire_account_ref=wire_account_ref,
     )
 
 
@@ -218,6 +219,38 @@ def test_scope_and_required_instrument_facts_fail_before_reservation(tmp_path):
     snapshot = gate.snapshot(account_scope)
     assert snapshot["increase_count"] == 0
     assert snapshot["increase_notional"] == Decimal("0")
+    gate.close()
+
+
+def test_ordinary_order_adapter_accepts_only_the_mapper_configured_wire_alias(tmp_path):
+    execution = _execution_contracts()
+    metadata = _metadata()
+    risk_scope = AccountScope("fake", "risk-account-1", "sandbox")
+    gate = DurableRiskGate(
+        tmp_path / "ordinary-wire-alias.sqlite3",
+        RiskPolicy("ordinary-wire-alias", Decimal("100"), 3, notional_unit="USD"),
+        clock=lambda: 1_700_000_000.0,
+    )
+    mapper = _mapper(
+        risk_scope,
+        metadata,
+        wire_account_ref="venue-account-ref",
+    )
+    adapter = DurableRiskAdmissionAdapter(gate, mapper)
+    order = _order(execution, metadata, account="venue-account-ref")
+    original_scope = order.scope
+    original_fingerprint = order.fingerprint
+
+    permit = adapter.reserve(order)
+
+    assert permit.scope == risk_scope
+    assert order.scope is original_scope
+    assert order.scope.account_ref == "venue-account-ref"
+    assert order.fingerprint == original_fingerprint
+    with pytest.raises(RiskAdmissionDeniedError) as wrong_alias:
+        adapter.reserve(_order(execution, metadata, account="another-account-ref"))
+    assert wrong_alias.value.code == "ACCOUNT_SCOPE_MISMATCH"
+    assert gate.snapshot(risk_scope)["increase_count"] == 1
     gate.close()
 
 

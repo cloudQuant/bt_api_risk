@@ -64,10 +64,11 @@ class DurableRiskAdmissionAdapter:
     The neutral order object is deliberately accepted by structural contract,
     so installing this adapter does not add an execution-package dependency.
 
-    The incoming order's provider, environment, and account reference must
-    match the scope produced by the mapper on every operation.  This prevents
-    a correctly configured account adapter from silently re-binding an order
-    routed for a different account.
+    The incoming order's provider and environment must match the mapped Risk
+    scope on every operation. Its account reference must exactly match the
+    mapper's trusted ``wire_account_ref`` when that typed property exists;
+    otherwise the legacy rule requires it to equal the mapped Risk account ID.
+    This prevents a configured alias from becoming a caller-selected rebind.
     """
 
     def __init__(
@@ -206,6 +207,23 @@ class DurableRiskAdmissionAdapter:
         except (RiskDeniedError, PermitInvalidError) as error:
             self._raise_neutral_denial(error)
 
+    def read_group_vector_snapshot(
+        self, scope: AccountScope, group_id: str
+    ) -> RiskGroupReservationReceipt:
+        """Read persisted group state without TTL cleanup or policy initialization.
+
+        This reports durable lifecycle and claim/resolution facts only. An
+        ``ACTIVE`` leg may already be past its expiry or group deadline; only
+        a leg with persisted ACTIVE state, no claim or resolution, and a
+        current UTC epoch-ns before both returned deadlines is a time-eligible
+        candidate. The write-side claim operation remains authoritative.
+        """
+
+        try:
+            return self._gate.read_group_vector_snapshot(scope, group_id)
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
     def query_group_leg_claim(
         self, scope: AccountScope, group_id: str, leg_id: str
     ) -> Optional[RiskGroupLegClaimReceipt]:  # noqa: UP045 -- Python 3.9 is supported.
@@ -310,14 +328,7 @@ class DurableRiskAdmissionAdapter:
         return mapped
 
     def _bind_group_mapped_order(self, intent: Any, mapped: Any) -> RiskIntent:
-        """Bind group order identity while leaving account selection to its owner.
-
-        The trusted account-owner mapper selects Risk ``AccountScope``. The
-        wire order's ``account_ref`` is not that scope's authority: venues may
-        expose an account reference different from the local risk-account ID.
-        Group reserve/claim methods compare the mapper result to their explicit
-        trusted scope before reaching the durable gate.
-        """
+        """Bind group order identity to the mapper's exact configured alias."""
         if type(mapped) is not RiskIntent:
             raise RiskAdmissionAdapterError("MAPPED_RISK_INTENT_REQUIRED")
         order_intent_id = getattr(intent, "intent_id", None)
@@ -329,16 +340,21 @@ class DurableRiskAdmissionAdapter:
         order_scope = getattr(intent, "scope", None)
         try:
             provider = order_scope.provider
+            account_ref = order_scope.account_ref
             environment = order_scope.environment
             strategy_id = order_scope.strategy_id
         except AttributeError:
             raise RiskDeniedError(
                 "ACCOUNT_SCOPE_UNPROVEN", "group order does not carry a valid wire scope"
             ) from None
-        if mapped.scope.provider != provider or mapped.scope.environment != environment:
+        if (
+            mapped.scope.provider != provider
+            or mapped.scope.environment != environment
+            or account_ref != self._expected_wire_account_ref(mapped.scope)
+        ):
             raise RiskDeniedError(
                 "GROUP_SCOPE_MISMATCH",
-                "trusted Risk scope provider/environment differ from the routed order",
+                "trusted Risk scope or configured account alias differs from the routed order",
             )
         if mapped.strategy_id is not None and mapped.strategy_id != strategy_id:
             raise RiskDeniedError(
@@ -360,21 +376,23 @@ class DurableRiskAdmissionAdapter:
 
         order_scope = getattr(intent, "scope", None)
         try:
-            input_scope = AccountScope(
-                provider=order_scope.provider,
-                account_id=order_scope.account_ref,
-                environment=order_scope.environment,
-            )
-        except (AttributeError, TypeError, ValueError):
+            provider = order_scope.provider
+            account_ref = order_scope.account_ref
+            environment = order_scope.environment
+        except AttributeError:
             raise RiskDeniedError(
                 "ACCOUNT_SCOPE_UNPROVEN",
                 "order does not carry a valid account scope",
             ) from None
 
-        if mapped.scope != input_scope:
+        if (
+            mapped.scope.provider != provider
+            or mapped.scope.environment != environment
+            or account_ref != self._expected_wire_account_ref(mapped.scope)
+        ):
             raise RiskDeniedError(
                 "ACCOUNT_SCOPE_MISMATCH",
-                "mapped risk scope does not match the order account scope",
+                "mapped Risk scope or configured account alias does not match the order",
             )
         strategy_id = getattr(order_scope, "strategy_id", None)
         if mapped.strategy_id is not None and mapped.strategy_id != strategy_id:
@@ -383,6 +401,23 @@ class DurableRiskAdmissionAdapter:
                 "mapped strategy allocation does not match the order strategy scope",
             )
         return mapped
+
+    def _expected_wire_account_ref(self, mapped_scope: AccountScope) -> str:
+        """Return the explicit trusted mapper alias or the legacy account ID."""
+
+        mapper = self._map_intent
+        marker = object()
+        configured = getattr(mapper, "wire_account_ref", marker)
+        if configured is marker:
+            owner = getattr(mapper, "__self__", None)
+            configured = getattr(owner, "wire_account_ref", marker)
+        if configured is marker:
+            return mapped_scope.account_id
+        if type(configured) is not str or not configured or configured != configured.strip():
+            raise RiskDeniedError(
+                "ACCOUNT_SCOPE_MISMATCH", "configured wire account alias is invalid"
+            )
+        return configured
 
 
 __all__ = [

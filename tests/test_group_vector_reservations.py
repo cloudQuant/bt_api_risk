@@ -330,6 +330,8 @@ def test_bounded_child_claim_keeps_reserved_identity_and_blocks_singleton_paths(
     assert projected.legs[0].resolved is False
     assert projected.legs[0].actual_intent_hash == child.fingerprint
     assert projected.legs[0].state is RiskGroupReservationState.SETTLED
+    read_only = gate.read_group_vector_snapshot(scope, receipt.group_id)
+    assert read_only.legs[0] == projected.legs[0]
     with pytest.raises(RiskDeniedError) as unresolved:
         gate.release_group_unclaimed(scope, receipt.group_id, "owner-stopped")
     assert unresolved.value.code == "GROUP_CLAIM_UNRESOLVED"
@@ -393,6 +395,11 @@ def test_group_claim_query_is_read_only_and_requires_a_durable_terminal_proof(tm
     assert committed.group_claim == replace(pending, resolved=True)
     assert committed.dispatch_latch_active is False
     assert committed.has_other_active_freezes is True
+    snapshot = adapter.read_group_vector_snapshot(scope, reserved.group_id)
+    assert snapshot.legs[0].claimed is True
+    assert snapshot.legs[0].resolved is True
+    assert snapshot.legs[0].state is RiskGroupReservationState.NO_FILL_TERMINAL
+    assert snapshot.legs[0].actual_intent_hash == child.fingerprint
 
     before = _group_claim_storage(gate)
     restarted = DurableRiskGate(
@@ -420,6 +427,7 @@ def _group_claim_storage(gate):
                 "SELECT * FROM risk_dispatch_claims ORDER BY permit_id",
                 "SELECT * FROM risk_dispatch_resolutions ORDER BY permit_id",
                 "SELECT * FROM risk_freezes ORDER BY scope_key, cause_id",
+                "SELECT * FROM risk_policy_bindings ORDER BY scope_key",
             )
         )
 
@@ -449,6 +457,57 @@ def test_unclaimed_vector_expiry_is_absolute_and_restart_does_not_renew(tmp_path
         )
     assert cannot_claim.value.code == "PERMIT_NOT_ACTIVE"
     restarted.close()
+
+
+def test_read_group_vector_snapshot_does_not_expire_or_initialize_policy(tmp_path, monkeypatch):
+    gate, scope, clock = _gate(tmp_path, ttl=5.0, database="read-group-snapshot.sqlite3")
+    receipt = _reserve(gate, scope, deadline_ns=1_200_000_000_000)
+    persisted_before = _group_claim_storage(gate)
+    clock.value = 106.0
+    changes: dict[str, int] = {}
+    original_connection = gate._connection
+
+    @contextmanager
+    def tracked_connection():
+        with original_connection() as connection:
+            changes["before"] = connection.total_changes
+            yield connection
+            changes["after"] = connection.total_changes
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("read_group_vector_snapshot must not initialize or expire state")
+
+    with monkeypatch.context() as scoped_patch:
+        scoped_patch.setattr(gate, "_connection", tracked_connection)
+        scoped_patch.setattr(gate, "_ensure_policy_binding", forbidden)
+        scoped_patch.setattr(gate, "_expire_active", forbidden)
+        snapshot = gate.read_group_vector_snapshot(scope, receipt.group_id)
+
+    assert changes == {"before": 0, "after": 0}
+    assert {leg.state for leg in snapshot.legs} == {RiskGroupReservationState.ACTIVE}
+    assert all(not leg.claimed and not leg.resolved for leg in snapshot.legs)
+    assert {leg.expires_at_ns for leg in snapshot.legs} == {105_000_000_000}
+    assert snapshot.deadline_ns == receipt.deadline_ns
+    assert _group_claim_storage(gate) == persisted_before
+
+    with pytest.raises(PermitInvalidError) as expired_claim:
+        gate.claim_group_leg(
+            scope,
+            receipt.group_id,
+            receipt.legs[0].leg_id,
+            receipt.legs[0].permit_id,
+            _intent(scope, receipt.legs[0].intent_id, "1", "100"),
+            expected_group_fingerprint=receipt.group_fingerprint,
+            expected_deadline_ns=receipt.deadline_ns,
+        )
+    assert expired_claim.value.code == "PERMIT_NOT_ACTIVE"
+    # Even a denied expired claim does not turn the snapshot reader into a
+    # cleanup path; persisted status remains ACTIVE until a mutating lifecycle
+    # operation records expiry.
+    after_denial = gate.read_group_vector_snapshot(scope, receipt.group_id)
+    assert {leg.state for leg in after_denial.legs} == {RiskGroupReservationState.ACTIVE}
+    assert all(leg.expires_at_ns <= int(clock.value * 1_000_000_000) for leg in after_denial.legs)
+    gate.close()
 
 
 def test_only_explicit_release_releases_unclaimed_vector_members(tmp_path):
@@ -542,9 +601,11 @@ def test_group_expiry_uses_facts_at_commit_boundary_and_rolls_back(tmp_path):
 
 
 class _BoundMapper:
-    def __init__(self, scope: AccountScope) -> None:
+    def __init__(self, scope: AccountScope, *, wire_account_ref: str | None = None) -> None:
         self.scope = scope
         self.calls = 0
+        if wire_account_ref is not None:
+            self.wire_account_ref = wire_account_ref
 
     def __call__(self, order) -> RiskIntent:
         return order.regular_intent
@@ -599,7 +660,7 @@ def test_account_adapter_maps_group_reserve_and_actual_child_without_execution_i
 
 def test_public_group_mapper_uses_explicit_trusted_scope_without_gate_writes(tmp_path):
     gate, scope, _ = _gate(tmp_path)
-    mapper = _BoundMapper(scope)
+    mapper = _BoundMapper(scope, wire_account_ref="provider-wire-account")
     adapter = DurableRiskAdmissionAdapter(gate, mapper)
     order = _raw_order(scope, _intent(scope, "wire-account-mismatch", "1", "100"))
     order.scope.account_ref = "provider-wire-account"
@@ -617,6 +678,21 @@ def test_public_group_mapper_uses_explicit_trusted_scope_without_gate_writes(tmp
             scope=AccountScope("fixture", "different-risk-account", "sandbox"),
         )
     assert mismatch.value.code == "GROUP_SCOPE_MISMATCH"
+    assert _group_claim_storage(gate) == before
+    wrong_strategy = _raw_order(scope, _intent(scope, "wrong-strategy", "1", "100"))
+    wrong_strategy.scope.account_ref = "provider-wire-account"
+    wrong_strategy.scope.strategy_id = "another-strategy"
+    with pytest.raises(RiskAdmissionDeniedError) as strategy_mismatch:
+        adapter.map_group_intent(wrong_strategy, scope=scope)
+    assert strategy_mismatch.value.code == "STRATEGY_SCOPE_MISMATCH"
+    assert _group_claim_storage(gate) == before
+
+    unconfigured_mapper = _BoundMapper(scope)
+    unconfigured_adapter = DurableRiskAdmissionAdapter(gate, unconfigured_mapper)
+    with pytest.raises(RiskAdmissionDeniedError) as unconfigured_alias:
+        unconfigured_adapter.map_group_intent(order, scope=scope)
+    assert unconfigured_alias.value.code == "GROUP_SCOPE_MISMATCH"
+    assert unconfigured_mapper.calls == 1
     assert _group_claim_storage(gate) == before
     gate.close()
 
@@ -663,7 +739,7 @@ def test_real_instrument_mapper_and_durable_gate_share_group_vector_path(tmp_pat
     )
     execution_scope = SimpleNamespace(
         provider="fixture",
-        account_ref="account-1",
+        account_ref="venue-account-1",
         environment="sandbox",
         strategy_id="strategy-1",
     )
@@ -674,6 +750,7 @@ def test_real_instrument_mapper_and_durable_gate_share_group_vector_path(tmp_pat
         allocation_reader=lambda order_scope: gate.get_strategy_allocation(
             scope, order_scope.strategy_id
         ),
+        wire_account_ref="venue-account-1",
     )
 
     def order(intent_id: str, quantity: str):
@@ -714,6 +791,10 @@ def test_real_instrument_mapper_and_durable_gate_share_group_vector_path(tmp_pat
     assert claim.actual_quantity == Decimal("1")
     assert claim.actual_notional == Decimal("10")
     assert claim.actual_intent_hash != receipt.legs[0].reserved_intent_hash
+    snapshot = adapter.read_group_vector_snapshot(scope, receipt.group_id)
+    assert snapshot.legs[0].claimed is True
+    assert snapshot.legs[0].resolved is False
+    assert snapshot.legs[0].actual_intent_hash == claim.actual_intent_hash
     gate.close()
 
 

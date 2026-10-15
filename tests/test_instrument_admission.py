@@ -219,6 +219,131 @@ def test_mapper_binds_metadata_and_risk_envelope_into_permit_identity(tmp_path) 
     assert caught.value.code == "PERMIT_INTENT_MISMATCH"
 
 
+def test_mapper_uses_explicit_wire_account_alias_without_rewriting_order(tmp_path) -> None:
+    metadata = _metadata(valuation_unit="USD", quantity_unit="contract")
+    risk_scope = AccountScope("fixture", "risk-account-1", "sandbox")
+    execution_scope = SimpleNamespace(
+        provider="fixture",
+        environment="sandbox",
+        account_ref="venue-account-ref",
+        strategy_id="strategy-1",
+        trading_day="2026-10-15",
+    )
+    gate = DurableRiskGate(
+        tmp_path / "wire-account-alias.sqlite3",
+        RiskPolicy(
+            "wire-alias-policy",
+            Decimal("2000"),
+            4,
+            require_strategy_allocation=True,
+            notional_unit="USD",
+        ),
+        clock=lambda: 1_700_000_000.0,
+    )
+    gate.set_strategy_allocation(
+        risk_scope,
+        "strategy-1",
+        "allocation-v1",
+        max_notional=Decimal("1000"),
+        notional_unit="USD",
+    )
+    allocation_reads: list[object] = []
+
+    def read_allocation(requested_scope):
+        allocation_reads.append(requested_scope)
+        return gate.get_strategy_allocation(risk_scope, requested_scope.strategy_id)
+
+    mapper = InstrumentRiskAdmissionMapper(
+        risk_scope,
+        InstrumentRiskRegistry((metadata,)),
+        clock_ns=lambda: 1_500,
+        allocation_reader=read_allocation,
+        wire_account_ref="venue-account-ref",
+    )
+    intent = _execution_shape(metadata, scope=execution_scope)
+    original_fingerprint = intent.fingerprint
+    original_scope = intent.scope
+
+    mapped = mapper(intent)
+
+    assert mapper.wire_account_ref == "venue-account-ref"
+    assert mapped.scope == risk_scope
+    assert mapped.strategy_id == "strategy-1"
+    assert allocation_reads == [original_scope]
+    assert intent.scope is original_scope
+    assert intent.fingerprint == original_fingerprint
+
+    wrong_alias = SimpleNamespace(**vars(intent))
+    wrong_alias.scope = SimpleNamespace(
+        provider="fixture",
+        environment="sandbox",
+        account_ref="different-venue-account",
+        strategy_id="strategy-1",
+        trading_day="2026-10-15",
+    )
+    with pytest.raises(RiskDeniedError) as rejected:
+        mapper(wrong_alias)
+    assert rejected.value.code == "ACCOUNT_SCOPE_MISMATCH"
+    assert allocation_reads == [original_scope]
+
+    for invalid_scope in (
+        SimpleNamespace(
+            provider="other-provider",
+            environment="sandbox",
+            account_ref="venue-account-ref",
+            strategy_id="strategy-1",
+            trading_day="2026-10-15",
+        ),
+        SimpleNamespace(
+            provider="fixture",
+            environment="live",
+            account_ref="venue-account-ref",
+            strategy_id="strategy-1",
+            trading_day="2026-10-15",
+        ),
+    ):
+        wrong_scope = SimpleNamespace(**vars(intent))
+        wrong_scope.scope = invalid_scope
+        with pytest.raises(RiskDeniedError) as scope_rejected:
+            mapper(wrong_scope)
+        assert scope_rejected.value.code == "ACCOUNT_SCOPE_MISMATCH"
+    assert allocation_reads == [original_scope]
+
+    for strategy_scope in (
+        SimpleNamespace(
+            provider="fixture",
+            environment="sandbox",
+            account_ref="venue-account-ref",
+            trading_day="2026-10-15",
+        ),
+        SimpleNamespace(
+            provider="fixture",
+            environment="sandbox",
+            account_ref="venue-account-ref",
+            strategy_id=" invalid-strategy",
+            trading_day="2026-10-15",
+        ),
+    ):
+        invalid_strategy = SimpleNamespace(**vars(intent))
+        invalid_strategy.scope = strategy_scope
+        with pytest.raises(RiskDeniedError) as strategy_rejected:
+            mapper(invalid_strategy)
+        assert strategy_rejected.value.code == "STRATEGY_ALLOCATION_UNAVAILABLE"
+        assert allocation_reads == [original_scope]
+
+    default_mapper = InstrumentRiskAdmissionMapper(
+        risk_scope,
+        InstrumentRiskRegistry((metadata,)),
+        clock_ns=lambda: 1_500,
+        allocation_reader=read_allocation,
+    )
+    with pytest.raises(RiskDeniedError) as default_rejected:
+        default_mapper(intent)
+    assert default_rejected.value.code == "ACCOUNT_SCOPE_MISMATCH"
+    assert allocation_reads == [original_scope]
+    gate.close()
+
+
 def test_mapper_requires_digest_and_proven_position_effect() -> None:
     metadata = _metadata()
     scope = AccountScope("fixture", "account", "sandbox")

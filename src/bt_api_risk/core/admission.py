@@ -2763,6 +2763,42 @@ class DurableRiskGate:
             ).fetchall()
             return self._group_receipt_in_transaction(connection, scope, group_id, rows)
 
+    def read_group_vector_snapshot(
+        self, scope: AccountScope, group_id: str
+    ) -> RiskGroupReservationReceipt:
+        """Read exact persisted group state without changing any Risk rows.
+
+        The receipt describes lifecycle, claim, and resolution state as stored
+        in one SQLite read snapshot. In particular, an elapsed group deadline
+        or permit expiry does not rewrite an ``ACTIVE`` row here. Consumers
+        must treat the returned state as historical facts, not dispatch
+        authorization. A leg is only a time-eligible claim candidate when its
+        persisted state is ACTIVE, it is unclaimed and unresolved, and the
+        caller's current UTC epoch-ns is before both ``deadline_ns`` and that
+        leg's ``expires_at_ns``. ``claim_group_leg`` remains authoritative and
+        rechecks current deadlines and policy on its write path.
+        """
+
+        self._validate_group_key(scope, group_id)
+        with self._connection() as connection:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            try:
+                rows = connection.execute(
+                    """SELECT * FROM risk_reservations
+                       WHERE scope_key = ? AND group_id = ? ORDER BY group_leg_id""",
+                    (scope.key, group_id),
+                ).fetchall()
+                if not rows:
+                    raise RiskDeniedError("GROUP_NOT_FOUND", "group reservation does not exist")
+                receipt = self._group_receipt_in_transaction(connection, scope, group_id, rows)
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+            else:
+                connection.execute("COMMIT")
+                return receipt
+
     def query_group_vector(self, scope: AccountScope, group_id: str) -> RiskGroupReservationReceipt:
         """Return one transactional projection of every member in a group."""
 
