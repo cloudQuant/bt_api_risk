@@ -457,6 +457,7 @@ def test_account_adapter_maps_group_reserve_and_actual_child_without_execution_i
     actual_order = _raw_order(scope, _intent(scope, "intent-a", "1", "100"))
     claim = adapter.claim_group_leg(
         actual_order,
+        scope=scope,
         group_id=receipt.group_id,
         leg_id="leg-a",
         permit_reference=receipt.legs[0].permit_id,
@@ -554,6 +555,7 @@ def test_real_instrument_mapper_and_durable_gate_share_group_vector_path(tmp_pat
     child = order("stable-leg", "1")
     claim = adapter.claim_group_leg(
         child,
+        scope=scope,
         group_id=receipt.group_id,
         leg_id="leg-a",
         permit_reference=receipt.legs[0].permit_id,

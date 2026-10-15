@@ -340,7 +340,10 @@ class OrderExposureObservationProof:
     intent_id: str
     intent_hash: str
     dispatch_claim_digest: str
-    dispatch_proof_sha256: str
+    # ``None`` is reserved for the separate first-observation terminal
+    # resolution path.  Ordinary post-ACK exposure updates still require the
+    # exact previously accepted DispatchTrackedOrderProof fingerprint.
+    dispatch_proof_sha256: Optional[str]  # noqa: UP045 -- Python 3.9 is supported.
     provider_order_id: str
     accepted_request_sha256: str
     exposure_reservation_id: str
@@ -414,7 +417,6 @@ class OrderExposureObservationProof:
         for name in (
             "intent_hash",
             "dispatch_claim_digest",
-            "dispatch_proof_sha256",
             "accepted_request_sha256",
             "exposure_reservation_sha256",
             "journal_record_sha256",
@@ -427,6 +429,8 @@ class OrderExposureObservationProof:
             "writer_fence_sha256",
         ):
             _digest(getattr(self, name), name)
+        if self.dispatch_proof_sha256 is not None:
+            _digest(self.dispatch_proof_sha256, "dispatch_proof_sha256")
         for name in ("order_revision", "journal_revision"):
             if type(getattr(self, name)) is not int or getattr(self, name) <= 0:
                 raise ValueError("invalid " + name)

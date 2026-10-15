@@ -20,6 +20,8 @@ from typing import Any, NoReturn
 
 from .core.admission import (
     AccountScope,
+    DispatchExposureResolutionProof,
+    DispatchExposureResolutionReceipt,
     DurableRiskGate,
     PermitInvalidError,
     RiskDeniedError,
@@ -107,6 +109,26 @@ class DurableRiskAdmissionAdapter:
 
         return self._gate.settle(permit_reference)
 
+    def resolve_dispatch_exposure(
+        self, proof: DispatchExposureResolutionProof
+    ) -> DispatchExposureResolutionReceipt:
+        """Resolve a claimed order from exact complete positive-fill terminal evidence."""
+
+        try:
+            return self._gate.resolve_dispatch_exposure(proof)
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
+    def dispatch_exposure_resolution_receipt(
+        self, permit_reference: str
+    ) -> DispatchExposureResolutionReceipt:
+        """Read the durable terminal-exposure outcome without mutation."""
+
+        try:
+            return self._gate.dispatch_exposure_resolution_receipt(permit_reference)
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
     def ensure_settled(self, permit_reference: str) -> RiskPermit:
         """Prove recovery settlement after the owner records a known outcome."""
 
@@ -180,6 +202,7 @@ class DurableRiskAdmissionAdapter:
         self,
         intent: Any,
         *,
+        scope: AccountScope,
         group_id: str,
         leg_id: str,
         permit_reference: str,
@@ -189,9 +212,18 @@ class DurableRiskAdmissionAdapter:
         """Claim one mapper-verified child order under its reserved group leg."""
 
         try:
+            if type(scope) is not AccountScope:
+                raise RiskDeniedError(
+                    "GROUP_SCOPE_MISMATCH", "a trusted persisted account scope is required"
+                )
             mapped = self._map_group_order(intent)
+            if mapped.scope != scope:
+                raise RiskDeniedError(
+                    "GROUP_SCOPE_MISMATCH",
+                    "mapped child does not use the exact trusted group account scope",
+                )
             return self._gate.claim_group_leg(
-                mapped.scope,
+                scope,
                 group_id,
                 leg_id,
                 permit_reference,
@@ -223,11 +255,49 @@ class DurableRiskAdmissionAdapter:
             owner = getattr(mapper, "__self__", None)
             group_mapper = getattr(owner, "map_group_intent", None)
         mapped = group_mapper(intent) if callable(group_mapper) else mapper(intent)
-        mapped = self._bind_mapped_order(intent, mapped)
+        mapped = self._bind_group_mapped_order(intent, mapped)
         if mapped.exposure_profile_fingerprint is None:
             raise RiskDeniedError(
                 "GROUP_PROFILE_UNAVAILABLE",
                 "group orders require a trusted mapper-owned exposure profile",
+            )
+        return mapped
+
+    def _bind_group_mapped_order(self, intent: Any, mapped: Any) -> RiskIntent:
+        """Bind group order identity while leaving account selection to its owner.
+
+        The trusted account-owner mapper selects Risk ``AccountScope``. The
+        wire order's ``account_ref`` is not that scope's authority: venues may
+        expose an account reference different from the local risk-account ID.
+        Group reserve/claim methods compare the mapper result to their explicit
+        trusted scope before reaching the durable gate.
+        """
+        if type(mapped) is not RiskIntent:
+            raise RiskAdmissionAdapterError("MAPPED_RISK_INTENT_REQUIRED")
+        order_intent_id = getattr(intent, "intent_id", None)
+        if type(order_intent_id) is not str or mapped.intent_id != order_intent_id:
+            raise RiskDeniedError(
+                "ORDER_INTENT_ID_MISMATCH",
+                "mapped risk intent does not match the order intent identity",
+            )
+        order_scope = getattr(intent, "scope", None)
+        try:
+            provider = order_scope.provider
+            environment = order_scope.environment
+            strategy_id = order_scope.strategy_id
+        except AttributeError:
+            raise RiskDeniedError(
+                "ACCOUNT_SCOPE_UNPROVEN", "group order does not carry a valid wire scope"
+            ) from None
+        if mapped.scope.provider != provider or mapped.scope.environment != environment:
+            raise RiskDeniedError(
+                "GROUP_SCOPE_MISMATCH",
+                "trusted Risk scope provider/environment differ from the routed order",
+            )
+        if mapped.strategy_id is not None and mapped.strategy_id != strategy_id:
+            raise RiskDeniedError(
+                "STRATEGY_SCOPE_MISMATCH",
+                "mapped strategy allocation does not match the order strategy scope",
             )
         return mapped
 

@@ -811,6 +811,327 @@ class DispatchTrackedOrderProof:
         return _dispatch_resolution_proof_sha256(self)
 
 
+@dataclass(frozen=True)
+class DispatchExposureResolutionProof:
+    """Resolve a dispatch latch from a complete first terminal observation.
+
+    This path is intentionally distinct from ``DispatchTrackedOrderProof``:
+    it accepts a positive-fill FILLED/CANCELLED observation with no open
+    leaves, while the existing tracked-order proof continues to require zero
+    fills.  An injected journal authority must verify the exact source events
+    and hold the current account fence through the Risk transaction.
+    """
+
+    claim: DispatchClaimBinding
+    evidence_class: DispatchEvidenceClass
+    dispatch_attempt_count: int
+    reconciliation_evidence_sha256: str
+    observation: OrderExposureObservationProof
+
+    def __post_init__(self) -> None:
+        if type(self.claim) is not DispatchClaimBinding:
+            raise ValueError("dispatch exposure proof requires an exact claim")
+        _validate_dispatch_evidence_class(self.claim.scope, self.evidence_class)
+        if type(self.dispatch_attempt_count) is not int or self.dispatch_attempt_count != 1:
+            raise ValueError("dispatch exposure proof requires exactly one attempt")
+        _require_sha256(self.reconciliation_evidence_sha256, "reconciliation_evidence_sha256")
+        if type(self.observation) is not OrderExposureObservationProof:
+            raise ValueError("dispatch exposure proof requires a typed order observation")
+        observation = self.observation
+        if observation.dispatch_proof_sha256 is not None:
+            raise ValueError("initial terminal observation cannot reuse an ACKED proof")
+        if not all(
+            (
+                observation.scope == self.claim.scope,
+                observation.permit_id == self.claim.permit_id,
+                observation.intent_id == self.claim.intent_id,
+                observation.intent_hash == self.claim.intent_hash,
+                observation.dispatch_claim_digest == self.claim.claim_digest,
+            )
+        ):
+            raise ValueError("terminal observation does not bind the exact dispatch claim")
+        if observation.state not in (OrderExposureState.FILLED, OrderExposureState.CANCELLED):
+            raise ValueError("dispatch exposure proof requires a known terminal order state")
+        if observation.cumulative_filled_quantity <= 0 or observation.leaves_quantity != 0:
+            raise ValueError("terminal exposure proof requires positive fills and zero leaves")
+        if observation.fill_trade_count <= 0 or not observation.fills:
+            raise ValueError("terminal exposure proof requires immutable positive-fill facts")
+
+    @property
+    def scope(self) -> AccountScope:
+        return self.claim.scope
+
+    @property
+    def permit_id(self) -> str:
+        return self.claim.permit_id
+
+    @property
+    def intent_id(self) -> str:
+        return self.claim.intent_id
+
+    @property
+    def intent_hash(self) -> str:
+        return self.claim.intent_hash
+
+    @property
+    def cause_id(self) -> str:
+        return self.claim.cause_id
+
+    @property
+    def claim_digest(self) -> str:
+        return self.claim.claim_digest
+
+    @property
+    def journal_revision(self) -> int:
+        return self.observation.journal_revision
+
+    @property
+    def journal_record_sha256(self) -> str:
+        return self.observation.journal_record_sha256
+
+    @property
+    def writer_fence_sha256(self) -> str:
+        return self.observation.writer_fence_sha256
+
+    @property
+    def fingerprint(self) -> str:
+        return _sha256(
+            _canonical_json(
+                {
+                    "claim_digest": self.claim.claim_digest,
+                    "dispatch_attempt_count": self.dispatch_attempt_count,
+                    "evidence_class": self.evidence_class.value,
+                    "journal_record_sha256": self.journal_record_sha256,
+                    "journal_revision": self.journal_revision,
+                    "observation_sha256": self.observation.fingerprint,
+                    "permit_id": self.permit_id,
+                    "reconciliation_evidence_sha256": self.reconciliation_evidence_sha256,
+                    "scope_key": self.scope.key,
+                    "schema": "bt-api-risk-dispatch-exposure-resolution-v1",
+                    "writer_fence_sha256": self.writer_fence_sha256,
+                }
+            )
+        )
+
+
+class DispatchExposureResolutionReceiptStatus(str, Enum):
+    """Durable state of one positive-fill terminal dispatch resolution."""
+
+    UNRESOLVED_ACTIVE = "UNRESOLVED_ACTIVE"
+    TERMINAL_EXPOSURE_RESOLVED = "TERMINAL_EXPOSURE_RESOLVED"
+
+
+@dataclass(frozen=True)
+class DispatchExposureResolutionReceipt:
+    """Single-snapshot Risk receipt for a positive-fill terminal resolution."""
+
+    status: DispatchExposureResolutionReceiptStatus
+    claim: DispatchClaimBinding
+    proof_sha256: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+    exposure_proof_sha256: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+    final_state: Optional[OrderExposureState] = None  # noqa: UP045 -- Python 3.9 is supported.
+    requested_quantity: Optional[Decimal] = None  # noqa: UP045 -- Python 3.9 is supported.
+    filled_quantity: Optional[Decimal] = None  # noqa: UP045 -- Python 3.9 is supported.
+    trade_count: Optional[int] = None  # noqa: UP045 -- Python 3.9 is supported.
+    order_revision: Optional[int] = None  # noqa: UP045 -- Python 3.9 is supported.
+    journal_revision: Optional[int] = None  # noqa: UP045 -- Python 3.9 is supported.
+    exposure_reservation_id: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+    exposure_reservation_sha256: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+    dispatch_latch_active: bool = True
+    has_other_active_freezes: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.status) is not DispatchExposureResolutionReceiptStatus:
+            raise ValueError("invalid dispatch exposure receipt status")
+        if type(self.claim) is not DispatchClaimBinding:
+            raise ValueError("invalid dispatch exposure receipt claim")
+        if type(self.dispatch_latch_active) is not bool or type(
+            self.has_other_active_freezes
+        ) is not bool:
+            raise ValueError("invalid dispatch exposure receipt freeze state")
+        optional_fields = (
+            self.proof_sha256,
+            self.exposure_proof_sha256,
+            self.final_state,
+            self.requested_quantity,
+            self.filled_quantity,
+            self.trade_count,
+            self.order_revision,
+            self.journal_revision,
+            self.exposure_reservation_id,
+            self.exposure_reservation_sha256,
+        )
+        if self.status is DispatchExposureResolutionReceiptStatus.UNRESOLVED_ACTIVE:
+            if any(value is not None for value in optional_fields) or not self.dispatch_latch_active:
+                raise ValueError("unresolved exposure receipt cannot carry terminal evidence")
+            return
+        if any(value is None for value in optional_fields) or self.dispatch_latch_active:
+            raise ValueError("resolved exposure receipt is incomplete or still latched")
+        _require_sha256(self.proof_sha256, "proof_sha256")
+        _require_sha256(self.exposure_proof_sha256, "exposure_proof_sha256")
+        _require_sha256(self.exposure_reservation_sha256, "exposure_reservation_sha256")
+        if (
+            type(self.exposure_reservation_id) is not str
+            or not self.exposure_reservation_id
+            or self.exposure_reservation_id != self.exposure_reservation_id.strip()
+        ):
+            raise ValueError("invalid exposure reservation id")
+        if self.final_state not in (OrderExposureState.FILLED, OrderExposureState.CANCELLED):
+            raise ValueError("resolved exposure receipt requires a terminal state")
+        requested = _as_decimal(self.requested_quantity)
+        filled = _as_decimal(self.filled_quantity)
+        if requested <= 0 or filled <= 0 or filled > requested:
+            raise ValueError("invalid terminal exposure quantities")
+        object.__setattr__(self, "requested_quantity", requested)
+        object.__setattr__(self, "filled_quantity", filled)
+        if (
+            type(self.trade_count) is not int
+            or self.trade_count <= 0
+            or type(self.order_revision) is not int
+            or self.order_revision <= 0
+            or type(self.journal_revision) is not int
+            or self.journal_revision <= 0
+        ):
+            raise ValueError("invalid terminal exposure evidence counters")
+        if self.final_state is OrderExposureState.FILLED and filled != requested:
+            raise ValueError("filled receipt must cover the requested quantity")
+
+    @property
+    def scope(self) -> AccountScope:
+        return self.claim.scope
+
+    @property
+    def permit_id(self) -> str:
+        return self.claim.permit_id
+
+    @property
+    def intent_id(self) -> str:
+        return self.claim.intent_id
+
+
+@dataclass(frozen=True)
+class VerifiedDispatchExposureResolution:
+    """Authority receipt binding terminal source facts to the current fence."""
+
+    scope: AccountScope
+    permit_id: str
+    intent_id: str
+    intent_hash: str
+    cause_id: str
+    claim_digest: str
+    proof_sha256: str
+    exposure_proof_sha256: str
+    provider_order_id: str
+    accepted_request_sha256: str
+    exposure_reservation_id: str
+    exposure_reservation_sha256: str
+    final_state: OrderExposureState
+    requested_quantity: Decimal
+    filled_quantity: Decimal
+    trade_count: int
+    order_revision: int
+    journal_revision: int
+    journal_record_sha256: str
+    writer_owner_id: str
+    writer_fencing_token: int
+    writer_fence_sha256: str
+
+    def __post_init__(self) -> None:
+        if type(self.scope) is not AccountScope:
+            raise ValueError("invalid verified exposure resolution scope")
+        for name in (
+            "permit_id",
+            "intent_id",
+            "cause_id",
+            "provider_order_id",
+            "exposure_reservation_id",
+            "writer_owner_id",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError("invalid verified exposure resolution " + name)
+        if self.cause_id != "dispatch-inflight:" + self.intent_id:
+            raise ValueError("verified exposure cause does not match intent")
+        for name in (
+            "intent_hash",
+            "claim_digest",
+            "proof_sha256",
+            "exposure_proof_sha256",
+            "accepted_request_sha256",
+            "exposure_reservation_sha256",
+            "journal_record_sha256",
+            "writer_fence_sha256",
+        ):
+            _require_sha256(getattr(self, name), name)
+        if self.final_state not in (OrderExposureState.FILLED, OrderExposureState.CANCELLED):
+            raise ValueError("verified exposure resolution requires a terminal state")
+        object.__setattr__(
+            self, "requested_quantity", _as_decimal(self.requested_quantity)
+        )
+        object.__setattr__(self, "filled_quantity", _as_decimal(self.filled_quantity))
+        if (
+            self.requested_quantity <= 0
+            or self.filled_quantity <= 0
+            or self.filled_quantity > self.requested_quantity
+        ):
+            raise ValueError("invalid verified exposure quantities")
+        for name in ("trade_count", "order_revision", "journal_revision", "writer_fencing_token"):
+            value = getattr(self, name)
+            if type(value) is not int or value <= 0:
+                raise ValueError("invalid verified exposure " + name)
+        if self.final_state is OrderExposureState.FILLED and (
+            self.filled_quantity != self.requested_quantity
+        ):
+            raise ValueError("verified filled observation is incomplete")
+
+
+class VerifiedDispatchExposureJournalAuthority(Protocol):
+    """Authority for complete first terminal order/fill evidence under a fence."""
+
+    def dispatch_exposure_resolution_guard(
+        self,
+        proof: DispatchExposureResolutionProof,
+        *,
+        claim: DispatchClaimBinding,
+    ) -> AbstractContextManager[
+        Optional[VerifiedDispatchExposureResolution]  # noqa: UP045 -- Python 3.9 is supported.
+    ]: ...
+
+
+def _verified_dispatch_exposure_matches(
+    verified: object,
+    *,
+    proof: DispatchExposureResolutionProof,
+    claim: DispatchClaimBinding,
+) -> bool:
+    observation = proof.observation
+    return bool(
+        type(verified) is VerifiedDispatchExposureResolution
+        and verified.scope == proof.scope == claim.scope == observation.scope
+        and verified.permit_id == proof.permit_id == claim.permit_id == observation.permit_id
+        and verified.intent_id == proof.intent_id == claim.intent_id == observation.intent_id
+        and verified.intent_hash == proof.intent_hash == claim.intent_hash == observation.intent_hash
+        and verified.cause_id == proof.cause_id == claim.cause_id
+        and verified.claim_digest == proof.claim_digest == claim.claim_digest
+        and verified.proof_sha256 == proof.fingerprint
+        and verified.exposure_proof_sha256 == observation.fingerprint
+        and verified.provider_order_id == observation.provider_order_id
+        and verified.accepted_request_sha256 == observation.accepted_request_sha256
+        and verified.exposure_reservation_id == observation.exposure_reservation_id
+        and verified.exposure_reservation_sha256 == observation.exposure_reservation_sha256
+        and verified.final_state is observation.state
+        and verified.requested_quantity == observation.requested_quantity
+        and verified.filled_quantity == observation.cumulative_filled_quantity
+        and verified.trade_count == observation.fill_trade_count
+        and verified.order_revision == observation.order_revision
+        and verified.journal_revision == observation.journal_revision
+        and verified.journal_record_sha256 == observation.journal_record_sha256
+        and verified.writer_owner_id == observation.writer_owner_id
+        and verified.writer_fencing_token == observation.writer_fencing_token
+        and verified.writer_fence_sha256 == observation.writer_fence_sha256
+    )
+
+
 DispatchResolutionProof = Union[DispatchTerminalProof, DispatchTrackedOrderProof]
 
 
@@ -2836,6 +3157,11 @@ class DurableRiskGate:
             raise RiskDeniedError(
                 "ORDER_EXPOSURE_PROOF_REQUIRED", "a typed order observation proof is required"
             )
+        if proof.dispatch_proof_sha256 is None:
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_TRACKED_PROOF_REQUIRED",
+                "ordinary exposure updates require the exact prior ACKED_TRACKED proof",
+            )
         if (
             proof.notional_unit != self._policy.notional_unit
             or proof.valuation_unit != self._policy.notional_unit
@@ -3010,7 +3336,13 @@ class DurableRiskGate:
                             "ORDER_EXPOSURE_JOURNAL_REVISION_STALE",
                             "account journal revision must advance monotonically",
                         )
-                    self._assert_order_observation_identity(proof, reservation)
+                    claim_row = connection.execute(
+                        "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?",
+                        (proof.permit_id,),
+                    ).fetchone()
+                    self._assert_order_observation_identity(
+                        proof, reservation, claim_row=claim_row
+                    )
                     if self._dispatch_latch_active(connection, proof.scope, current_claim.cause_id):
                         raise RiskDeniedError(
                             "ORDER_EXPOSURE_DISPATCH_UNRESOLVED",
@@ -4146,6 +4478,465 @@ class DurableRiskGate:
                 "the cancellation journal authority could not verify this proof",
             ) from exc
 
+    def resolve_dispatch_exposure(
+        self, proof: DispatchExposureResolutionProof
+    ) -> DispatchExposureResolutionReceipt:
+        """Seed terminal positive-fill occupancy and clear its exact latch atomically.
+
+        This is the only first-observation path for an order whose earliest
+        complete source snapshot is already FILLED or partially FILLED then
+        CANCELLED.  It never fabricates the legacy zero-fill tracked proof.
+        In RESERVATIONS_ONLY mode the full settled reservation remains counted;
+        LIVE_GROSS additionally converts that reservation into the existing
+        per-order gross/fill ledger under a fresh attributed baseline.
+        """
+        if type(proof) is not DispatchExposureResolutionProof:
+            raise PermitInvalidError(
+                "DISPATCH_EXPOSURE_PROOF_REQUIRED",
+                "a typed positive-fill terminal exposure proof is required",
+            )
+        observation = proof.observation
+        if self._policy.notional_unit is not None and (
+            observation.notional_unit != self._policy.notional_unit
+            or observation.valuation_unit != self._policy.notional_unit
+        ):
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_UNIT_MISMATCH",
+                "terminal order valuation must use the fixed policy unit",
+            )
+        now_ns = int(float(self._clock()) * 1_000_000_000)
+        self._assert_terminal_observation_current(proof, now_ns)
+        binding = self._load_dispatch_claim_binding(
+            proof.permit_id, proof.journal_record_sha256
+        )
+        if binding != proof.claim:
+            raise PermitInvalidError(
+                "DISPATCH_RESOLUTION_PROOF_SCOPE_MISMATCH",
+                "terminal proof does not carry the current exact durable claim",
+            )
+        guard_factory = None
+        for authority in (
+            self._gross_exposure_authority,
+            self._execution_journal_authority,
+        ):
+            candidate = getattr(authority, "dispatch_exposure_resolution_guard", None)
+            if callable(candidate):
+                guard_factory = candidate
+                break
+        if not callable(guard_factory):
+            raise PermitInvalidError(
+                "DISPATCH_EXPOSURE_AUTHORITY_REQUIRED",
+                "a current order-journal authority is required",
+            )
+
+        try:
+            with guard_factory(proof, claim=binding) as verified:
+                if not _verified_dispatch_exposure_matches(
+                    verified, proof=proof, claim=binding
+                ):
+                    raise PermitInvalidError(
+                        "DISPATCH_EXPOSURE_PROOF_REJECTED",
+                        "the journal authority did not verify these exact terminal facts and fence",
+                    )
+                with self._transaction() as connection:
+                    committed_at_ns = int(float(self._clock()) * 1_000_000_000)
+                    self._assert_terminal_observation_current(proof, committed_at_ns)
+                    self._ensure_policy_binding(connection, proof.scope.key)
+                    reservation = connection.execute(
+                        "SELECT * FROM risk_reservations WHERE permit_id = ?",
+                        (proof.permit_id,),
+                    ).fetchone()
+                    if reservation is None:
+                        raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+                    if (
+                        reservation["action"] != IntentAction.INCREASE.value
+                        or reservation["status"] != self._SETTLED
+                    ):
+                        raise PermitInvalidError(
+                            "ORDER_EXPOSURE_REQUIRES_SETTLED_INCREASE",
+                            "terminal exposure resolution requires a settled increase permit",
+                        )
+                    claim_row = self._require_dispatch_claim(connection, reservation)
+                    current_claim = self._dispatch_claim_binding(reservation, claim_row)
+                    if current_claim != binding or current_claim != proof.claim:
+                        raise PermitInvalidError(
+                            "DISPATCH_RESOLUTION_PROOF_SCOPE_MISMATCH",
+                            "the durable dispatch claim changed before terminal exposure commit",
+                        )
+                    prior_resolution = connection.execute(
+                        "SELECT permit_id FROM risk_dispatch_resolutions WHERE permit_id = ?",
+                        (proof.permit_id,),
+                    ).fetchone()
+                    if prior_resolution is not None:
+                        raise PermitInvalidError(
+                            "DISPATCH_ALREADY_RECONCILED",
+                            "this dispatch claim already has a terminal resolution",
+                        )
+                    prior_exposure = connection.execute(
+                        "SELECT permit_id FROM risk_order_exposures WHERE permit_id = ?",
+                        (proof.permit_id,),
+                    ).fetchone()
+                    if prior_exposure is not None:
+                        raise PermitInvalidError(
+                            "ORDER_EXPOSURE_ALREADY_SEEDED",
+                            "this permit already has an exposure projection",
+                        )
+                    self._assert_order_observation_identity(
+                        observation, reservation, claim_row=claim_row
+                    )
+                    self._assert_terminal_order_matches_actual_claim(
+                        observation, reservation, claim_row
+                    )
+
+                    baseline = None
+                    baseline_fresh = False
+                    if self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS:
+                        baseline = self._assert_live_baseline_fresh(
+                            connection, proof.scope, committed_at_ns
+                        )
+                        baseline_fence = int(baseline["writer_fencing_token"])
+                        if observation.writer_fencing_token < baseline_fence or (
+                            observation.writer_fencing_token == baseline_fence
+                            and (
+                                observation.writer_owner_id != baseline["writer_owner_id"]
+                                or observation.writer_fence_sha256
+                                != baseline["writer_fence_sha256"]
+                            )
+                        ):
+                            raise RiskDeniedError(
+                                "ORDER_EXPOSURE_WRITER_FENCE_STALE",
+                                "terminal observation predates the accepted account baseline fence",
+                            )
+                        baseline_fresh = True
+                        latest = connection.execute(
+                            "SELECT journal_revision FROM risk_gross_scope_revisions "
+                            "WHERE scope_key = ?",
+                            (proof.scope.key,),
+                        ).fetchone()
+                        if latest is None or observation.journal_revision <= int(
+                            latest["journal_revision"]
+                        ):
+                            raise RiskDeniedError(
+                                "ORDER_EXPOSURE_JOURNAL_REVISION_STALE",
+                                "account journal revision must advance monotonically",
+                            )
+
+                    snapshot = self._apply_order_exposure_in_transaction(
+                        connection,
+                        observation,
+                        reservation,
+                        None,
+                        committed_at_ns,
+                        dispatch_proof_sha256=proof.fingerprint,
+                    )
+                    self._persist_order_fill_facts(connection, observation)
+                    connection.execute(
+                        """
+                        INSERT INTO risk_dispatch_resolutions (
+                            permit_id, scope_key, intent_id, intent_hash, cause_id,
+                            claim_digest, proof_kind, evidence_class,
+                            dispatch_attempt_count, journal_revision,
+                            journal_record_sha256,
+                            reconciliation_evidence_sha256, writer_fence_sha256,
+                            provider_order_id, accepted_request_sha256,
+                            exposure_reservation_id, exposure_reservation_sha256,
+                            filled_quantity, trade_count, resolved_at,
+                            resolution_proof_sha256, exposure_proof_sha256,
+                            terminal_state, requested_quantity,
+                            cumulative_filled_quantity, exposure_fill_trade_count,
+                            exposure_fill_ids_sha256, exposure_order_revision
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'TERMINAL_EXPOSURE', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                  0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            proof.permit_id,
+                            proof.scope.key,
+                            proof.intent_id,
+                            proof.intent_hash,
+                            proof.cause_id,
+                            proof.claim_digest,
+                            proof.evidence_class.value,
+                            proof.dispatch_attempt_count,
+                            observation.journal_revision,
+                            observation.journal_record_sha256,
+                            proof.reconciliation_evidence_sha256,
+                            observation.writer_fence_sha256,
+                            observation.provider_order_id,
+                            observation.accepted_request_sha256,
+                            observation.exposure_reservation_id,
+                            observation.exposure_reservation_sha256,
+                            self._clock(),
+                            proof.fingerprint,
+                            observation.fingerprint,
+                            observation.state.value,
+                            _decimal_text(observation.requested_quantity),
+                            _decimal_text(observation.cumulative_filled_quantity),
+                            observation.fill_trade_count,
+                            observation.fill_ids_sha256,
+                            observation.order_revision,
+                        ),
+                    )
+                    cleared = connection.execute(
+                        "UPDATE risk_freezes SET active = 0, updated_at = ? "
+                        "WHERE scope_key = ? AND cause_id = ? AND active = 1",
+                        (self._clock(), proof.scope.key, proof.cause_id),
+                    )
+                    if cleared.rowcount != 1:
+                        raise PermitInvalidError(
+                            "DISPATCH_FREEZE_MISSING",
+                            "the exact dispatch latch was not active at terminal commit",
+                        )
+                    if self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS:
+                        updated = connection.execute(
+                            "UPDATE risk_gross_scope_revisions SET journal_revision = ? "
+                            "WHERE scope_key = ?",
+                            (observation.journal_revision, proof.scope.key),
+                        )
+                        if updated.rowcount != 1:
+                            raise RiskDeniedError(
+                                "ORDER_EXPOSURE_JOURNAL_REVISION_UNAVAILABLE",
+                                "the account journal revision cursor is unavailable",
+                            )
+                        if self._gross_scope_over_limit(connection, proof.scope):
+                            self._freeze_in_transaction(
+                                connection,
+                                proof.scope,
+                                "gross-exposure-over-cap",
+                                "gross_exposure_limit_exceeded",
+                                self._clock(),
+                            )
+                        elif baseline_fresh:
+                            connection.execute(
+                                "UPDATE risk_freezes SET active = 0, updated_at = ? "
+                                "WHERE scope_key = ? AND cause_id = "
+                                "'gross-exposure-over-cap' AND active = 1",
+                                (self._clock(), proof.scope.key),
+                            )
+                    # Keep the bound local for static analyzers: the snapshot
+                    # return value is deliberately obtained from the exact
+                    # durable receipt, not from this transient calculation.
+                    del snapshot
+                    result = self._dispatch_exposure_resolution_receipt_in_transaction(
+                        connection, proof.permit_id
+                    )
+                return result
+        except (PermitInvalidError, RiskDeniedError):
+            raise
+        except Exception as exc:
+            raise PermitInvalidError(
+                "DISPATCH_EXPOSURE_PROOF_REJECTED",
+                "the journal authority could not verify this terminal exposure proof",
+            ) from exc
+
+    def dispatch_exposure_resolution_receipt(
+        self, permit_id: str
+    ) -> DispatchExposureResolutionReceipt:
+        """Read one exact claim/resolution/exposure snapshot without mutation."""
+        if type(permit_id) is not str or not permit_id or permit_id != permit_id.strip():
+            raise PermitInvalidError("PERMIT_UNKNOWN", "permit reference is invalid")
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            try:
+                result = self._dispatch_exposure_resolution_receipt_in_transaction(
+                    connection, permit_id
+                )
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+            connection.execute("ROLLBACK")
+            return result
+
+    def _dispatch_exposure_resolution_receipt_in_transaction(
+        self, connection: sqlite3.Connection, permit_id: str
+    ) -> DispatchExposureResolutionReceipt:
+        reservation = connection.execute(
+            "SELECT * FROM risk_reservations WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        if reservation is None:
+            raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+        if (
+            reservation["action"] != IntentAction.INCREASE.value
+            or reservation["status"] != self._SETTLED
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_EXPOSURE_STATE_CONFLICT",
+                "terminal exposure receipt requires a settled increase reservation",
+            )
+        policy_error = self._policy_binding_read_error(connection, str(reservation["scope_key"]))
+        if policy_error is not None:
+            raise PermitInvalidError(
+                policy_error, "risk database is bound to another or unknown policy"
+            )
+        claim_row = connection.execute(
+            "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        if claim_row is None:
+            raise PermitInvalidError("PERMIT_NOT_DISPATCH_CLAIMED", "permit was not claimed")
+        try:
+            if reservation["group_id"] is not None:
+                self._validate_group_claim_row(reservation, claim_row)
+            claim = self._dispatch_claim_binding(reservation, claim_row)
+        except (KeyError, TypeError, ValueError, RiskDeniedError) as exc:
+            raise PermitInvalidError(
+                "DISPATCH_EXPOSURE_STATE_CONFLICT", "stored dispatch claim is inconsistent"
+            ) from exc
+        cause = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+        if claim.cause_id != cause:
+            raise PermitInvalidError(
+                "DISPATCH_EXPOSURE_STATE_CONFLICT", "dispatch claim cause is inconsistent"
+            )
+        freeze = connection.execute(
+            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+            (reservation["scope_key"], cause),
+        ).fetchone()
+        if freeze is None or type(freeze["active"]) is not int or freeze["active"] not in (0, 1):
+            raise PermitInvalidError(
+                "DISPATCH_EXPOSURE_STATE_CONFLICT", "exact dispatch latch is missing or invalid"
+            )
+        other_freezes = connection.execute(
+            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id <> ?",
+            (reservation["scope_key"], cause),
+        ).fetchall()
+        if any(type(row["active"]) is not int or row["active"] not in (0, 1) for row in other_freezes):
+            raise PermitInvalidError(
+                "DISPATCH_EXPOSURE_STATE_CONFLICT", "another account freeze has an invalid state"
+            )
+        has_other_active_freezes = any(int(row["active"]) == 1 for row in other_freezes)
+        resolution = connection.execute(
+            "SELECT * FROM risk_dispatch_resolutions WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        exposure = connection.execute(
+            "SELECT * FROM risk_order_exposures WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        if resolution is None:
+            if freeze["active"] != 1 or exposure is not None:
+                raise PermitInvalidError(
+                    "DISPATCH_EXPOSURE_STATE_CONFLICT",
+                    "an unresolved claim must retain its exact latch and have no exposure row",
+                )
+            return DispatchExposureResolutionReceipt(
+                status=DispatchExposureResolutionReceiptStatus.UNRESOLVED_ACTIVE,
+                claim=claim,
+                dispatch_latch_active=True,
+                has_other_active_freezes=has_other_active_freezes,
+            )
+        if (
+            freeze["active"] != 0
+            or resolution["proof_kind"] != "TERMINAL_EXPOSURE"
+            or resolution["scope_key"] != reservation["scope_key"]
+            or resolution["intent_id"] != reservation["intent_id"]
+            or resolution["intent_hash"] != reservation["intent_hash"]
+            or resolution["cause_id"] != cause
+            or resolution["claim_digest"] != claim.claim_digest
+            or exposure is None
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_EXPOSURE_STATE_CONFLICT",
+                "stored terminal resolution, exposure, claim, or latch is inconsistent",
+            )
+        required = (
+            "resolution_proof_sha256",
+            "exposure_proof_sha256",
+            "terminal_state",
+            "requested_quantity",
+            "cumulative_filled_quantity",
+            "exposure_fill_trade_count",
+            "exposure_fill_ids_sha256",
+            "exposure_order_revision",
+        )
+        if any(resolution[name] is None for name in required):
+            raise PermitInvalidError(
+                "DISPATCH_EXPOSURE_STATE_CONFLICT", "terminal resolution proof columns are missing"
+            )
+        try:
+            final_state = OrderExposureState(str(resolution["terminal_state"]))
+            requested = _as_decimal(resolution["requested_quantity"])
+            filled = _as_decimal(resolution["cumulative_filled_quantity"])
+            trade_count = int(resolution["exposure_fill_trade_count"])
+            order_revision = int(resolution["exposure_order_revision"])
+            journal_revision = int(resolution["journal_revision"])
+            proof_sha256 = _require_sha256(
+                str(resolution["resolution_proof_sha256"]), "resolution_proof_sha256"
+            )
+            exposure_proof_sha256 = _require_sha256(
+                str(resolution["exposure_proof_sha256"]), "exposure_proof_sha256"
+            )
+            exposure_id = str(resolution["exposure_reservation_id"])
+            exposure_sha256 = _require_sha256(
+                str(resolution["exposure_reservation_sha256"]),
+                "exposure_reservation_sha256",
+            )
+            fill_ids_sha = _require_sha256(
+                str(resolution["exposure_fill_ids_sha256"]), "exposure_fill_ids_sha256"
+            )
+            observation_record = _require_sha256(
+                str(resolution["journal_record_sha256"]), "journal_record_sha256"
+            )
+        except (TypeError, ValueError) as exc:
+            raise PermitInvalidError(
+                "DISPATCH_EXPOSURE_STATE_CONFLICT", "stored terminal proof fields are malformed"
+            ) from exc
+        if not (
+            final_state in (OrderExposureState.FILLED, OrderExposureState.CANCELLED)
+            and requested > 0
+            and filled > 0
+            and filled <= requested
+            and trade_count > 0
+            and order_revision > 0
+            and journal_revision > 0
+            and exposure_id
+            and exposure_id == str(exposure["exposure_reservation_id"])
+            and exposure_sha256 == str(exposure["exposure_reservation_sha256"])
+            and proof_sha256 == str(exposure["dispatch_proof_sha256"])
+            and exposure_proof_sha256 == str(exposure["proof_sha256"])
+            and final_state.value == exposure["state"]
+            and _decimal_text(requested) == exposure["requested_quantity"]
+            and _decimal_text(filled) == exposure["cumulative_filled_quantity"]
+            and Decimal(0) == _as_decimal(exposure["leaves_quantity"])
+            and trade_count == int(exposure["fill_trade_count"])
+            and fill_ids_sha == str(exposure["fill_ids_sha256"])
+            and order_revision == int(exposure["order_revision"])
+            and journal_revision == int(exposure["journal_revision"])
+            and observation_record == str(exposure["journal_record_sha256"])
+            and int(exposure["complete_order_snapshot"]) == 1
+            and int(exposure["complete_fill_history"]) == 1
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_EXPOSURE_STATE_CONFLICT",
+                "terminal exposure projection no longer matches its immutable resolution",
+            )
+        fills = connection.execute(
+            "SELECT trade_id, quantity FROM risk_order_exposure_fills "
+            "WHERE permit_id = ? ORDER BY trade_id",
+            (permit_id,),
+        ).fetchall()
+        if (
+            len(fills) != trade_count
+            or fill_ids_sha256_from_ids(tuple(str(row["trade_id"]) for row in fills))
+            != fill_ids_sha
+            or sum((_as_decimal(row["quantity"]) for row in fills), Decimal(0)) != filled
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_EXPOSURE_STATE_CONFLICT",
+                "terminal fill rows do not match the recorded complete fill set",
+            )
+        return DispatchExposureResolutionReceipt(
+            status=DispatchExposureResolutionReceiptStatus.TERMINAL_EXPOSURE_RESOLVED,
+            claim=claim,
+            proof_sha256=proof_sha256,
+            exposure_proof_sha256=exposure_proof_sha256,
+            final_state=final_state,
+            requested_quantity=requested,
+            filled_quantity=filled,
+            trade_count=trade_count,
+            order_revision=order_revision,
+            journal_revision=journal_revision,
+            exposure_reservation_id=exposure_id,
+            exposure_reservation_sha256=exposure_sha256,
+            dispatch_latch_active=False,
+            has_other_active_freezes=has_other_active_freezes,
+        )
+
     def resolve_dispatch_freeze(self, proof: DispatchResolutionProof) -> None:
         """Resolve dispatch uncertainty under a verified execution-journal fence.
 
@@ -4728,7 +5519,7 @@ class DurableRiskGate:
                         proof_kind = str(resolution["proof_kind"])
                         expected_state = (
                             RiskGroupReservationState.SETTLED
-                            if proof_kind == "ACKED_TRACKED"
+                            if proof_kind in ("ACKED_TRACKED", "TERMINAL_EXPOSURE")
                             else RiskGroupReservationState.NO_FILL_TERMINAL
                             if proof_kind in {item.value for item in DispatchTerminalState}
                             else None
@@ -5367,6 +6158,108 @@ class DurableRiskGate:
                 "baseline refresh requires no unobserved risk reservation or dispatch claim",
             )
 
+    def _assert_terminal_observation_current(
+        self, proof: DispatchExposureResolutionProof, now_ns: int
+    ) -> None:
+        observation = proof.observation
+        if self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS:
+            self._assert_order_exposure_freshness(observation, now_ns)
+            return
+        intervals = (
+            (observation.observed_at_ns, observation.valid_until_ns),
+            (
+                observation.instrument_metadata_observed_at_ns,
+                observation.instrument_metadata_valid_until_ns,
+            ),
+            (observation.valuation_observed_at_ns, observation.valuation_valid_until_ns),
+        )
+        if observation.fx_observed_at_ns is not None:
+            intervals += ((observation.fx_observed_at_ns, observation.fx_valid_until_ns),)
+        if any(start > now_ns or end is None or now_ns >= end for start, end in intervals):
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_OBSERVATION_STALE",
+                "terminal order, metadata, valuation, or FX facts are outside their validity interval",
+            )
+
+    def _actual_claim_order_bounds(
+        self, reservation: sqlite3.Row, claim_row: sqlite3.Row
+    ) -> tuple[Decimal, Decimal]:
+        """Return the gate-stored child bounds, or the singleton reservation bounds."""
+        if claim_row is None:
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_DISPATCH_CLAIM_REQUIRED",
+                "order observation requires the exact durable dispatch claim",
+            )
+        if reservation["group_id"] is None:
+            if claim_row["group_id"] is not None:
+                raise RiskDeniedError(
+                    "GROUP_STATE_CONFLICT", "singleton order has a grouped dispatch claim"
+                )
+            quantity, notional = reservation["quantity"], reservation["notional"]
+        else:
+            self._validate_group_claim_row(reservation, claim_row)
+            if claim_row["actual_intent_json"] is None:
+                raise RiskDeniedError(
+                    "GROUP_CLAIM_STATE_INVALID", "group claim has no exact child intent"
+                )
+            actual = _risk_intent_from_json(str(claim_row["actual_intent_json"]))
+            if (
+                actual.action is not IntentAction.INCREASE
+                or actual.scope.key != reservation["scope_key"]
+                or actual.intent_id != reservation["intent_id"]
+                or actual.instrument != reservation["instrument"]
+                or actual.quantity_unit != reservation["quantity_unit"]
+                or actual.notional_unit != reservation["notional_unit"]
+                or actual.exposure_profile_fingerprint
+                != claim_row["actual_exposure_profile_fingerprint"]
+                or actual.quantity is None
+                or actual.notional <= 0
+            ):
+                raise RiskDeniedError(
+                    "GROUP_CLAIM_STATE_INVALID", "stored group child intent is inconsistent"
+                )
+            quantity, notional = claim_row["actual_quantity"], claim_row["actual_notional"]
+            if (
+                _as_decimal(quantity) != actual.quantity
+                or _as_decimal(notional) != actual.notional
+            ):
+                raise RiskDeniedError(
+                    "GROUP_CLAIM_STATE_INVALID", "stored group child size changed"
+                )
+        if quantity is None or notional is None:
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_REQUEST_MISMATCH", "admitted order has no exact quantity/notional"
+            )
+        return _as_decimal(quantity), _as_decimal(notional)
+
+    def _assert_terminal_order_matches_actual_claim(
+        self,
+        proof: OrderExposureObservationProof,
+        reservation: sqlite3.Row,
+        claim_row: sqlite3.Row,
+    ) -> None:
+        quantity, _notional = self._actual_claim_order_bounds(reservation, claim_row)
+        if (
+            proof.requested_quantity != quantity
+            or proof.instrument_id != reservation["instrument"]
+            or (
+                reservation["notional_unit"] is not None
+                and (
+                    proof.notional_unit != reservation["notional_unit"]
+                    or proof.valuation_unit != reservation["notional_unit"]
+                )
+            )
+            or (
+                self._policy.notional_unit is not None
+                and proof.valuation_unit != self._policy.notional_unit
+            )
+            or proof.position_effect != "OPEN"
+        ):
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_REQUEST_MISMATCH",
+                "terminal order facts differ from the exact admitted child request",
+            )
+
     def _tracked_order_binding(
         self, permit_id: str
     ) -> tuple[sqlite3.Row, DispatchClaimBinding, DispatchTrackedOrderProof]:
@@ -5448,20 +6341,25 @@ class DurableRiskGate:
                 "observation does not bind the exact settled dispatch claim and ACKED order",
             )
 
-    @staticmethod
     def _assert_order_observation_identity(
-        proof: OrderExposureObservationProof, reservation: sqlite3.Row
+        self,
+        proof: OrderExposureObservationProof,
+        reservation: sqlite3.Row,
+        *,
+        claim_row: sqlite3.Row,
     ) -> None:
-        expected_quantity = (
-            None if reservation["quantity"] is None else _as_decimal(reservation["quantity"])
+        expected_quantity, _expected_notional = self._actual_claim_order_bounds(
+            reservation, claim_row
         )
         if (
             proof.scope.key != reservation["scope_key"]
             or proof.intent_id != reservation["intent_id"]
             or proof.intent_hash != reservation["intent_hash"]
             or proof.instrument_id != reservation["instrument"]
-            or proof.notional_unit != reservation["notional_unit"]
-            or expected_quantity is None
+            or (
+                reservation["notional_unit"] is not None
+                and proof.notional_unit != reservation["notional_unit"]
+            )
             or proof.requested_quantity != expected_quantity
         ):
             raise RiskDeniedError(
@@ -5667,9 +6565,16 @@ class DurableRiskGate:
         reservation: sqlite3.Row,
         prior: Optional[sqlite3.Row],  # noqa: UP045 -- Python 3.9 is supported.
         now_ns: int,
+        *,
+        dispatch_proof_sha256: Optional[str] = None,  # noqa: UP045 -- Python 3.9 is supported.
     ) -> OrderExposureSnapshot:
-        requested = _as_decimal(reservation["quantity"])
-        original_notional = _as_decimal(reservation["notional"])
+        claim_row = connection.execute(
+            "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?",
+            (proof.permit_id,),
+        ).fetchone()
+        requested, original_notional = self._actual_claim_order_bounds(
+            reservation, claim_row
+        )
         if prior is None:
             previous_filled_quantity = Decimal(0)
             previous_leaves_quantity = requested
@@ -5775,7 +6680,11 @@ class DurableRiskGate:
             "exposure_reservation_id": proof.exposure_reservation_id,
             "exposure_reservation_sha256": proof.exposure_reservation_sha256,
             "dispatch_claim_digest": proof.dispatch_claim_digest,
-            "dispatch_proof_sha256": proof.dispatch_proof_sha256,
+            "dispatch_proof_sha256": (
+                proof.dispatch_proof_sha256
+                if dispatch_proof_sha256 is None
+                else _require_sha256(dispatch_proof_sha256, "dispatch_proof_sha256")
+            ),
             "accepted_request_sha256": proof.accepted_request_sha256,
             "order_revision": (
                 proof.order_revision
@@ -6886,6 +7795,45 @@ class DurableRiskGate:
                 CREATE INDEX IF NOT EXISTS idx_risk_order_exposures_scope
                     ON risk_order_exposures(scope_key, state, journal_revision);
                 """
+            )
+            dispatch_resolution_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(risk_dispatch_resolutions)"
+                ).fetchall()
+            }
+            for name, column_type in (
+                ("resolution_proof_sha256", "TEXT"),
+                ("exposure_proof_sha256", "TEXT"),
+                ("terminal_state", "TEXT"),
+                ("requested_quantity", "TEXT"),
+                ("cumulative_filled_quantity", "TEXT"),
+                ("exposure_fill_trade_count", "INTEGER"),
+                ("exposure_fill_ids_sha256", "TEXT"),
+                ("exposure_order_revision", "INTEGER"),
+            ):
+                if name not in dispatch_resolution_columns:
+                    connection.execute(
+                        "ALTER TABLE risk_dispatch_resolutions ADD COLUMN " + name + " " + column_type
+                    )
+            connection.execute(
+                """CREATE UNIQUE INDEX IF NOT EXISTS idx_risk_dispatch_resolution_proof
+                   ON risk_dispatch_resolutions(resolution_proof_sha256)
+                   WHERE resolution_proof_sha256 IS NOT NULL"""
+            )
+            connection.execute(
+                """CREATE TRIGGER IF NOT EXISTS risk_dispatch_resolution_immutable_update
+                   BEFORE UPDATE ON risk_dispatch_resolutions
+                   BEGIN
+                       SELECT RAISE(ABORT, 'dispatch resolutions are immutable');
+                   END"""
+            )
+            connection.execute(
+                """CREATE TRIGGER IF NOT EXISTS risk_dispatch_resolution_immutable_delete
+                   BEFORE DELETE ON risk_dispatch_resolutions
+                   BEGIN
+                       SELECT RAISE(ABORT, 'dispatch resolutions are immutable');
+                   END"""
             )
             reservation_columns = {
                 str(row["name"])
