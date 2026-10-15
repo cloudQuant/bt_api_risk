@@ -809,17 +809,17 @@ class InstrumentRiskAdmissionMapper:
             allocation_version=allocation_version,
             instrument=(
                 order.instrument
-                if action is IntentAction.INCREASE and strategy_id and quantity_unit is not None
+                if action is IntentAction.INCREASE and quantity_unit is not None
                 else None
             ),
             quantity=(
                 order.quantity
-                if action is IntentAction.INCREASE and strategy_id and quantity_unit is not None
+                if action is IntentAction.INCREASE and quantity_unit is not None
                 else None
             ),
             quantity_unit=(
                 quantity_unit
-                if action is IntentAction.INCREASE and strategy_id and quantity_unit is not None
+                if action is IntentAction.INCREASE and quantity_unit is not None
                 else None
             ),
             notional_unit=notional_unit,
