@@ -22,6 +22,7 @@ import json
 import math
 import re
 import sqlite3
+import time
 import uuid
 from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
@@ -1946,6 +1947,12 @@ class DurableRiskGate:
     Dispatch latches can be cleared only through an injected execution-journal
     authority that holds the account writer fence and proves an exact no-fill
     terminal result. No authority is installed by default.
+
+    Freshness comparisons use an integer epoch-nanosecond clock. ``clock_ns``
+    overrides that source; the legacy seconds-based ``clock`` remains available
+    for persisted timestamps and, when supplied alone, is converted with its
+    established seconds-to-nanoseconds behavior. Callers that supply both
+    clocks are responsible for keeping the two time sources aligned.
     """
 
     _ACTIVE = "active"
@@ -1969,10 +1976,24 @@ class DurableRiskGate:
         gross_exposure_authority: Optional[  # noqa: UP045 -- Python 3.9 is supported.
             GrossExposureAuthority
         ] = None,
+        clock_ns: Optional[Callable[[], int]] = None,  # noqa: UP045 -- Python 3.9 is supported.
     ) -> None:
         self._database_path = Path(database_path)
         self._policy = policy
-        self._clock = clock or _wall_clock
+        if clock is not None and not callable(clock):
+            raise ValueError("clock must be callable")
+        if clock_ns is not None and not callable(clock_ns):
+            raise ValueError("clock_ns must be callable")
+        self._clock = _wall_clock if clock is None else clock
+        if clock_ns is not None:
+            self._clock_ns = clock_ns
+        elif clock is None:
+            self._clock_ns = _wall_clock_ns
+        else:
+            # Preserve deterministic callers of the established seconds clock
+            # API. Production defaults use time.time_ns directly; a caller
+            # supplying both clocks owns their alignment.
+            self._clock_ns = lambda: int(float(clock()) * 1_000_000_000)
         self._timeout_seconds = timeout_seconds
         self._execution_journal_authority = execution_journal_authority
         self._gross_exposure_authority = gross_exposure_authority
@@ -1983,6 +2004,13 @@ class DurableRiskGate:
     def policy(self) -> RiskPolicy:
         """Return the immutable policy configured for this gate instance."""
         return self._policy
+
+    def _now_ns(self) -> int:
+        """Read an exact integer epoch-nanosecond clock for freshness checks."""
+        value = self._clock_ns()
+        if type(value) is not int or value < 0:
+            raise ValueError("clock_ns must return a non-negative integer")
+        return value
 
     def set_strategy_allocation(
         self,
@@ -2436,15 +2464,11 @@ class DurableRiskGate:
                 if permit.action is IntentAction.INCREASE:
                     self._assert_not_frozen(connection, permit.scope)
                     if live_gross:
-                        self._assert_live_gross_limits(
-                            connection, intent, now, include_intent=False
-                        )
+                        self._assert_live_gross_limits(connection, intent, include_intent=False)
                         final_now = self._clock()
                         self._expire_active(connection, final_now)
                         self._existing_permit_or_raise(existing, intent, final_now)
-                        self._assert_live_gross_limits(
-                            connection, intent, final_now, include_intent=False
-                        )
+                        self._assert_live_gross_limits(connection, intent, include_intent=False)
                 return permit
 
             if intent.action is IntentAction.UNKNOWN_EFFECT:
@@ -2458,7 +2482,7 @@ class DurableRiskGate:
                 self._assert_increase_limit(connection, intent)
                 self._assert_strategy_allocation_limit(connection, intent)
                 if live_gross:
-                    self._assert_live_gross_limits(connection, intent, now)
+                    self._assert_live_gross_limits(connection, intent)
 
             generation = self._next_generation(connection, intent.scope.key)
             permit = RiskPermit(
@@ -2524,7 +2548,7 @@ class DurableRiskGate:
                     raise RiskDeniedError(
                         "INTENT_EXPIRED", "permit TTL elapsed before LIVE_GROSS admission committed"
                     )
-                self._assert_live_gross_limits(connection, intent, final_now, include_intent=False)
+                self._assert_live_gross_limits(connection, intent, include_intent=False)
             return permit
 
     def reserve_group_vector(
@@ -2617,7 +2641,7 @@ class DurableRiskGate:
         live_gross = self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS
         with self._transaction() as connection:
             now = self._clock()
-            now_ns = int(now * 1_000_000_000)
+            now_ns = self._now_ns()
             self._ensure_policy_binding(connection, scope.key)
             self._expire_active(connection, now)
             existing_rows = connection.execute(
@@ -2680,7 +2704,7 @@ class DurableRiskGate:
                 self._assert_increase_limit(connection, intent)
                 self._assert_strategy_allocation_limit(connection, intent)
                 if live_gross:
-                    self._assert_live_gross_limits(connection, intent, now)
+                    self._assert_live_gross_limits(connection, intent)
                 generation = self._next_generation(connection, scope.key)
                 permit = RiskPermit(
                     permit_id=str(uuid.uuid4()),
@@ -2740,7 +2764,7 @@ class DurableRiskGate:
                         intent.exposure_profile_fingerprint,
                     ),
                 )
-            commit_now_ns = int(self._clock() * 1_000_000_000)
+            commit_now_ns = self._now_ns()
             for leg in ordered_legs:
                 self._assert_group_exposure_facts(leg.intent, commit_now_ns)
             if commit_now_ns >= deadline_ns:
@@ -2753,15 +2777,31 @@ class DurableRiskGate:
                 commit_now = commit_now_ns / 1_000_000_000
                 self._expire_active(connection, commit_now)
                 for leg in ordered_legs:
-                    self._assert_live_gross_limits(
-                        connection, leg.intent, commit_now, include_intent=False
-                    )
+                    self._assert_live_gross_limits(connection, leg.intent, include_intent=False)
             rows = connection.execute(
                 """SELECT * FROM risk_reservations
                    WHERE scope_key = ? AND group_id = ? ORDER BY group_leg_id""",
                 (scope.key, group_id),
             ).fetchall()
-            return self._group_receipt_in_transaction(connection, scope, group_id, rows)
+            result = self._group_receipt_in_transaction(connection, scope, group_id, rows)
+            linearized_at_ns = self._now_ns()
+            for leg in ordered_legs:
+                self._assert_group_exposure_facts(leg.intent, linearized_at_ns)
+            if linearized_at_ns >= deadline_ns:
+                raise RiskDeniedError(
+                    "GROUP_DEADLINE_ELAPSED", "group deadline elapsed before commit"
+                )
+            if linearized_at_ns >= now_ns + ttl_ns:
+                raise RiskDeniedError("GROUP_PERMIT_EXPIRED", "group TTL elapsed before commit")
+            if live_gross:
+                for leg in ordered_legs:
+                    self._assert_live_gross_limits(
+                        connection,
+                        leg.intent,
+                        include_intent=False,
+                        now_ns=linearized_at_ns,
+                    )
+            return result
 
     def read_group_vector_snapshot(
         self, scope: AccountScope, group_id: str
@@ -2886,7 +2926,7 @@ class DurableRiskGate:
                             "GROUP_STATE_CONFLICT",
                             "an unclaimed member cannot carry a claim resolution or dispatch latch",
                         )
-                    now_ns = int(self._clock() * 1_000_000_000)
+                    now_ns = self._now_ns()
                     if now_ns >= group_receipt.deadline_ns:
                         raise PermitInvalidError(
                             "GROUP_DEADLINE_ELAPSED", "group deadline has elapsed"
@@ -3051,7 +3091,7 @@ class DurableRiskGate:
         live_gross = self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS
         with self._transaction() as connection:
             now = self._clock()
-            now_ns = int(now * 1_000_000_000)
+            now_ns = self._now_ns()
             self._ensure_policy_binding(connection, scope.key)
             self._expire_active(connection, now)
             rows = connection.execute(
@@ -3106,7 +3146,7 @@ class DurableRiskGate:
             self._assert_intent_notional_unit(actual_intent)
             self._assert_not_frozen(connection, scope)
             if live_gross:
-                self._assert_live_gross_limits(connection, actual_intent, now, include_intent=False)
+                self._assert_live_gross_limits(connection, actual_intent, include_intent=False)
 
             cause_id = self._dispatch_freeze_cause(str(reservation["intent_id"]))
             connection.execute(
@@ -3141,7 +3181,7 @@ class DurableRiskGate:
             )
             self._freeze_in_transaction(connection, scope, cause_id, cause_id, now_ns / 1e9)
 
-            commit_now_ns = int(self._clock() * 1_000_000_000)
+            commit_now_ns = self._now_ns()
             self._assert_group_exposure_facts(actual_intent, commit_now_ns, invalid=True)
             if commit_now_ns >= deadline_ns:
                 raise PermitInvalidError(
@@ -3155,7 +3195,6 @@ class DurableRiskGate:
                 self._assert_live_gross_limits(
                     connection,
                     actual_intent,
-                    commit_now_ns / 1_000_000_000,
                     include_intent=False,
                 )
             claim = connection.execute(
@@ -3206,7 +3245,7 @@ class DurableRiskGate:
             raise RiskDeniedError(
                 "GROSS_EXPOSURE_UNIT_MISMATCH", "baseline does not use the fixed policy unit"
             )
-        now_ns = int(float(self._clock()) * 1_000_000_000)
+        now_ns = self._now_ns()
         if not self._gross_facts_are_fresh(proof.observed_at_ns, proof.valid_until_ns, now_ns):
             raise RiskDeniedError(
                 "GROSS_EXPOSURE_BASELINE_STALE", "account baseline is stale or not yet observed"
@@ -3226,7 +3265,7 @@ class DurableRiskGate:
                         "the authority did not verify this exact baseline and writer fence",
                     )
                 with self._transaction() as connection:
-                    committed_at_ns = int(float(self._clock()) * 1_000_000_000)
+                    committed_at_ns = self._now_ns()
                     if not self._gross_facts_are_fresh(
                         proof.observed_at_ns, proof.valid_until_ns, committed_at_ns
                     ):
@@ -3240,7 +3279,7 @@ class DurableRiskGate:
                         (proof.scope.key,),
                     ).fetchone()
                     if existing is not None and existing["proof_sha256"] == proof.fingerprint:
-                        replay_at_ns = int(float(self._clock()) * 1_000_000_000)
+                        replay_at_ns = self._now_ns()
                         if not self._gross_facts_are_fresh(
                             proof.observed_at_ns, proof.valid_until_ns, replay_at_ns
                         ):
@@ -3384,7 +3423,7 @@ class DurableRiskGate:
                            journal_revision = excluded.journal_revision""",
                         (proof.scope.key, proof.account_revision),
                     )
-                    commit_at_ns = int(float(self._clock()) * 1_000_000_000)
+                    commit_at_ns = self._now_ns()
                     if not self._gross_facts_are_fresh(
                         proof.observed_at_ns, proof.valid_until_ns, commit_at_ns
                     ):
@@ -3398,7 +3437,7 @@ class DurableRiskGate:
                         "('gross-exposure-baseline-stale', 'gross-exposure-over-cap') AND active = 1",
                         (self._clock(), proof.scope.key),
                     )
-                    commit_at_ns = int(float(self._clock()) * 1_000_000_000)
+                    commit_at_ns = self._now_ns()
                     if not self._gross_facts_are_fresh(
                         proof.observed_at_ns, proof.valid_until_ns, commit_at_ns
                     ):
@@ -3448,7 +3487,7 @@ class DurableRiskGate:
             raise RiskDeniedError(
                 "ORDER_EXPOSURE_UNIT_MISMATCH", "order valuation must use the fixed policy unit"
             )
-        now_ns = int(float(self._clock()) * 1_000_000_000)
+        now_ns = self._now_ns()
         self._assert_order_exposure_freshness(proof, now_ns)
         authority = self._gross_exposure_authority
         guard_factory = getattr(authority, "order_observation_guard", None)
@@ -3467,7 +3506,7 @@ class DurableRiskGate:
                         "the authority did not verify this exact observation and current fence",
                     )
                 with self._transaction() as connection:
-                    committed_at_ns = int(float(self._clock()) * 1_000_000_000)
+                    committed_at_ns = self._now_ns()
                     self._assert_order_exposure_freshness(proof, committed_at_ns)
                     self._ensure_policy_binding(connection, proof.scope.key)
                     reservation, current_claim, current_tracked = self._tracked_order_binding_in(
@@ -3500,7 +3539,7 @@ class DurableRiskGate:
                     ).fetchone()
                     if prior is not None and proof.order_revision == int(prior["order_revision"]):
                         if proof.fingerprint == prior["proof_sha256"]:
-                            replay_at_ns = int(float(self._clock()) * 1_000_000_000)
+                            replay_at_ns = self._now_ns()
                             self._assert_order_exposure_freshness(proof, replay_at_ns)
                             if not self._gross_facts_are_fresh(
                                 int(baseline["observed_at_ns"]),
@@ -3521,9 +3560,7 @@ class DurableRiskGate:
                                     "'gross-exposure-baseline-stale' AND active = 1",
                                     (self._clock(), proof.scope.key),
                                 )
-                            self._assert_order_exposure_freshness(
-                                proof, int(float(self._clock()) * 1_000_000_000)
-                            )
+                            self._assert_order_exposure_freshness(proof, self._now_ns())
                             return self._order_exposure_snapshot(prior, proof.scope)
                         if (
                             proof.state is not OrderExposureState.UNKNOWN
@@ -3666,7 +3703,7 @@ class DurableRiskGate:
                             "WHERE scope_key = ? AND cause_id = 'gross-exposure-over-cap' AND active = 1",
                             (self._clock(), proof.scope.key),
                         )
-                    commit_at_ns = int(float(self._clock()) * 1_000_000_000)
+                    commit_at_ns = self._now_ns()
                     self._assert_order_exposure_freshness(proof, commit_at_ns)
                     baseline_fresh_at_commit = self._gross_facts_are_fresh(
                         int(baseline["observed_at_ns"]),
@@ -3688,7 +3725,7 @@ class DurableRiskGate:
                             "gross_exposure_baseline_stale",
                             self._clock(),
                         )
-                    linearized_at_ns = int(float(self._clock()) * 1_000_000_000)
+                    linearized_at_ns = self._now_ns()
                     self._assert_order_exposure_freshness(proof, linearized_at_ns)
                     if not self._gross_facts_are_fresh(
                         int(baseline["observed_at_ns"]),
@@ -3823,7 +3860,7 @@ class DurableRiskGate:
                         notional_unit=permit.notional_unit,
                     )
                     self._assert_live_gross_limits(
-                        connection, live_intent, now, include_intent=False
+                        connection, live_intent, include_intent=False
                     )
             if live_gross and permit.action is IntentAction.INCREASE:
                 final_now = self._clock()
@@ -3849,7 +3886,7 @@ class DurableRiskGate:
                     notional_unit=permit.notional_unit,
                 )
                 self._assert_live_gross_limits(
-                    connection, final_intent, final_now, include_intent=False
+                    connection, final_intent, include_intent=False
                 )
             return permit
 
@@ -3919,7 +3956,7 @@ class DurableRiskGate:
             if permit.action is IntentAction.INCREASE:
                 self._assert_not_frozen(connection, permit.scope)
                 if live_gross:
-                    self._assert_live_gross_limits(connection, intent, now, include_intent=False)
+                    self._assert_live_gross_limits(connection, intent, include_intent=False)
                     # The permit, baseline, and prior order valuations may
                     # expire while this transaction is doing its checks.  Run
                     # the authoritative freshness check again immediately
@@ -3932,7 +3969,7 @@ class DurableRiskGate:
                             "PERMIT_NOT_ACTIVE", "permit expired before dispatch claim"
                         )
                     self._assert_not_frozen(connection, permit.scope)
-                    self._assert_live_gross_limits(connection, intent, now, include_intent=False)
+                    self._assert_live_gross_limits(connection, intent, include_intent=False)
             connection.execute(
                 """
                 INSERT INTO risk_dispatch_claims (
@@ -3955,7 +3992,7 @@ class DurableRiskGate:
                     raise PermitInvalidError(
                         "PERMIT_NOT_ACTIVE", "permit expired before dispatch claim committed"
                     )
-                self._assert_live_gross_limits(connection, intent, commit_now, include_intent=False)
+                self._assert_live_gross_limits(connection, intent, include_intent=False)
             return permit
 
     def dispatch_claim_binding(self, permit_id: str) -> DispatchClaimBinding:
@@ -5028,7 +5065,7 @@ class DurableRiskGate:
                 "ORDER_EXPOSURE_UNIT_MISMATCH",
                 "terminal order valuation must use the fixed policy unit",
             )
-        now_ns = int(float(self._clock()) * 1_000_000_000)
+        now_ns = self._now_ns()
         self._assert_terminal_observation_current(proof, now_ns)
         binding = self._load_dispatch_claim_binding(
             proof.permit_id, proof.journal_record_sha256
@@ -5063,7 +5100,7 @@ class DurableRiskGate:
                         "the journal authority did not verify these exact terminal facts and fence",
                     )
                 with self._transaction() as connection:
-                    committed_at_ns = int(float(self._clock()) * 1_000_000_000)
+                    committed_at_ns = self._now_ns()
                     self._assert_terminal_observation_current(proof, committed_at_ns)
                     self._ensure_policy_binding(connection, proof.scope.key)
                     reservation = connection.execute(
@@ -5243,6 +5280,12 @@ class DurableRiskGate:
                     result = self._dispatch_exposure_resolution_receipt_in_transaction(
                         connection, proof.permit_id
                     )
+                    commit_now_ns = self._now_ns()
+                    self._assert_terminal_observation_current(proof, commit_now_ns)
+                    if self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS:
+                        self._assert_live_baseline_fresh(
+                            connection, proof.scope, commit_now_ns
+                        )
                 return result
         except (PermitInvalidError, RiskDeniedError):
             raise
@@ -6531,11 +6574,15 @@ class DurableRiskGate:
         self,
         connection: sqlite3.Connection,
         intent: RiskIntent,
-        now: float,
         *,
         include_intent: bool = True,
+        now_ns: Optional[int] = None,  # noqa: UP045 -- Python 3.9 is supported.
     ) -> None:
-        now_ns = int(float(now) * 1_000_000_000)
+        # Gross valuations and proof intervals are integer-nanosecond facts.
+        # Sampling the dedicated clock here avoids converting a seconds float
+        # back to ns at admission and dispatch boundaries.
+        if now_ns is None:
+            now_ns = self._now_ns()
         self._assert_live_baseline_fresh(connection, intent.scope, now_ns)
         pending = connection.execute(
             """SELECT reservation.permit_id FROM risk_reservations AS reservation
@@ -8018,7 +8065,7 @@ class DurableRiskGate:
                 "permit_ttl_elapsed",
                 self._ACTIVE,
                 now,
-                int(now * 1_000_000_000),
+                self._now_ns(),
             ),
         )
 
@@ -8779,9 +8826,11 @@ def _sha256(value: str) -> str:
 
 
 def _wall_clock() -> float:
-    import time
-
     return time.time()
+
+
+def _wall_clock_ns() -> int:
+    return time.time_ns()
 
 
 __all__ = [
