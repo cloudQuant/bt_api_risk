@@ -392,6 +392,30 @@ class RiskPolicy:
         return _sha256(_canonical_json(payload))
 
 
+@dataclass(frozen=True, slots=True)
+class DurableRiskPolicyBinding:
+    """Readback of one immutable policy persisted in an account ledger."""
+
+    scope: AccountScope
+    policy_id: str
+    policy_fingerprint: str
+    ledger_identity_ref: str
+
+    def __post_init__(self) -> None:
+        if type(self.scope) is not AccountScope:
+            raise ValueError("scope must be an AccountScope")
+        if type(self.policy_id) is not str or not self.policy_id:
+            raise ValueError("policy_id is required")
+        for name in ("policy_fingerprint", "ledger_identity_ref"):
+            value = getattr(self, name)
+            if (
+                type(value) is not str
+                or len(value) != 64
+                or any(character not in "0123456789abcdef" for character in value)
+            ):
+                raise ValueError(name + " must be a lowercase SHA-256 digest")
+
+
 @dataclass(frozen=True)
 class RiskIntent:
     """A provider-neutral request after the account owner derived its effect.
@@ -2296,6 +2320,42 @@ class DurableRiskGate:
     def policy(self) -> RiskPolicy:
         """Return the immutable policy configured for this gate instance."""
         return self._policy
+
+    def bind_policy(self, scope: AccountScope) -> DurableRiskPolicyBinding:
+        """Persist and read back this exact policy before an owner serves writes.
+
+        The existing reservation ledger remains authoritative. A restart with
+        the same policy is idempotent even when reservations are still active
+        or UNKNOWN; a different policy is refused by the same immutable
+        binding check used by :meth:`reserve`.
+        """
+
+        if type(scope) is not AccountScope:
+            raise RiskDeniedError(
+                "RISK_POLICY_BINDING_SCOPE_INVALID",
+                "startup policy binding requires an exact account scope",
+            )
+        with self._transaction() as connection:
+            self._ensure_policy_binding(connection, scope.key)
+            row = connection.execute(
+                "SELECT policy_hash, policy_id FROM risk_policy_bindings WHERE scope_key = ?",
+                (scope.key,),
+            ).fetchone()
+            if (
+                row is None
+                or row["policy_hash"] != self._policy.fingerprint
+                or row["policy_id"] != self._policy.policy_id
+            ):
+                raise RiskDeniedError(
+                    "RISK_POLICY_BINDING_UNAVAILABLE",
+                    "startup policy binding did not persist the configured policy",
+                )
+            return DurableRiskPolicyBinding(
+                scope=scope,
+                policy_id=str(row["policy_id"]),
+                policy_fingerprint=str(row["policy_hash"]),
+                ledger_identity_ref=self._ledger_identity_ref,
+            )
 
     @property
     def ledger_identity_ref(self) -> str:
@@ -13130,6 +13190,7 @@ __all__ = [
     "AccountScope",
     "DispatchClaimBinding",
     "DurableRiskGate",
+    "DurableRiskPolicyBinding",
     "FreezeActivationResult",
     "FreezeActivationStatus",
     "IntentAction",
