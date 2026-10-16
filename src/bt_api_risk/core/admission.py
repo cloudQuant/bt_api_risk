@@ -2041,6 +2041,17 @@ class DurableRiskGate:
         """Return the immutable policy configured for this gate instance."""
         return self._policy
 
+    @property
+    def ledger_identity_ref(self) -> str:
+        """Return this durable SQLite ledger's path-bound identity.
+
+        This is an internal consistency value, not an authentication
+        credential or proof that this ledger is the sole admission owner.
+        Trusted deployment wiring must independently verify one shared ledger
+        identity across every RiskTarget in a shared-collateral domain.
+        """
+        return self._ledger_identity_ref
+
     def _now_ns(self) -> int:
         """Read an exact integer epoch-nanosecond clock for freshness checks."""
         value = self._clock_ns()
@@ -2510,6 +2521,15 @@ class DurableRiskGate:
 
         now = self._clock()
         with self._transaction() as connection:
+            declared_scope = connection.execute(
+                """SELECT 1 FROM risk_shared_collateral_domain_scopes
+                   WHERE scope_key = ? LIMIT 1""",
+                (scope.key,),
+            ).fetchone()
+            if declared_scope is not None:
+                raise ValueError(
+                    "shared-collateral scopes cannot install per-scope margin-pool limits"
+                )
             self._ensure_policy_binding(connection, scope.key)
             current = connection.execute(
                 """SELECT * FROM risk_margin_pool_limits
@@ -2568,6 +2588,249 @@ class DurableRiskGate:
                     now,
                 ),
             )
+
+    def declare_shared_collateral_domain(
+        self,
+        domain_id: str,
+        revision: str,
+        member_scopes: Sequence[AccountScope],
+        members: Sequence[tuple[AccountScope, AccountResourceKey]],
+        *,
+        max_notional: Optional[Decimal],  # noqa: UP045 -- Python 3.9 is supported.
+        ledger_identity_ref: Optional[str],  # noqa: UP045 -- Python 3.9 is supported.
+        manifest_complete: bool,
+    ) -> bool:
+        """Persist a trusted deployment declaration for shared collateral.
+
+        ``members`` maps complete, source-controlled account/resource facts to
+        one cross-product domain.  ``member_scopes`` also quarantines accounts
+        whose resource mapping is missing while a deployment declaration is
+        incomplete.  Client intents cannot name a domain or choose its ledger
+        identity.  The declaration remains durable but fail-closed when the
+        manifest is incomplete, the identity is absent/mismatched, or no
+        unit-compatible cap is available.  The return value is true only when
+        this local ledger identity matches and the full domain is ready for
+        new increases; it is not a sole-owner deployment attestation.
+
+        The identity reference binds to this Risk gate's SQLite path and
+        persisted database identity.  A local match alone does not prove that
+        this is the sole deployment owner: trusted composition must pass one
+        independently selected identity to every target.  That composition
+        check is outside this core-only API.
+        """
+
+        if type(domain_id) is not str or not _ALLOCATION_ID.fullmatch(domain_id):
+            raise ValueError("invalid shared-collateral domain_id")
+        if type(revision) is not str or not _ALLOCATION_ID.fullmatch(revision):
+            raise ValueError("invalid shared-collateral revision")
+        if type(manifest_complete) is not bool:
+            raise ValueError("manifest_complete must be a bool")
+        if isinstance(member_scopes, (str, bytes)) or not isinstance(
+            member_scopes, Sequence
+        ):
+            raise ValueError("member_scopes must be a sequence of AccountScope values")
+        if not member_scopes:
+            raise ValueError("a shared-collateral declaration must name a quarantined scope")
+        scope_by_key: dict[str, AccountScope] = {}
+        for scope in member_scopes:
+            if type(scope) is not AccountScope:
+                raise ValueError("every shared-collateral scope must be an AccountScope")
+            scope_by_key[scope.key] = scope
+        if len(scope_by_key) != len(member_scopes):
+            raise ValueError("shared-collateral scopes must be unique")
+        if isinstance(members, (str, bytes)) or not isinstance(members, Sequence):
+            raise ValueError("members must be a sequence of trusted scope/resource pairs")
+        normalized_members: list[tuple[str, str, str]] = []
+        seen_members: set[tuple[str, str, str]] = set()
+        for member in members:
+            if type(member) is not tuple or len(member) != 2:
+                raise ValueError("each shared-collateral member must be a scope/resource pair")
+            scope, resource = member
+            if type(scope) is not AccountScope or not isinstance(resource, AccountResourceKey):
+                raise ValueError("shared-collateral members require trusted scope/resource values")
+            if scope.key not in scope_by_key:
+                raise ValueError("every resource member must belong to a declared scope")
+            key = (scope.key, resource.product_type, resource.margin_pool)
+            if key in seen_members:
+                raise ValueError("shared-collateral resource members must be unique")
+            seen_members.add(key)
+            normalized_members.append(key)
+        normalized_members.sort()
+        if manifest_complete and (
+            len(scope_by_key) < 2
+            or not normalized_members
+            or {scope_key for scope_key, _, _ in normalized_members} != set(scope_by_key)
+        ):
+            raise ValueError("a complete shared-collateral manifest needs mapped resources for every account")
+        if ledger_identity_ref is not None and (
+            type(ledger_identity_ref) is not str
+            or not _ALLOCATION_ID.fullmatch(ledger_identity_ref)
+        ):
+            raise ValueError("invalid shared-collateral ledger_identity_ref")
+        if max_notional is None:
+            normalized_cap = None
+        else:
+            try:
+                normalized_cap = _as_decimal(max_notional)
+            except (InvalidOperation, ValueError) as exc:
+                raise ValueError("max_notional must be a non-negative finite decimal") from exc
+            if normalized_cap < 0:
+                raise ValueError("max_notional must be a non-negative finite decimal")
+
+        unit = self._policy.notional_unit
+        identity_matches = ledger_identity_ref == self.ledger_identity_ref
+        ready = bool(
+            manifest_complete
+            and identity_matches
+            and normalized_cap is not None
+            and unit is not None
+        )
+        scope_keys = sorted(scope_by_key)
+        manifest = {
+            "ledger_identity_ref": ledger_identity_ref,
+            "domain_id": domain_id,
+            "manifest_complete": manifest_complete,
+            "max_notional": (
+                None if normalized_cap is None else _decimal_text(normalized_cap)
+            ),
+            "members": [list(member) for member in normalized_members],
+            "notional_unit": unit,
+            "scope_keys": scope_keys,
+        }
+        manifest_sha256 = _sha256(_canonical_json(manifest))
+        now = self._clock()
+        with self._transaction() as connection:
+            current = connection.execute(
+                "SELECT * FROM risk_shared_collateral_domains WHERE domain_id = ?",
+                (domain_id,),
+            ).fetchone()
+            revision_row = connection.execute(
+                """SELECT manifest_sha256 FROM risk_shared_collateral_domain_revisions
+                   WHERE domain_id = ? AND revision = ?""",
+                (domain_id, revision),
+            ).fetchone()
+            if current is not None and current["revision"] == revision:
+                if current["manifest_sha256"] != manifest_sha256:
+                    raise ValueError("shared-collateral revision cannot be reused with changed facts")
+                return bool(
+                    current["ready"]
+                    and current["ledger_identity_ref"] == self.ledger_identity_ref
+                    and current["manifest_complete"]
+                )
+            if revision_row is not None:
+                raise ValueError("shared-collateral revision cannot be replayed")
+
+            for scope_key, product_type, margin_pool in normalized_members:
+                assigned = connection.execute(
+                    """SELECT domain_id FROM risk_shared_collateral_domain_members
+                       WHERE scope_key = ? AND product_type = ? AND margin_pool = ?
+                         AND domain_id != ? LIMIT 1""",
+                    (scope_key, product_type, margin_pool, domain_id),
+                ).fetchone()
+                if assigned is not None:
+                    raise ValueError(
+                        "a trusted account resource can belong to only one shared-collateral domain"
+                    )
+
+            prior_scope_keys: set[str] = set()
+            if current is not None:
+                prior_scope_keys = {
+                    str(row["scope_key"])
+                    for row in connection.execute(
+                        """SELECT scope_key FROM risk_shared_collateral_domain_scopes
+                           WHERE domain_id = ?""",
+                        (domain_id,),
+                    ).fetchall()
+                }
+            changed_scope_keys = sorted(prior_scope_keys | set(scope_keys))
+            if (
+                current is not None
+                and changed_scope_keys
+                and self._shared_domain_has_occupied_reservations(
+                    connection, changed_scope_keys
+                )
+            ):
+                raise ValueError(
+                    "shared-collateral revision cannot change while active, settled, or "
+                    "unknown increases occupy a member scope"
+                )
+
+            for scope_key in scope_keys:
+                self._ensure_policy_binding(connection, scope_key)
+            if current is None:
+                connection.execute(
+                    """INSERT INTO risk_shared_collateral_domains (
+                           domain_id, revision, ledger_identity_ref, manifest_complete,
+                           max_notional, notional_unit, ready, manifest_sha256, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        domain_id,
+                        revision,
+                        ledger_identity_ref,
+                        int(manifest_complete),
+                        None if normalized_cap is None else _decimal_text(normalized_cap),
+                        unit,
+                        int(ready),
+                        manifest_sha256,
+                        now,
+                    ),
+                )
+            else:
+                connection.execute(
+                    "DELETE FROM risk_shared_collateral_domain_scopes WHERE domain_id = ?",
+                    (domain_id,),
+                )
+                connection.execute(
+                    """UPDATE risk_shared_collateral_domains SET
+                           revision = ?, ledger_identity_ref = ?, manifest_complete = ?,
+                           max_notional = ?, notional_unit = ?, ready = ?,
+                           manifest_sha256 = ?, updated_at = ?
+                       WHERE domain_id = ?""",
+                    (
+                        revision,
+                        ledger_identity_ref,
+                        int(manifest_complete),
+                        None if normalized_cap is None else _decimal_text(normalized_cap),
+                        unit,
+                        int(ready),
+                        manifest_sha256,
+                        now,
+                        domain_id,
+                    ),
+                )
+            connection.execute(
+                """INSERT INTO risk_shared_collateral_domain_revisions (
+                       domain_id, revision, manifest_sha256, created_at
+                   ) VALUES (?, ?, ?, ?)""",
+                (domain_id, revision, manifest_sha256, now),
+            )
+            for scope_key in scope_keys:
+                connection.execute(
+                    """INSERT INTO risk_shared_collateral_domain_scopes (
+                           domain_id, scope_key
+                       ) VALUES (?, ?)""",
+                    (domain_id, scope_key),
+                )
+            for scope_key, product_type, margin_pool in normalized_members:
+                connection.execute(
+                    """INSERT INTO risk_shared_collateral_domain_members (
+                           domain_id, scope_key, product_type, margin_pool
+                       ) VALUES (?, ?, ?, ?)""",
+                    (domain_id, scope_key, product_type, margin_pool),
+                )
+            if ready:
+                assert normalized_cap is not None
+                assert unit is not None
+                self._assert_shared_domain_existing_occupancy(
+                    connection,
+                    domain_id,
+                    revision,
+                    scope_keys,
+                    set(normalized_members),
+                    normalized_cap,
+                    unit,
+                )
+            return ready
 
     def set_closable_position(
         self,
@@ -2763,6 +3026,9 @@ class DurableRiskGate:
         live_gross = self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS
         with self._transaction() as connection:
             self._assert_current_instrument_facts(intent)
+            shared_domain = self._assert_shared_collateral_admission(
+                connection, intent.scope, intent.action, intent.resource
+            )
             if live_gross:
                 # BEGIN IMMEDIATE can wait behind another process.  LIVE_GROSS
                 # freshness is checked at the point where this transaction
@@ -2839,9 +3105,10 @@ class DurableRiskGate:
                     notional_unit, group_id, group_fingerprint, group_leg_id,
                     group_deadline_ns, group_expires_at_ns, group_leg_count,
                     group_exposure_profile_fingerprint, resource_product_type, resource_margin_pool,
-                    close_position_version
+                    close_position_version, shared_collateral_domain_id,
+                    shared_collateral_domain_revision
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?,
-                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?)
                 """,
                 (
                     permit.permit_id,
@@ -2867,6 +3134,8 @@ class DurableRiskGate:
                     None if intent.resource is None else intent.resource.product_type,
                     None if intent.resource is None else intent.resource.margin_pool,
                     close_position_version,
+                    None if shared_domain is None else shared_domain["domain_id"],
+                    None if shared_domain is None else shared_domain["revision"],
                 ),
             )
             if live_gross and intent.action is IntentAction.INCREASE:
@@ -2975,6 +3244,15 @@ class DurableRiskGate:
         with self._transaction() as connection:
             now = self._clock()
             now_ns = self._now_ns()
+            shared_domains_by_intent = {
+                leg.intent.intent_id: self._assert_shared_collateral_admission(
+                    connection,
+                    leg.intent.scope,
+                    leg.intent.action,
+                    leg.intent.resource,
+                )
+                for leg in ordered_legs
+            }
             self._ensure_policy_binding(connection, scope.key)
             self._expire_active(connection, now)
             existing_rows = connection.execute(
@@ -3067,9 +3345,10 @@ class DurableRiskGate:
                            group_fingerprint, group_leg_id, group_deadline_ns,
                            group_expires_at_ns, group_leg_count,
                            group_exposure_profile_fingerprint,
-                           resource_product_type, resource_margin_pool, close_position_version
+                            resource_product_type, resource_margin_pool, close_position_version,
+                            shared_collateral_domain_id, shared_collateral_domain_revision
                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?,
-                                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         permit.permit_id,
                         permit.intent_id,
@@ -3101,6 +3380,16 @@ class DurableRiskGate:
                         None if intent.resource is None else intent.resource.product_type,
                         None if intent.resource is None else intent.resource.margin_pool,
                         None,
+                        (
+                            None
+                            if shared_domains_by_intent[intent.intent_id] is None
+                            else shared_domains_by_intent[intent.intent_id]["domain_id"]
+                        ),
+                        (
+                            None
+                            if shared_domains_by_intent[intent.intent_id] is None
+                            else shared_domains_by_intent[intent.intent_id]["revision"]
+                        ),
                     ),
                 )
             commit_now_ns = self._now_ns()
@@ -3543,6 +3832,16 @@ class DurableRiskGate:
             self._assert_reservation_allocation_current(connection, reservation, invalid=True)
             self._assert_intent_notional_unit(actual_intent)
             self._assert_not_frozen(connection, scope)
+            shared_domain = self._assert_shared_collateral_admission(
+                connection,
+                actual_intent.scope,
+                actual_intent.action,
+                actual_intent.resource,
+                invalid=True,
+            )
+            self._assert_shared_reservation_binding(
+                connection, permit_id, shared_domain
+            )
             if live_gross:
                 self._assert_live_gross_limits(connection, actual_intent, include_intent=False)
 
@@ -4223,6 +4522,26 @@ class DurableRiskGate:
             permit = self._permit_from_row(row)
             if permit.policy_fingerprint != self._policy.fingerprint:
                 raise PermitInvalidError("POLICY_CHANGED", "permit was issued under another policy")
+            if permit.action is IntentAction.INCREASE:
+                stored_resource = (
+                    None
+                    if row["resource_product_type"] is None
+                    or row["resource_margin_pool"] is None
+                    else AccountResourceKey(
+                        product_type=str(row["resource_product_type"]),
+                        margin_pool=str(row["resource_margin_pool"]),
+                    )
+                )
+                shared_domain = self._assert_shared_collateral_admission(
+                    connection,
+                    permit.scope,
+                    permit.action,
+                    intent.resource if intent is not None else stored_resource,
+                    invalid=True,
+                )
+                self._assert_shared_reservation_binding(
+                    connection, permit_id, shared_domain
+                )
             self._ensure_policy_binding(connection, permit.scope.key)
             self._expire_active(connection, now)
             row = connection.execute(
@@ -4327,6 +4646,7 @@ class DurableRiskGate:
                     "GROUP_CLAIM_REQUIRED",
                     "group permit can only claim through claim_group_leg",
                 )
+            self._assert_shared_reservation_current(connection, permit_id)
             self._ensure_policy_binding(connection, intent.scope.key)
             self._expire_active(connection, now)
             claim = connection.execute(
@@ -8185,21 +8505,310 @@ class DurableRiskGate:
                 "intent notional unit does not match the account policy",
             )
 
+    def _shared_domain_has_occupied_reservations(
+        self, connection: sqlite3.Connection, scope_keys: Sequence[str]
+    ) -> bool:
+        """Return whether a scope set still carries live or unresolved credit."""
+
+        if not scope_keys:
+            return False
+        placeholders = ",".join("?" for _ in scope_keys)
+        reservation = connection.execute(
+            """SELECT 1 FROM risk_reservations
+               WHERE scope_key IN ("""
+            + placeholders
+            + """) AND action = ? AND status IN (?, ?) LIMIT 1""",
+            (*scope_keys, IntentAction.INCREASE.value, self._ACTIVE, self._SETTLED),
+        ).fetchone()
+        if reservation is not None:
+            return True
+        unknown = connection.execute(
+            """SELECT 1 FROM risk_order_exposures
+               WHERE scope_key IN ("""
+            + placeholders
+            + """) AND state = ? LIMIT 1""",
+            (*scope_keys, OrderExposureState.UNKNOWN.value),
+        ).fetchone()
+        if unknown is not None:
+            return True
+        unresolved_claim = connection.execute(
+            """SELECT 1 FROM risk_dispatch_claims AS claim
+               JOIN risk_reservations AS reservation USING (permit_id)
+               LEFT JOIN risk_dispatch_resolutions AS resolution
+                 ON resolution.permit_id = claim.permit_id
+               WHERE claim.scope_key IN ("""
+            + placeholders
+            + ") AND reservation.action = ? AND resolution.permit_id IS NULL LIMIT 1",
+            (*scope_keys, IntentAction.INCREASE.value),
+        ).fetchone()
+        return unresolved_claim is not None
+
+    def _assert_shared_domain_existing_occupancy(
+        self,
+        connection: sqlite3.Connection,
+        domain_id: str,
+        revision: str,
+        scope_keys: Sequence[str],
+        members: set[tuple[str, str, str]],
+        max_notional: Decimal,
+        notional_unit: str,
+    ) -> None:
+        """Validate pre-existing rows before making a complete domain writable."""
+
+        if not scope_keys:
+            raise ValueError("a ready shared-collateral domain has no member scopes")
+        placeholders = ",".join("?" for _ in scope_keys)
+        rows = connection.execute(
+            """SELECT reservation.permit_id, reservation.scope_key,
+                      reservation.resource_product_type, reservation.resource_margin_pool,
+                      reservation.notional, reservation.notional_unit,
+                      reservation.shared_collateral_domain_id,
+                      reservation.shared_collateral_domain_revision
+               FROM risk_reservations AS reservation
+               WHERE reservation.scope_key IN ("""
+            + placeholders
+            + """) AND reservation.action = ?
+                 AND (reservation.status IN (?, ?) OR EXISTS (
+                     SELECT 1 FROM risk_order_exposures AS exposure
+                     WHERE exposure.permit_id = reservation.permit_id
+                       AND exposure.state = ?
+                 ))""",
+            (
+                *scope_keys,
+                IntentAction.INCREASE.value,
+                self._ACTIVE,
+                self._SETTLED,
+                OrderExposureState.UNKNOWN.value,
+            ),
+        ).fetchall()
+        total = Fraction(0)
+        bound_permits: list[str] = []
+        for row in rows:
+            member = (
+                str(row["scope_key"]),
+                row["resource_product_type"],
+                row["resource_margin_pool"],
+            )
+            if member not in members:
+                raise ValueError(
+                    "shared-collateral domain cannot activate with unclassified occupied increases"
+                )
+            if row["notional_unit"] != notional_unit:
+                raise ValueError(
+                    "shared-collateral domain cannot activate across unlike notional units"
+                )
+            if row["shared_collateral_domain_id"] not in (None, domain_id) or (
+                row["shared_collateral_domain_id"] == domain_id
+                and row["shared_collateral_domain_revision"] != revision
+            ):
+                raise ValueError(
+                    "occupied reservation is already bound to another shared-collateral domain"
+                )
+            total += Fraction(_as_decimal(row["notional"]))
+            bound_permits.append(str(row["permit_id"]))
+        if total > Fraction(max_notional):
+            raise ValueError(
+                "shared-collateral domain cap is below its existing active/settled/unknown occupation"
+            )
+        for permit_id in bound_permits:
+            connection.execute(
+                """UPDATE risk_reservations
+                   SET shared_collateral_domain_id = ?, shared_collateral_domain_revision = ?
+                   WHERE permit_id = ? AND shared_collateral_domain_id IS NULL""",
+                (domain_id, revision, permit_id),
+            )
+
+    def _assert_shared_collateral_admission(
+        self,
+        connection: sqlite3.Connection,
+        scope: AccountScope,
+        action: IntentAction,
+        resource: Optional[AccountResourceKey],  # noqa: UP045 -- Python 3.9 is supported.
+        *,
+        invalid: bool = False,
+    ) -> Optional[sqlite3.Row]:  # noqa: UP045 -- Python 3.9 is supported.
+        """Require a ready shared-domain member before issuing new credit."""
+
+        if action is not IntentAction.INCREASE:
+            return None
+        domains = connection.execute(
+            """SELECT domain.domain_id, domain.revision, domain.ledger_identity_ref, domain.ready,
+                      domain.manifest_complete, domain.max_notional, domain.notional_unit
+               FROM risk_shared_collateral_domain_scopes AS member_scope
+               JOIN risk_shared_collateral_domains AS domain
+                 ON domain.domain_id = member_scope.domain_id
+               WHERE member_scope.scope_key = ? ORDER BY domain.domain_id""",
+            (scope.key,),
+        ).fetchall()
+        if not domains:
+            return None
+        error = PermitInvalidError if invalid else RiskDeniedError
+        if any(
+            not row["ready"]
+            or not row["manifest_complete"]
+            or row["ledger_identity_ref"] != self.ledger_identity_ref
+            or row["max_notional"] is None
+            or row["notional_unit"] != self._policy.notional_unit
+            for row in domains
+        ):
+            raise error(
+                "SHARED_COLLATERAL_DOMAIN_UNREADY",
+                "shared collateral lacks a complete manifest, matching ledger identity, or cap",
+            )
+        if resource is None:
+            raise error(
+                "SHARED_COLLATERAL_RESOURCE_UNMAPPED",
+                "new credit in a shared-collateral account requires a trusted resource mapping",
+            )
+        member = connection.execute(
+            """SELECT domain.domain_id, domain.revision, domain.ledger_identity_ref, domain.ready,
+                      domain.manifest_complete, domain.max_notional, domain.notional_unit
+               FROM risk_shared_collateral_domain_members AS resource_member
+               JOIN risk_shared_collateral_domains AS domain
+                 ON domain.domain_id = resource_member.domain_id
+               WHERE resource_member.scope_key = ?
+                 AND resource_member.product_type = ?
+                 AND resource_member.margin_pool = ?""",
+            (scope.key, resource.product_type, resource.margin_pool),
+        ).fetchone()
+        if member is None:
+            raise error(
+                "SHARED_COLLATERAL_RESOURCE_UNMAPPED",
+                "new credit resource is not in the trusted shared-collateral manifest",
+            )
+        if (
+            not member["ready"]
+            or not member["manifest_complete"]
+            or member["ledger_identity_ref"] != self.ledger_identity_ref
+            or member["max_notional"] is None
+            or member["notional_unit"] != self._policy.notional_unit
+        ):
+            raise error(
+                "SHARED_COLLATERAL_DOMAIN_UNREADY",
+                "shared collateral lacks a complete manifest, matching ledger identity, or cap",
+            )
+        return member
+
+    def _assert_shared_reservation_binding(
+        self,
+        connection: sqlite3.Connection,
+        permit_id: str,
+        shared_domain: Optional[sqlite3.Row],  # noqa: UP045 -- Python 3.9 is supported.
+    ) -> None:
+        """Require persisted credit provenance to match the current domain revision."""
+
+        if shared_domain is None:
+            return
+        row = connection.execute(
+            """SELECT shared_collateral_domain_id, shared_collateral_domain_revision,
+                      notional_unit
+               FROM risk_reservations WHERE permit_id = ?""",
+            (permit_id,),
+        ).fetchone()
+        if row is None or (
+            row["shared_collateral_domain_id"] != shared_domain["domain_id"]
+            or row["shared_collateral_domain_revision"] != shared_domain["revision"]
+            or row["notional_unit"] != shared_domain["notional_unit"]
+        ):
+            raise PermitInvalidError(
+                "SHARED_COLLATERAL_RESERVATION_BINDING_STALE",
+                "reserved credit is not bound to the current trusted collateral-domain revision",
+            )
+
+    def _assert_shared_reservation_current(
+        self, connection: sqlite3.Connection, permit_id: str
+    ) -> None:
+        """Check shared-domain readiness before any dispatch-side write."""
+
+        reservation = connection.execute(
+            "SELECT * FROM risk_reservations WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        if reservation is None:
+            return
+        scope = AccountScope(
+            provider=str(reservation["provider"]),
+            account_id=str(reservation["account_id"]),
+            environment=str(reservation["environment"]),
+        )
+        action = IntentAction(str(reservation["action"]))
+        resource = (
+            None
+            if reservation["resource_product_type"] is None
+            or reservation["resource_margin_pool"] is None
+            else AccountResourceKey(
+                product_type=str(reservation["resource_product_type"]),
+                margin_pool=str(reservation["resource_margin_pool"]),
+            )
+        )
+        shared_domain = self._assert_shared_collateral_admission(
+            connection, scope, action, resource, invalid=True
+        )
+        self._assert_shared_reservation_binding(connection, permit_id, shared_domain)
+
     def _assert_margin_pool_limit(self, connection: sqlite3.Connection, intent: RiskIntent) -> None:
-        """Enforce one declared margin-pool ceiling inside the write transaction.
+        """Enforce the applicable margin-pool ceiling inside the write transaction.
 
         Only intents that carry a trusted ``AccountResourceKey`` participate;
-        keyless intents (and every legacy row) keep their established behavior
-        untouched.  Usage counts every live INCREASE reservation in the same
-        account and pool at its exact reserved notional, which is the trusted
-        mapper's already-valued (FX-converted) maximum, so this path never
-        re-derives FX arithmetic.  The check shares the caller's
-        ``BEGIN IMMEDIATE`` transaction, so legs of one vector and contenders
-        from other writers are accounted atomically before any insert commits.
+        undeclared isolated accounts keep their established per-account
+        behavior.  A declared shared domain instead counts each mapped active,
+        settled, or UNKNOWN increase row once across all member accounts and
+        products.  Usage is the trusted mapper's already-valued (FX-converted)
+        maximum, so this path never re-derives FX arithmetic.  The check shares
+        the caller's ``BEGIN IMMEDIATE`` transaction, so group legs and
+        competing writers are accounted atomically before inserts commit.
         """
 
         resource = intent.resource
         if resource is None or intent.action is not IntentAction.INCREASE:
+            return
+        shared_domain = self._assert_shared_collateral_admission(
+            connection, intent.scope, intent.action, resource
+        )
+        if shared_domain is not None:
+            if intent.notional_unit != shared_domain["notional_unit"]:
+                raise RiskDeniedError(
+                    "NOTIONAL_UNIT_MISMATCH",
+                    "intent notional unit does not match the shared-collateral domain",
+                )
+            rows = connection.execute(
+                """SELECT reservation.notional, reservation.notional_unit
+                   FROM risk_reservations AS reservation
+                   WHERE reservation.action = ?
+                     AND (reservation.status IN (?, ?) OR EXISTS (
+                       SELECT 1 FROM risk_order_exposures AS exposure
+                       WHERE exposure.permit_id = reservation.permit_id
+                         AND exposure.state = ?
+                     ))
+                     AND EXISTS (
+                       SELECT 1 FROM risk_shared_collateral_domain_members AS member
+                       WHERE member.domain_id = ?
+                         AND member.scope_key = reservation.scope_key
+                         AND member.product_type = reservation.resource_product_type
+                         AND member.margin_pool = reservation.resource_margin_pool
+                     )""",
+                (
+                    IntentAction.INCREASE.value,
+                    self._ACTIVE,
+                    self._SETTLED,
+                    OrderExposureState.UNKNOWN.value,
+                    shared_domain["domain_id"],
+                ),
+            ).fetchall()
+            if any(row["notional_unit"] != shared_domain["notional_unit"] for row in rows):
+                raise RiskDeniedError(
+                    "SHARED_COLLATERAL_UNIT_USAGE_UNAVAILABLE",
+                    "existing shared-collateral reservations use an incompatible notional unit",
+                )
+            reserved_notional = sum(
+                (Fraction(_as_decimal(row["notional"])) for row in rows), Fraction(0)
+            )
+            if reserved_notional + Fraction(intent.notional) > Fraction(
+                _as_decimal(shared_domain["max_notional"])
+            ):
+                raise RiskDeniedError(
+                    "SHARED_COLLATERAL_LIMIT_EXHAUSTED",
+                    "cross-account shared-collateral notional limit exceeded",
+                )
             return
         limit = connection.execute(
             """SELECT max_notional, notional_unit FROM risk_margin_pool_limits
@@ -8866,6 +9475,10 @@ class DurableRiskGate:
             connection.execute("PRAGMA journal_mode = WAL")
             connection.executescript(
                 """
+                CREATE TABLE IF NOT EXISTS risk_ledger_identity (
+                    singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                    identity_nonce TEXT NOT NULL UNIQUE
+                );
                 CREATE TABLE IF NOT EXISTS risk_reservations (
                     permit_id TEXT PRIMARY KEY,
                     intent_id TEXT NOT NULL UNIQUE,
@@ -8897,7 +9510,9 @@ class DurableRiskGate:
                     group_exposure_profile_fingerprint TEXT,
                     resource_product_type TEXT,
                     resource_margin_pool TEXT,
-                    close_position_version TEXT
+                    close_position_version TEXT,
+                    shared_collateral_domain_id TEXT,
+                    shared_collateral_domain_revision TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_risk_reservations_scope_status
                     ON risk_reservations(scope_key, status, action);
@@ -9103,6 +9718,45 @@ class DurableRiskGate:
                     notional_unit TEXT NOT NULL,
                     created_at REAL NOT NULL,
                     PRIMARY KEY(scope_key, product_type, margin_pool, allocation_version)
+                );
+                CREATE TABLE IF NOT EXISTS risk_shared_collateral_domains (
+                    domain_id TEXT PRIMARY KEY,
+                    revision TEXT NOT NULL,
+                    ledger_identity_ref TEXT,
+                    manifest_complete INTEGER NOT NULL CHECK(manifest_complete IN (0, 1)),
+                    max_notional TEXT,
+                    notional_unit TEXT,
+                    ready INTEGER NOT NULL CHECK(ready IN (0, 1)),
+                    manifest_sha256 TEXT NOT NULL,
+                    updated_at REAL NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS risk_shared_collateral_domain_revisions (
+                    domain_id TEXT NOT NULL,
+                    revision TEXT NOT NULL,
+                    manifest_sha256 TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(domain_id, revision),
+                    FOREIGN KEY(domain_id) REFERENCES risk_shared_collateral_domains(domain_id)
+                );
+                CREATE TABLE IF NOT EXISTS risk_shared_collateral_domain_scopes (
+                    domain_id TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    PRIMARY KEY(domain_id, scope_key),
+                    FOREIGN KEY(domain_id) REFERENCES risk_shared_collateral_domains(domain_id)
+                        ON DELETE CASCADE
+                );
+                CREATE INDEX IF NOT EXISTS idx_risk_shared_collateral_scope
+                    ON risk_shared_collateral_domain_scopes(scope_key, domain_id);
+                CREATE TABLE IF NOT EXISTS risk_shared_collateral_domain_members (
+                    domain_id TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    product_type TEXT NOT NULL,
+                    margin_pool TEXT NOT NULL,
+                    PRIMARY KEY(domain_id, scope_key, product_type, margin_pool),
+                    UNIQUE(scope_key, product_type, margin_pool),
+                    FOREIGN KEY(domain_id, scope_key)
+                        REFERENCES risk_shared_collateral_domain_scopes(domain_id, scope_key)
+                        ON DELETE CASCADE
                 );
                 CREATE TABLE IF NOT EXISTS risk_closable_positions (
                     scope_key TEXT NOT NULL,
@@ -9354,6 +10008,8 @@ class DurableRiskGate:
                 ("resource_product_type", "TEXT"),
                 ("resource_margin_pool", "TEXT"),
                 ("close_position_version", "TEXT"),
+                ("shared_collateral_domain_id", "TEXT"),
+                ("shared_collateral_domain_revision", "TEXT"),
             ):
                 if name not in reservation_columns:
                     connection.execute(
@@ -9488,6 +10144,22 @@ class DurableRiskGate:
                        SELECT RAISE(ABORT, 'group dispatch claims are immutable');
                    END"""
             )
+            connection.execute(
+                "INSERT OR IGNORE INTO risk_ledger_identity(singleton, identity_nonce) VALUES (1, ?)",
+                (uuid.uuid4().hex,),
+            )
+            identity = connection.execute(
+                "SELECT identity_nonce FROM risk_ledger_identity WHERE singleton = 1"
+            ).fetchone()
+            if identity is None:
+                raise RuntimeError("risk ledger identity could not be initialized")
+            identity_material = (
+                "sqlite-risk-ledger-identity-v1\0"
+                + str(self._database_path.resolve())
+                + "\0"
+                + str(identity["identity_nonce"])
+            )
+            self._ledger_identity_ref = _sha256(identity_material)
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
