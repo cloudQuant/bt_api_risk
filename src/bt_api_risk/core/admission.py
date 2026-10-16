@@ -3459,6 +3459,211 @@ class DurableRiskGate:
             for permit_id, intent_id, receipt_sha256 in receipts
         )
 
+    def get_closable_position_rebase(
+        self,
+        scope: AccountScope,
+        instrument: str,
+        strategy_id: str,
+        *,
+        position_side: str = "NET",
+        position_bucket: str = "ALL",
+    ) -> Optional[ClosablePositionRebaseV1]:  # noqa: UP045 -- Python 3.9 is supported.
+        """Read the exact latest persisted full-book cut without changing Risk state.
+
+        The returned proof is a typed projection of Risk's stored cut, not new
+        execution-source evidence.  A caller replaying it must independently
+        reconstruct and verify the complete source snapshot before treating an
+        equal cut as idempotent.  Missing cuts return ``None``; orphaned or
+        inconsistent cut/receipt state fails closed.
+        """
+
+        from .closable_position_rebase import ClosablePositionRebaseV1
+
+        self._validate_closable_rebase_key(
+            scope, instrument, strategy_id, position_side, position_bucket
+        )
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            try:
+                latest = connection.execute(
+                    """SELECT * FROM risk_closable_position_rebases
+                       WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
+                    (scope.key, instrument, strategy_id),
+                ).fetchone()
+                if latest is None:
+                    orphan = connection.execute(
+                        """SELECT 1 FROM risk_closable_position_absorptions
+                           WHERE scope_key = ? AND instrument = ? AND strategy_id = ? LIMIT 1""",
+                        (scope.key, instrument, strategy_id),
+                    ).fetchone()
+                    if orphan is not None:
+                        raise RiskDeniedError(
+                            "CLOSE_REBASE_STATE_CONFLICT",
+                            "close absorptions exist without their owning rebase cut",
+                        )
+                    version_rows = connection.execute(
+                        """SELECT allocation_version FROM risk_closable_position_versions
+                           WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
+                        (scope.key, instrument, strategy_id),
+                    ).fetchall()
+                    declaration = connection.execute(
+                        """SELECT allocation_version FROM risk_closable_positions
+                           WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
+                        (scope.key, instrument, strategy_id),
+                    ).fetchone()
+                    has_orphan_rebase_version = any(
+                        type(row["allocation_version"]) is str
+                        and re.fullmatch(
+                            r"exec-rebase-[0-9a-f]{32}-[0-9]+-[0-9a-f]{20}",
+                            row["allocation_version"],
+                        )
+                        is not None
+                        for row in version_rows
+                    ) or (
+                        declaration is not None
+                        and type(declaration["allocation_version"]) is str
+                        and re.fullmatch(
+                            r"exec-rebase-[0-9a-f]{32}-[0-9]+-[0-9a-f]{20}",
+                            declaration["allocation_version"],
+                        )
+                        is not None
+                    )
+                    if has_orphan_rebase_version:
+                        raise RiskDeniedError(
+                            "CLOSE_REBASE_STATE_CONFLICT",
+                            "execution-book rebase versions exist without their latest cut",
+                        )
+                    result = None
+                else:
+                    policy_error = self._policy_binding_read_error(connection, scope.key)
+                    if policy_error is not None:
+                        raise RiskDeniedError(
+                            policy_error,
+                            "persisted close rebase is not bound to the current Risk policy",
+                        )
+                    declaration = connection.execute(
+                        """SELECT * FROM risk_closable_positions
+                           WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
+                        (scope.key, instrument, strategy_id),
+                    ).fetchone()
+                    if declaration is None:
+                        raise RiskDeniedError(
+                            "CLOSE_REBASE_STATE_CONFLICT",
+                            "persisted close rebase has no owning declaration",
+                        )
+                    if not (
+                        latest["scope_key"] == scope.key
+                        and latest["instrument"] == instrument
+                        and latest["strategy_id"] == strategy_id
+                    ):
+                        raise RiskDeniedError(
+                            "CLOSE_REBASE_STATE_CONFLICT",
+                            "persisted close rebase key is inconsistent",
+                        )
+                    try:
+                        generation = latest["execution_generation"]
+                        cursor = latest["execution_cursor"]
+                        snapshot_sha256 = latest["snapshot_sha256"]
+                        quantity = latest["closable_quantity"]
+                        quantity_unit = latest["quantity_unit"]
+                        allocation_version = latest["allocation_version"]
+                        stored_receipts_json = latest["absorbed_close_receipts_json"]
+                        stored_receipts_sha256 = latest["absorbed_close_receipts_sha256"]
+                        stored_receipt_count = latest["absorbed_close_receipt_count"]
+                        if not (
+                            type(generation) is str
+                            and type(cursor) is int
+                            and type(snapshot_sha256) is str
+                            and type(quantity) is str
+                            and type(quantity_unit) is str
+                            and type(allocation_version) is str
+                            and type(stored_receipts_json) is str
+                            and type(stored_receipts_sha256) is str
+                            and type(stored_receipt_count) is int
+                        ):
+                            raise ValueError("persisted close rebase has invalid field types")
+                        receipt_query = """SELECT permit_id, intent_id, close_receipt_sha256
+                            FROM risk_closable_position_absorptions
+                            WHERE scope_key = ? AND instrument = ? AND strategy_id = ?
+                              AND execution_generation = ? AND execution_cursor = ?
+                              AND snapshot_sha256 = ?"""
+                        receipt_parameters = (
+                            scope.key,
+                            instrument,
+                            strategy_id,
+                            generation,
+                            cursor,
+                            snapshot_sha256,
+                        )
+                        receipt_rows = connection.execute(
+                            receipt_query + " ORDER BY permit_id", receipt_parameters
+                        ).fetchall()
+                        from .closable_position_rebase import ClosablePositionCloseReceiptV1
+
+                        receipts = tuple(
+                            ClosablePositionCloseReceiptV1(
+                                permit_id=str(row["permit_id"]),
+                                intent_id=str(row["intent_id"]),
+                                close_receipt_sha256=str(row["close_receipt_sha256"]),
+                            )
+                            for row in receipt_rows
+                        )
+                        receipts_json = self._closable_rebase_receipts_json(receipts)
+                        if not (
+                            stored_receipts_json == receipts_json
+                            and stored_receipts_sha256 == _sha256(receipts_json)
+                            and stored_receipt_count == len(receipts)
+                        ):
+                            raise ValueError("persisted close receipt set is inconsistent")
+                        proof = ClosablePositionRebaseV1(
+                            scope=scope,
+                            instrument=instrument,
+                            strategy_id=strategy_id,
+                            closable_quantity=_as_decimal(quantity),
+                            quantity_unit=quantity_unit,
+                            execution_generation=generation,
+                            execution_cursor=cursor,
+                            snapshot_sha256=snapshot_sha256,
+                            absorbed_close_receipts=receipts,
+                        )
+                    except (InvalidOperation, KeyError, TypeError, ValueError):
+                        raise RiskDeniedError(
+                            "CLOSE_REBASE_STATE_CONFLICT",
+                            "persisted close rebase facts are invalid",
+                        ) from None
+                    expected_version = (
+                        f"exec-rebase-{proof.execution_generation}-{proof.execution_cursor}-"
+                        f"{proof.snapshot_sha256[:20]}"
+                    )
+                    if allocation_version != expected_version:
+                        raise RiskDeniedError(
+                            "CLOSE_REBASE_STATE_CONFLICT",
+                            "persisted close rebase version is not bound to its cut",
+                        )
+                    self._assert_closable_rebase_baseline_matches(
+                        declaration, latest, proof
+                    )
+                    for receipt in proof.absorbed_close_receipts:
+                        verified_sha256 = self._verified_close_receipt_sha256_in_transaction(
+                            connection,
+                            permit_id=receipt.permit_id,
+                            intent_id=receipt.intent_id,
+                            scope_key=scope.key,
+                            instrument=instrument,
+                            strategy_id=strategy_id,
+                        )
+                        if verified_sha256 != receipt.close_receipt_sha256:
+                            raise RiskDeniedError(
+                                "CLOSE_REBASE_STATE_CONFLICT",
+                                "persisted close rebase no longer matches its terminal Risk receipts",
+                            )
+                    result = proof
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+            connection.execute("ROLLBACK")
+        return result
+
     def rebase_closable_position(
         self, proof: ClosablePositionRebaseV1
     ) -> ClosablePositionSnapshot:
@@ -3569,6 +3774,7 @@ class DurableRiskGate:
                         verified_sha256 = self._verified_close_receipt_sha256_in_transaction(
                             connection,
                             permit_id=receipt.permit_id,
+                            intent_id=receipt.intent_id,
                             scope_key=proof.scope.key,
                             instrument=proof.instrument,
                             strategy_id=proof.strategy_id,
@@ -3789,14 +3995,15 @@ class DurableRiskGate:
                     "CLOSE_REBASE_UNKNOWN_CLOSE",
                     "a bound close reservation has an unknown durable state",
                 )
+            intent_id = str(reservation["intent_id"])
             receipt_sha256 = self._verified_close_receipt_sha256_in_transaction(
                 connection,
                 permit_id=permit_id,
+                intent_id=intent_id,
                 scope_key=scope_key,
                 instrument=instrument,
                 strategy_id=strategy_id,
             )
-            intent_id = str(reservation["intent_id"])
             absorbed = connection.execute(
                 """SELECT * FROM risk_closable_position_absorptions
                    WHERE scope_key = ? AND permit_id = ?""",
@@ -3822,6 +4029,7 @@ class DurableRiskGate:
         connection: sqlite3.Connection,
         *,
         permit_id: str,
+        intent_id: str,
         scope_key: str,
         instrument: str,
         strategy_id: str,
@@ -3855,6 +4063,32 @@ class DurableRiskGate:
             raise RiskDeniedError(
                 "CLOSE_REBASE_STATE_CONFLICT",
                 "the full durable Risk close receipt is incomplete",
+            )
+        if not (
+            type(intent_id) is str
+            and receipt.claim.intent_id == intent_id
+            and claim["intent_id"] == intent_id
+            and reservation["intent_id"] == intent_id
+        ):
+            raise RiskDeniedError(
+                "CLOSE_REBASE_STATE_CONFLICT",
+                "terminal close receipt intent differs from its persisted reference",
+            )
+        if not (
+            reservation["position_side"] == close["position_side"] == "NET"
+            and reservation["position_bucket"] == close["position_bucket"] == "ALL"
+        ):
+            raise RiskDeniedError(
+                "CLOSE_REBASE_STATE_CONFLICT",
+                "terminal close receipt dimensions differ from NET/ALL",
+            )
+        if not (
+            reservation["position_side"] == close["position_side"] == "NET"
+            and reservation["position_bucket"] == close["position_bucket"] == "ALL"
+        ):
+            raise RiskDeniedError(
+                "CLOSE_REBASE_STATE_CONFLICT",
+                "terminal close receipt dimensions differ from NET/ALL",
             )
         if not (
             reservation["scope_key"] == scope_key

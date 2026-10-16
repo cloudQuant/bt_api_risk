@@ -232,6 +232,178 @@ def _rebase(
     )
 
 
+def _database_rows(path):
+    connection = sqlite3.connect(path)
+    try:
+        return tuple(connection.iterdump())
+    finally:
+        connection.close()
+
+
+def test_persisted_rebase_readback_is_exact_policy_bound_and_read_only(tmp_path):
+    gate, scope = _gate(tmp_path)
+    path = tmp_path / "risk-rebase.sqlite3"
+    assert gate.get_closable_position_rebase(scope, "venue/contract-a", "strategy-a") is None
+
+    _make_close(gate, scope, intent_id="paper-close-readback", quantity="2")
+    refs = gate.get_unabsorbed_settled_close_receipts(scope, "venue/contract-a", "strategy-a")
+    proof = _rebase(scope, refs, cursor=9, quantity="3")
+    gate.rebase_closable_position(proof)
+
+    before = _database_rows(path)
+    persisted = gate.get_closable_position_rebase(scope, "venue/contract-a", "strategy-a")
+    after = _database_rows(path)
+
+    assert persisted == proof
+    assert persisted.absorbed_close_receipts == refs
+    assert before == after
+
+
+def test_persisted_rebase_readback_same_cut_replay_is_read_only(tmp_path):
+    gate, scope = _gate(tmp_path)
+    path = tmp_path / "risk-rebase.sqlite3"
+    _make_close(gate, scope, intent_id="paper-close-same-cut", quantity="2")
+    refs = gate.get_unabsorbed_settled_close_receipts(
+        scope, "venue/contract-a", "strategy-a"
+    )
+    original = _rebase(scope, refs, cursor=9, quantity="3")
+    gate.rebase_closable_position(original)
+
+    before_replay = _database_rows(path)
+    persisted = gate.get_closable_position_rebase(
+        scope, "venue/contract-a", "strategy-a"
+    )
+    assert persisted == original
+    gate.rebase_closable_position(persisted)
+    after_replay = _database_rows(path)
+
+    assert after_replay == before_replay
+
+
+def test_persisted_rebase_readback_rejects_a_changed_scope_policy(tmp_path):
+    gate, scope = _gate(tmp_path)
+    _make_close(gate, scope, intent_id="paper-close-policy", quantity="2")
+    refs = gate.get_unabsorbed_settled_close_receipts(scope, "venue/contract-a", "strategy-a")
+    gate.rebase_closable_position(_rebase(scope, refs, cursor=9, quantity="3"))
+
+    changed_policy_gate = DurableRiskGate(
+        tmp_path / "risk-rebase.sqlite3",
+        RiskPolicy(
+            "changed-paper-close-rebase",
+            Decimal("5000"),
+            8,
+            require_strategy_allocation=True,
+            notional_unit="USD",
+        ),
+        clock=_Clock(),
+        execution_journal_authority=_Authority(),
+    )
+    with pytest.raises(RiskDeniedError) as mismatch:
+        changed_policy_gate.get_closable_position_rebase(scope, "venue/contract-a", "strategy-a")
+    assert mismatch.value.code == "RISK_POLICY_BINDING_MISMATCH"
+
+
+def test_persisted_rebase_readback_rejects_cut_facts_changed_without_receipts(tmp_path):
+    gate, scope = _gate(tmp_path)
+    _make_close(gate, scope, intent_id="paper-close-changed-cut", quantity="2")
+    refs = gate.get_unabsorbed_settled_close_receipts(scope, "venue/contract-a", "strategy-a")
+    gate.rebase_closable_position(_rebase(scope, refs, cursor=9, quantity="3"))
+
+    connection = sqlite3.connect(tmp_path / "risk-rebase.sqlite3")
+    try:
+        connection.execute(
+            """UPDATE risk_closable_position_rebases SET execution_cursor = ?
+               WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
+            (10, scope.key, "venue/contract-a", "strategy-a"),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RiskDeniedError) as conflict:
+        gate.get_closable_position_rebase(scope, "venue/contract-a", "strategy-a")
+    assert conflict.value.code == "CLOSE_REBASE_STATE_CONFLICT"
+
+
+@pytest.mark.parametrize("delete_version_row", [False, True])
+def test_persisted_rebase_readback_rejects_missing_latest_cut_with_version_history(
+    tmp_path, delete_version_row
+):
+    gate, scope = _gate(tmp_path)
+    path = tmp_path / "risk-rebase.sqlite3"
+    proof = _rebase(scope, (), cursor=9, quantity="5")
+    gate.rebase_closable_position(proof)
+
+    connection = sqlite3.connect(path)
+    try:
+        connection.execute(
+            """DELETE FROM risk_closable_position_rebases
+               WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
+            (scope.key, "venue/contract-a", "strategy-a"),
+        )
+        if delete_version_row:
+            connection.execute(
+                """DELETE FROM risk_closable_position_versions
+                   WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
+                (scope.key, "venue/contract-a", "strategy-a"),
+            )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RiskDeniedError) as conflict:
+        gate.get_closable_position_rebase(scope, "venue/contract-a", "strategy-a")
+    assert conflict.value.code == "CLOSE_REBASE_STATE_CONFLICT"
+
+
+def test_persisted_rebase_readback_rejects_cut_ref_intent_not_bound_to_permit(
+    tmp_path,
+):
+    gate, scope = _gate(tmp_path)
+    path = tmp_path / "risk-rebase.sqlite3"
+    _make_close(gate, scope, intent_id="paper-close-readback-binding", quantity="2")
+    refs = gate.get_unabsorbed_settled_close_receipts(scope, "venue/contract-a", "strategy-a")
+    proof = _rebase(scope, refs, cursor=9, quantity="3")
+    gate.rebase_closable_position(proof)
+
+    forged_ref = ClosablePositionCloseReceiptV1(
+        permit_id=refs[0].permit_id,
+        intent_id="paper-close-forged-reference",
+        close_receipt_sha256=refs[0].close_receipt_sha256,
+    )
+    forged_refs_json = gate._closable_rebase_receipts_json((forged_ref,))
+    connection = sqlite3.connect(path)
+    try:
+        # Offline/corrupt database mutation bypasses the production immutability guard.
+        connection.execute("DROP TRIGGER risk_closable_position_absorption_immutable_update")
+        connection.execute(
+            """UPDATE risk_closable_position_absorptions SET intent_id = ?
+               WHERE scope_key = ? AND permit_id = ?""",
+            (forged_ref.intent_id, scope.key, refs[0].permit_id),
+        )
+        connection.execute(
+            """UPDATE risk_closable_position_rebases
+               SET absorbed_close_receipts_json = ?,
+                   absorbed_close_receipts_sha256 = ?, absorbed_close_receipt_count = ?
+               WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
+            (
+                forged_refs_json,
+                _sha(forged_refs_json),
+                1,
+                scope.key,
+                "venue/contract-a",
+                "strategy-a",
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    with pytest.raises(RiskDeniedError) as conflict:
+        gate.get_closable_position_rebase(scope, "venue/contract-a", "strategy-a")
+    assert conflict.value.code == "CLOSE_REBASE_STATE_CONFLICT"
+
+
 def test_full_book_rebase_absorbs_each_verified_close_once_and_keeps_new_closes_bounded(
     tmp_path,
 ):
@@ -424,6 +596,12 @@ def test_same_cut_replay_revalidates_absorbed_risk_receipt(tmp_path):
         connection.commit()
     finally:
         connection.close()
+
+    with pytest.raises(PermitInvalidError) as readback:
+        gate.get_closable_position_rebase(
+            scope, "venue/contract-a", "strategy-a"
+        )
+    assert readback.value.code == "DISPATCH_CLOSE_STATE_CONFLICT"
 
     with pytest.raises(PermitInvalidError) as replay:
         gate.rebase_closable_position(proof)
