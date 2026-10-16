@@ -14,6 +14,7 @@ import sqlite3
 from collections.abc import Mapping
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from typing import Final
 
 from bt_api_base.service_protocol import WireScope
@@ -30,7 +31,7 @@ _RECEIPT_FIELDS: Final[frozenset[str]] = frozenset(
 )
 _CONFIRMED_RECEIPT_FIELDS: Final[frozenset[str]] = _RECEIPT_FIELDS | {"confirmed_utc"}
 _CONTENT_FIELDS: Final[frozenset[str]] = frozenset({"afi_budget", "risk_policy"})
-_AFI_BUDGET_FIELDS: Final[frozenset[str]] = frozenset(
+_AFI_BUDGET_BASE_FIELDS: Final[frozenset[str]] = frozenset(
     {
         "kind",
         "schema_version",
@@ -44,6 +45,27 @@ _AFI_BUDGET_FIELDS: Final[frozenset[str]] = frozenset(
         "unallocated_amount",
         "account_ref",
         "allocated_amount",
+    }
+)
+_AFI_BUDGET_FX_FIELDS: Final[frozenset[str]] = _AFI_BUDGET_BASE_FIELDS | {
+    "source_amount",
+    "source_currency",
+    "fx_observation",
+}
+_BUDGET_FX_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "observation_ref",
+        "base_currency",
+        "quote_currency",
+        "direction",
+        "rate_unit",
+        "rate",
+        "as_of_ns",
+        "valid_until_ns",
+        "source_ref",
+        "source_version",
+        "source_generation",
+        "source_cursor",
     }
 )
 _RISK_POLICY_FIELDS: Final[frozenset[str]] = frozenset(
@@ -76,6 +98,7 @@ class ResolvedBudgetAdmission:
     policy_ref: str
     policy_version: str
     risk_policy: RiskPolicy
+    fx_observations: tuple[Mapping[str, object], ...] = ()
 
 
 class PolicyCatalogBudgetAdmissionResolver:
@@ -145,7 +168,7 @@ class PolicyCatalogBudgetAdmissionResolver:
         risk_policy = content["risk_policy"]
         if (
             not isinstance(afi_budget, Mapping)
-            or set(afi_budget) != _AFI_BUDGET_FIELDS
+            or set(afi_budget) not in (_AFI_BUDGET_BASE_FIELDS, _AFI_BUDGET_FX_FIELDS)
             or not isinstance(risk_policy, Mapping)
             or set(risk_policy) != _RISK_POLICY_FIELDS
         ):
@@ -169,6 +192,64 @@ class PolicyCatalogBudgetAdmissionResolver:
             type(afi_budget[key]) is not type(value) or afi_budget[key] != value
             for key, value in expected_budget.items()
         ):
+            raise BudgetAdmissionResolutionError("BUDGET_POLICY_CONTENT_MISMATCH")
+
+        generation_fx = snapshot.get("fx_observations")
+        if type(generation_fx) not in (tuple, list):
+            raise BudgetAdmissionResolutionError("BUDGET_POLICY_CONTENT_MISMATCH")
+        if set(afi_budget) == _AFI_BUDGET_FX_FIELDS:
+            source_amount = afi_budget["source_amount"]
+            source_currency = afi_budget["source_currency"]
+            fx_observation = afi_budget["fx_observation"]
+            if (
+                type(source_amount) is not str
+                or type(source_currency) is not str
+                or source_currency == ""
+            ):
+                raise BudgetAdmissionResolutionError("BUDGET_POLICY_CONTENT_MISMATCH")
+            try:
+                source_value = Decimal(source_amount)
+                allocated_value = Decimal(snapshot["allocated_amount"])
+            except (InvalidOperation, TypeError, ValueError):
+                raise BudgetAdmissionResolutionError(
+                    "BUDGET_POLICY_CONTENT_MISMATCH"
+                ) from None
+            if (
+                not source_value.is_finite()
+                or source_value <= 0
+                or source_currency == snapshot["currency"]
+                and (fx_observation is not None or source_value != allocated_value)
+            ):
+                raise BudgetAdmissionResolutionError("BUDGET_POLICY_CONTENT_MISMATCH")
+            if source_currency != snapshot["currency"]:
+                if (
+                    not isinstance(fx_observation, Mapping)
+                    or set(fx_observation) != _BUDGET_FX_FIELDS
+                    or fx_observation.get("base_currency") != source_currency
+                    or fx_observation.get("quote_currency") != snapshot["currency"]
+                    or fx_observation.get("direction") != "BASE_TO_QUOTE"
+                    or fx_observation.get("rate_unit") != "QUOTE_PER_BASE"
+                    or not any(item == fx_observation for item in generation_fx)
+                ):
+                    raise BudgetAdmissionResolutionError(
+                        "BUDGET_POLICY_CONTENT_MISMATCH"
+                    )
+                try:
+                    rate = Decimal(fx_observation["rate"])
+                    converted = Fraction(source_value) * Fraction(rate)
+                    if (
+                        not rate.is_finite()
+                        or rate <= 0
+                        or converted != Fraction(allocated_value)
+                    ):
+                        raise BudgetAdmissionResolutionError(
+                            "BUDGET_POLICY_CONTENT_MISMATCH"
+                        )
+                except (InvalidOperation, TypeError, ValueError):
+                    raise BudgetAdmissionResolutionError(
+                        "BUDGET_POLICY_CONTENT_MISMATCH"
+                    ) from None
+        elif generation_fx:
             raise BudgetAdmissionResolutionError("BUDGET_POLICY_CONTENT_MISMATCH")
 
         amount = snapshot["allocated_amount"]
@@ -211,6 +292,7 @@ class PolicyCatalogBudgetAdmissionResolver:
             policy_ref=snapshot["policy_ref"],
             policy_version=snapshot["policy_version"],
             risk_policy=policy,
+            fx_observations=tuple(generation_fx),
         )
 
 

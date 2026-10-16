@@ -31,11 +31,13 @@ import json
 import re
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 from types import MappingProxyType
 from typing import Final, Iterator
 
@@ -69,6 +71,65 @@ _BUDGET_AMOUNT_PATTERN: Final[re.Pattern[str]] = re.compile(
     r"^(?:0|[1-9][0-9]*)(?:\.[0-9]{1,18})?$"
 )
 _BUDGET_CURRENCY_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Z]{3}$")
+_BUDGET_FX_MAX_AGE_NS: Final[int] = 86_400_000_000_000
+_BUDGET_FX_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "observation_ref",
+        "base_currency",
+        "quote_currency",
+        "direction",
+        "rate_unit",
+        "rate",
+        "as_of_ns",
+        "valid_until_ns",
+        "source_ref",
+        "source_version",
+        "source_generation",
+        "source_cursor",
+    }
+)
+_BUDGET_FX_REF_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$"
+)
+_BUDGET_FX_VERSION_PATTERN: Final[re.Pattern[str]] = re.compile(
+    r"^[A-Za-z0-9][A-Za-z0-9._:/-]*-v[1-9][0-9]*$"
+)
+_BUDGET_BASE_ALLOCATION_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "account_ref",
+        "policy_ref",
+        "amount",
+        "max_increase_count",
+        "metric",
+        "currency",
+    }
+)
+_BUDGET_FX_ALLOCATION_FIELDS: Final[frozenset[str]] = _BUDGET_BASE_ALLOCATION_FIELDS | {
+    "source_amount",
+    "source_currency",
+    "fx_observation",
+}
+_AFI_BUDGET_BASE_FIELDS: Final[frozenset[str]] = frozenset(
+    {
+        "kind",
+        "schema_version",
+        "portfolio_ref",
+        "membership_version",
+        "membership_sha256",
+        "allocation_set_sha256",
+        "metric",
+        "currency",
+        "total_amount",
+        "unallocated_amount",
+        "account_ref",
+        "allocated_amount",
+    }
+)
+_AFI_BUDGET_FX_FIELDS: Final[frozenset[str]] = _AFI_BUDGET_BASE_FIELDS | {
+    "source_amount",
+    "source_currency",
+    "fx_observation",
+}
 _POLICY_SCOPE_FIELDS: Final[tuple[str, ...]] = (
     "execution_domain_ref",
     "account_ref",
@@ -608,6 +669,113 @@ def _budget_units_text(units: int, scale: int) -> str:
     return str(whole) if not tail else f"{whole}.{tail}"
 
 
+def _budget_decimal(value: object, *, code: str) -> Decimal:
+    """Parse one canonical positive decimal without imposing the pool's int64 cap.
+
+    FX source amounts and rates are persisted as text and compared exactly; they
+    are not SQLite pool-unit counters. Reusing ``_budget_amount_units`` here
+    wrongly rejects ordinary values such as ``"10"`` because scaling them to
+    18 decimal places exceeds SQLite's signed-integer range.
+    """
+
+    if (
+        type(value) is not str
+        or len(value) > 64
+        or _BUDGET_AMOUNT_PATTERN.fullmatch(value) is None
+    ):
+        raise PolicyCatalogError(code)
+    try:
+        amount = Decimal(value)
+    except InvalidOperation:
+        raise PolicyCatalogError(code) from None
+    sign, digits, exponent = amount.as_tuple()
+    if (
+        sign
+        or len(digits) > 38
+        or exponent < -_MAX_BUDGET_SCALE
+        or amount <= 0
+        or amount.adjusted() > 63
+    ):
+        raise PolicyCatalogError(code)
+    canonical = format(amount, "f")
+    if "." in canonical:
+        canonical = canonical.rstrip("0").rstrip(".")
+    if canonical != value:
+        raise PolicyCatalogError(code)
+    return amount
+
+
+def _budget_fx_observation(value: object) -> dict[str, object]:
+    """Validate the exact immutable FX evidence shape used by AFI budget v1."""
+
+    if type(value) is not dict or set(value) != _BUDGET_FX_FIELDS:
+        raise PolicyCatalogError("INVALID_BUDGET_FX_FACT")
+    for name in ("observation_ref", "base_currency", "quote_currency", "source_ref"):
+        item = value[name]
+        if type(item) is not str or _BUDGET_FX_REF_PATTERN.fullmatch(item) is None:
+            raise PolicyCatalogError("INVALID_BUDGET_FX_FACT")
+    for name in ("source_generation", "source_cursor"):
+        if not _valid_wire_text(value[name]):
+            raise PolicyCatalogError("INVALID_BUDGET_FX_FACT")
+    if (
+        type(value["source_version"]) is not str
+        or _BUDGET_FX_VERSION_PATTERN.fullmatch(value["source_version"]) is None
+        or type(value["base_currency"]) is not str
+        or _BUDGET_CURRENCY_PATTERN.fullmatch(value["base_currency"]) is None
+        or type(value["quote_currency"]) is not str
+        or _BUDGET_CURRENCY_PATTERN.fullmatch(value["quote_currency"]) is None
+        or value["base_currency"] == value["quote_currency"]
+        or value["direction"] != "BASE_TO_QUOTE"
+        or type(value["direction"]) is not str
+        or value["rate_unit"] != "QUOTE_PER_BASE"
+        or type(value["rate_unit"]) is not str
+    ):
+        raise PolicyCatalogError("INVALID_BUDGET_FX_FACT")
+    rate = _budget_decimal(value["rate"], code="INVALID_BUDGET_FX_RATE")
+    for name in ("as_of_ns", "valid_until_ns"):
+        if type(value[name]) is not int or value[name] <= 0:
+            raise PolicyCatalogError("INVALID_BUDGET_FX_FACT")
+    if value["valid_until_ns"] <= value["as_of_ns"]:
+        raise PolicyCatalogError("INVALID_BUDGET_FX_FACT")
+    rate_text = format(rate, "f")
+    if "." in rate_text:
+        rate_text = rate_text.rstrip("0").rstrip(".")
+    return {**value, "rate": rate_text}
+
+
+def _validate_budget_fx_allocation(
+    *,
+    source_amount: object,
+    source_currency: object,
+    amount: object,
+    budget_currency: str,
+    fx_observation: object,
+) -> dict[str, object] | None:
+    """Check exact source-to-budget conversion and return its canonical fact."""
+
+    if (
+        type(source_currency) is not str
+        or _BUDGET_CURRENCY_PATTERN.fullmatch(source_currency) is None
+    ):
+        raise PolicyCatalogError("INVALID_BUDGET_FX_FACT")
+    source_value = _budget_decimal(source_amount, code="INVALID_BUDGET_SOURCE_AMOUNT")
+    budget_value = _budget_decimal(amount, code="INVALID_BUDGET_AMOUNT")
+    if source_currency == budget_currency:
+        if fx_observation is not None or source_value != budget_value:
+            raise PolicyCatalogError("INVALID_BUDGET_FX_FACT")
+        return None
+    observation = _budget_fx_observation(fx_observation)
+    if (
+        observation["base_currency"] != source_currency
+        or observation["quote_currency"] != budget_currency
+    ):
+        raise PolicyCatalogError("BUDGET_FX_PAIR_MISMATCH")
+    rate = Decimal(observation["rate"])
+    if Fraction(source_value) * Fraction(rate) != Fraction(budget_value):
+        raise PolicyCatalogError("BUDGET_FX_CONVERSION_MISMATCH")
+    return observation
+
+
 class PolicyCatalogStore:
     """Durable immutable policy versions for the ``policy_catalog`` role.
 
@@ -630,16 +798,30 @@ class PolicyCatalogStore:
         *,
         clock: Callable[[], str] = _now_utc,
         trusted_approver_principals: tuple[str, ...] | frozenset[str] = (),
+        trusted_fx_observation_reader: Callable[[str], Mapping[str, object]] | None = None,
+        fx_clock_ns: Callable[[], int] = time.time_ns,
     ) -> None:
         if type(path) is not str or not path:
             raise PolicyCatalogError("INVALID_STORE_PATH")
         if not callable(clock):
             raise PolicyCatalogError("INVALID_CLOCK")
+        if trusted_fx_observation_reader is not None and not callable(
+            trusted_fx_observation_reader
+        ):
+            raise PolicyCatalogError("INVALID_BUDGET_FX_SOURCE")
+        if not callable(fx_clock_ns):
+            raise PolicyCatalogError("INVALID_BUDGET_FX_CLOCK")
         if type(trusted_approver_principals) not in (tuple, frozenset):
             raise PolicyCatalogError("INVALID_APPROVER_CAPABILITY")
         if any(not _valid_wire_text(value) for value in trusted_approver_principals):
             raise PolicyCatalogError("INVALID_APPROVER_CAPABILITY")
         self._clock = clock
+        # These are injected by the trusted service/resource composition. The
+        # FX reader is a local authoritative fact lookup, not a provider call;
+        # the proposal RPC can name a fact but cannot install or replace its
+        # independent server-side source.
+        self._trusted_fx_observation_reader = trusted_fx_observation_reader
+        self._fx_clock_ns = fx_clock_ns
         self._trusted_approver_principals = frozenset(trusted_approver_principals)
         self._write_lock = threading.RLock()
         self._db = sqlite3.connect(path, timeout=10.0, check_same_thread=False)
@@ -748,6 +930,199 @@ class PolicyCatalogStore:
         if not _valid_wire_text(value) or len(value) > 64:
             raise PolicyCatalogError("INVALID_CLOCK")
         return value
+
+    def _validate_trusted_budget_fx(
+        self, observations: tuple[dict[str, object], ...]
+    ) -> None:
+        """Re-read exact FX observations through the injected trusted source."""
+
+        if not observations:
+            return
+        reader = self._trusted_fx_observation_reader
+        if reader is None:
+            raise PolicyCatalogError("BUDGET_FX_AUTHORITY_UNAVAILABLE")
+        for expected in observations:
+            try:
+                current_value = _plain_wire_value(reader(expected["observation_ref"]))
+                current = _budget_fx_observation(current_value)
+            except PolicyCatalogError:
+                raise PolicyCatalogError("BUDGET_FX_SOURCE_UNAVAILABLE") from None
+            except Exception:
+                raise PolicyCatalogError("BUDGET_FX_SOURCE_UNAVAILABLE") from None
+            if current != expected:
+                raise PolicyCatalogError("BUDGET_FX_SOURCE_MISMATCH")
+            try:
+                now_ns = self._fx_clock_ns()
+            except Exception:
+                raise PolicyCatalogError("BUDGET_FX_CLOCK_UNAVAILABLE") from None
+            if type(now_ns) is not int or now_ns <= 0:
+                raise PolicyCatalogError("BUDGET_FX_CLOCK_UNAVAILABLE")
+            if not expected["as_of_ns"] <= now_ns < expected["valid_until_ns"]:
+                raise PolicyCatalogError("BUDGET_FX_NOT_CURRENT")
+            if now_ns - expected["as_of_ns"] > _BUDGET_FX_MAX_AGE_NS:
+                raise PolicyCatalogError("BUDGET_FX_STALE")
+
+    def _budget_generation_fx_observations(
+        self,
+        generation: sqlite3.Row | str,
+        *,
+        check_source: bool = False,
+    ) -> tuple[dict[str, object], ...]:
+        """Rebuild and verify the generation digest from its immutable member docs."""
+
+        if type(generation) is str:
+            row = self._budget_generation_row(generation)
+        else:
+            row = generation
+        if row is None:
+            raise PolicyCatalogError("BUDGET_GENERATION_NOT_FOUND")
+        with self._write_lock:
+            pool = self._db.execute(
+                "SELECT scale FROM policy_budget_pools WHERE pool_ref=?",
+                (row["pool_ref"],),
+            ).fetchone()
+        if pool is None:
+            raise PolicyCatalogError("BUDGET_POOL_NOT_FOUND")
+        total_text = _budget_units_text(row["total_units"], pool["scale"])
+        unallocated_text = _budget_units_text(row["unallocated_units"], pool["scale"])
+        members = self._budget_members(row["generation_ref"])
+        if not members:
+            raise PolicyCatalogError("BUDGET_POLICY_CONTENT_MISMATCH")
+
+        allocation_rows: list[dict[str, object]] = []
+        observations_by_ref: dict[str, dict[str, object]] = {}
+        fx_metadata_mode: bool | None = None
+        allocated_units = 0
+        for member in members:
+            policy = self._row(member["policy_ref"])
+            if (
+                policy is None
+                or policy["digest"] != member["policy_digest"]
+                or hashlib.sha256(policy["content_json"].encode("utf-8")).hexdigest()
+                != policy["digest"]
+            ):
+                raise PolicyCatalogError("BUDGET_POLICY_STATE_CONFLICT")
+            try:
+                content = json.loads(policy["content_json"])
+            except (json.JSONDecodeError, TypeError):
+                raise PolicyCatalogError("BUDGET_POLICY_CONTENT_MISMATCH") from None
+            if (
+                type(content) is not dict
+                or set(content) != {"afi_budget", "risk_policy"}
+                or _canonical_json(content, path="$.content") != policy["content_json"]
+            ):
+                raise PolicyCatalogError("BUDGET_POLICY_CONTENT_MISMATCH")
+            budget = content["afi_budget"]
+            if type(budget) is not dict:
+                raise PolicyCatalogError("BUDGET_POLICY_CONTENT_MISMATCH")
+            fields = set(budget)
+            if fields == _AFI_BUDGET_BASE_FIELDS:
+                has_fx_metadata = False
+            elif fields == _AFI_BUDGET_FX_FIELDS:
+                has_fx_metadata = True
+            else:
+                raise PolicyCatalogError("BUDGET_POLICY_CONTENT_MISMATCH")
+            if fx_metadata_mode is None:
+                fx_metadata_mode = has_fx_metadata
+            elif fx_metadata_mode is not has_fx_metadata:
+                raise PolicyCatalogError("BUDGET_POLICY_CONTENT_MISMATCH")
+
+            expected_budget: dict[str, object] = {
+                "kind": _BUDGET_KIND,
+                "schema_version": _BUDGET_SCHEMA_VERSION,
+                "portfolio_ref": row["portfolio_ref"],
+                "membership_version": row["membership_version"],
+                "membership_sha256": row["membership_sha256"],
+                "allocation_set_sha256": row["allocation_set_sha256"],
+                "metric": row["metric"],
+                "currency": row["currency"],
+                "total_amount": total_text,
+                "unallocated_amount": unallocated_text,
+                "account_ref": member["account_ref"],
+                "allocated_amount": member["amount_text"],
+            }
+            manifest_allocation: dict[str, object] = {
+                "account_ref": member["account_ref"],
+                "policy_ref": member["policy_ref"],
+                "amount": member["amount_text"],
+                "max_increase_count": member["max_increase_count"],
+                "metric": row["metric"],
+                "currency": row["currency"],
+            }
+            if has_fx_metadata:
+                source_amount = budget["source_amount"]
+                source_currency = budget["source_currency"]
+                fx_payload = budget["fx_observation"]
+                expected_budget.update(
+                    {
+                        "source_amount": source_amount,
+                        "source_currency": source_currency,
+                        "fx_observation": fx_payload,
+                    }
+                )
+                normalized_fx = _validate_budget_fx_allocation(
+                    source_amount=source_amount,
+                    source_currency=source_currency,
+                    amount=member["amount_text"],
+                    budget_currency=row["currency"],
+                    fx_observation=fx_payload,
+                )
+                if normalized_fx is not None:
+                    observation_ref = normalized_fx["observation_ref"]
+                    existing = observations_by_ref.get(observation_ref)
+                    if existing is not None and existing != normalized_fx:
+                        raise PolicyCatalogError("BUDGET_FX_SOURCE_MISMATCH")
+                    observations_by_ref[observation_ref] = normalized_fx
+                manifest_allocation.update(
+                    {
+                        "source_amount": source_amount,
+                        "source_currency": source_currency,
+                        "fx_observation": fx_payload,
+                    }
+                )
+            if any(
+                type(budget.get(key)) is not type(value)
+                or budget.get(key) != value
+                for key, value in expected_budget.items()
+            ):
+                raise PolicyCatalogError("BUDGET_POLICY_CONTENT_MISMATCH")
+            risk_policy = content["risk_policy"]
+            if (
+                type(risk_policy) is not dict
+                or risk_policy.get("policy_id") != member["policy_ref"]
+                or risk_policy.get("max_increase_notional") != member["amount_text"]
+                or risk_policy.get("max_increase_count") != member["max_increase_count"]
+                or risk_policy.get("notional_unit") != row["currency"]
+            ):
+                raise PolicyCatalogError("BUDGET_POLICY_CONTENT_MISMATCH")
+            allocated_units += member["amount_units"]
+            allocation_rows.append(manifest_allocation)
+
+        if allocated_units + row["unallocated_units"] != row["total_units"]:
+            raise PolicyCatalogError("BUDGET_NOT_CONSERVED")
+        manifest = {
+            "kind": _BUDGET_KIND,
+            "schema_version": _BUDGET_SCHEMA_VERSION,
+            "portfolio_ref": row["portfolio_ref"],
+            "membership_version": row["membership_version"],
+            "membership_sha256": row["membership_sha256"],
+            "metric": row["metric"],
+            "currency": row["currency"],
+            "total_amount": total_text,
+            "unallocated_amount": unallocated_text,
+            "allocations": allocation_rows,
+        }
+        digest = hashlib.sha256(
+            _canonical_json(manifest, path="$.budget").encode("utf-8")
+        ).hexdigest()
+        if digest != row["allocation_set_sha256"]:
+            raise PolicyCatalogError("ALLOCATION_SET_DIGEST_MISMATCH")
+        observations = tuple(
+            observations_by_ref[key] for key in sorted(observations_by_ref)
+        )
+        if check_source:
+            self._validate_trusted_budget_fx(observations)
+        return observations
 
     def _row(self, reference: str) -> sqlite3.Row | None:
         with self._write_lock:
@@ -1119,6 +1494,8 @@ class PolicyCatalogStore:
         accounts: set[str] = set()
         policy_refs: set[str] = set()
         normalized_allocations: list[dict[str, object]] = []
+        proposal_fx_by_ref: dict[str, dict[str, object]] = {}
+        allocation_fx_mode: bool | None = None
         total_text = plain["total_amount"]
         unallocated_text = plain["unallocated_amount"]
         if type(total_text) is not str or type(unallocated_text) is not str:
@@ -1144,14 +1521,18 @@ class PolicyCatalogStore:
                 raise PolicyCatalogError("INVALID_BUDGET_AMOUNT")
             allocation_units = 0
             for item in plain["allocations"]:
-                if type(item) is not dict or set(item) != {
-                    "account_ref",
-                    "policy_ref",
-                    "amount",
-                    "max_increase_count",
-                    "metric",
-                    "currency",
-                }:
+                if type(item) is not dict:
+                    raise PolicyCatalogError("INVALID_BUDGET_ALLOCATION")
+                item_fields = set(item)
+                if item_fields == _BUDGET_BASE_ALLOCATION_FIELDS:
+                    has_fx_metadata = False
+                elif item_fields == _BUDGET_FX_ALLOCATION_FIELDS:
+                    has_fx_metadata = True
+                else:
+                    raise PolicyCatalogError("INVALID_BUDGET_ALLOCATION")
+                if allocation_fx_mode is None:
+                    allocation_fx_mode = has_fx_metadata
+                elif allocation_fx_mode is not has_fx_metadata:
                     raise PolicyCatalogError("INVALID_BUDGET_ALLOCATION")
                 account_ref = item["account_ref"]
                 if not _valid_wire_text(account_ref):
@@ -1183,6 +1564,28 @@ class PolicyCatalogStore:
                         "amount_units": amount_units,
                     }
                 )
+                if has_fx_metadata:
+                    fx_payload = _validate_budget_fx_allocation(
+                        source_amount=item["source_amount"],
+                        source_currency=item["source_currency"],
+                        amount=amount_text,
+                        budget_currency=currency,
+                        fx_observation=item["fx_observation"],
+                    )
+                    normalized_allocation = normalized_allocations[-1]
+                    normalized_allocation.update(
+                        {
+                            "source_amount": item["source_amount"],
+                            "source_currency": item["source_currency"],
+                            "fx_observation": fx_payload,
+                        }
+                    )
+                    if fx_payload is not None:
+                        observation_ref = fx_payload["observation_ref"]
+                        existing_fx = proposal_fx_by_ref.get(observation_ref)
+                        if existing_fx is not None and existing_fx != fx_payload:
+                            raise PolicyCatalogError("BUDGET_FX_SOURCE_MISMATCH")
+                        proposal_fx_by_ref[observation_ref] = fx_payload
             if allocation_units + unallocated_units != total_units:
                 raise PolicyCatalogError("BUDGET_NOT_CONSERVED")
             if tuple(sorted(canonical_scope["account_refs"])) != tuple(sorted(accounts)):
@@ -1209,6 +1612,11 @@ class PolicyCatalogStore:
                             "metric",
                             "currency",
                         )
+                        + (
+                            ("source_amount", "source_currency", "fx_observation")
+                            if allocation_fx_mode
+                            else ()
+                        )
                     }
                     for allocation in sorted(
                         normalized_allocations, key=lambda row: row["account_ref"]
@@ -1220,6 +1628,10 @@ class PolicyCatalogStore:
             ).hexdigest()
             if actual_allocation_digest != allocation_set_sha256:
                 raise PolicyCatalogError("ALLOCATION_SET_DIGEST_MISMATCH")
+
+            self._validate_trusted_budget_fx(
+                tuple(proposal_fx_by_ref[key] for key in sorted(proposal_fx_by_ref))
+            )
 
             # The trusted roster digest and exact member list are installed by
             # the Risk resource owner; caller-provided membership is only a pin.
@@ -1317,8 +1729,22 @@ class PolicyCatalogStore:
                     "account_ref": allocation["account_ref"],
                     "allocated_amount": allocation["amount"],
                 }
+                if allocation_fx_mode:
+                    expected_budget.update(
+                        {
+                            "source_amount": allocation["source_amount"],
+                            "source_currency": allocation["source_currency"],
+                            "fx_observation": allocation["fx_observation"],
+                        }
+                    )
                 if (
-                    afi_budget != expected_budget
+                    type(afi_budget) is not dict
+                    or set(afi_budget) != set(expected_budget)
+                    or any(
+                        type(afi_budget.get(key)) is not type(value)
+                        or afi_budget.get(key) != value
+                        for key, value in expected_budget.items()
+                    )
                     or type(risk_policy) is not dict
                     or risk_policy.get("policy_id") != allocation["policy_ref"]
                     or risk_policy.get("max_increase_notional") != allocation["amount"]
@@ -1398,6 +1824,7 @@ class PolicyCatalogStore:
                 raise PolicyCatalogError("MAKER_CHECKER_REQUIRED")
             if generation["proposer_scope_json"] != scope_json:
                 raise PolicyCatalogError("SCOPE_NOT_OWNER")
+            self._budget_generation_fx_observations(generation, check_source=True)
             if generation["state"] == "approved":
                 if (
                     generation["approved_by"] == principal_ref
@@ -1467,17 +1894,23 @@ class PolicyCatalogStore:
                 or principal_ref not in self._trusted_approver_principals
             ):
                 raise PolicyCatalogError("BUDGET_PUBLISH_NOT_AUTHORIZED")
+            observations = self._budget_generation_fx_observations(
+                generation, check_source=True
+            )
             member = self._budget_member_row(generation_ref, account_ref)
             if member is None:
                 raise PolicyCatalogError("BUDGET_MEMBER_NOT_FOUND")
             if member["state"] in ("published", "confirmed"):
                 receipt = json.loads(member["receipt_json"])
-                return {
+                result = {
                     "generation_ref": generation_ref,
                     "state": generation["state"],
                     "member": receipt,
                     "consumer_effective": False,
                 }
+                if observations:
+                    result["fx_observations"] = observations
+                return result
             if generation["state"] not in ("approved", "publishing"):
                 raise PolicyCatalogError("BUDGET_GENERATION_HELD")
             pool = self._db.execute(
@@ -1514,12 +1947,15 @@ class PolicyCatalogStore:
                 (stamp, generation_ref),
             )
             updated = self._budget_generation_row(generation_ref)
-            return {
+            result = {
                 "generation_ref": generation_ref,
                 "state": updated["state"],
                 "member": dict(receipt),
                 "consumer_effective": False,
             }
+            if observations:
+                result["fx_observations"] = observations
+            return result
 
     def confirm_budget_member(
         self,
@@ -1552,6 +1988,13 @@ class PolicyCatalogStore:
             if member["state"] == "rejected":
                 raise PolicyCatalogError("BUDGET_MEMBER_REJECTED")
             if member["state"] == "confirmed" and generation["state"] == "authority_ready":
+                # Even an idempotent confirmation read must not report a
+                # converted generation as current after its source fact has
+                # expired or changed. The durable authority/reservation stays
+                # intact; admission resolution independently rechecks it.
+                self._budget_generation_fx_observations(
+                    generation, check_source=True
+                )
                 return self._budget_generation_summary(generation)
             if generation["state"] not in (
                 "publishing",
@@ -1566,14 +2009,24 @@ class PolicyCatalogStore:
             else:
                 expected = json.loads(member["receipt_json"])
                 try:
-                    confirmed = confirmation_store.resolve(member["policy_ref"])
+                    self._budget_generation_fx_observations(
+                        generation, check_source=True
+                    )
                 except PolicyCatalogError as error:
                     failure = error.code
-                except sqlite3.Error:
-                    failure = "CONFIRMATION_STORE_UNAVAILABLE"
-                else:
-                    if any(confirmed.get(key) != value for key, value in expected.items()):
-                        failure = "CONFIRMED_RECEIPT_MISMATCH"
+                if failure is None:
+                    try:
+                        confirmed = confirmation_store.resolve(member["policy_ref"])
+                    except PolicyCatalogError as error:
+                        failure = error.code
+                    except sqlite3.Error:
+                        failure = "CONFIRMATION_STORE_UNAVAILABLE"
+                    else:
+                        if any(
+                            confirmed.get(key) != value
+                            for key, value in expected.items()
+                        ):
+                            failure = "CONFIRMED_RECEIPT_MISMATCH"
             if failure is not None:
                 self._db.execute(
                     "UPDATE policy_budget_members SET state='unknown' "
@@ -1902,6 +2355,9 @@ class PolicyCatalogStore:
                     or receipt != expected_receipt
                 ):
                     raise PolicyCatalogError("BUDGET_MEMBER_RECEIPT_MISMATCH")
+                fx_observations = self._budget_generation_fx_observations(
+                    generation, check_source=True
+                )
 
                 result = MappingProxyType(
                     {
@@ -1924,6 +2380,7 @@ class PolicyCatalogStore:
                         "max_increase_count": member["max_increase_count"],
                         "policy_ref": member["policy_ref"],
                         "policy_version": member["policy_digest"],
+                        "fx_observations": fx_observations,
                         "owner_principal": member["owner_principal"],
                         "owner_scope": MappingProxyType(
                             json.loads(member["owner_scope_json"])
@@ -2016,7 +2473,7 @@ class PolicyCatalogStore:
             }
             for member in self._budget_members(generation["generation_ref"])
         )
-        return {
+        result = {
             "generation_ref": generation["generation_ref"],
             "pool_ref": generation["pool_ref"],
             "portfolio_ref": generation["portfolio_ref"],
@@ -2035,6 +2492,10 @@ class PolicyCatalogStore:
             "members": members,
             "consumer_effective": False,
         }
+        fx_observations = self._budget_generation_fx_observations(generation)
+        if fx_observations:
+            result["fx_observations"] = fx_observations
+        return result
 
     @staticmethod
     def _receipt_payload(
