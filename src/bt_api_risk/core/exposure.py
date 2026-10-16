@@ -23,6 +23,8 @@ if TYPE_CHECKING:
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _UNIT = re.compile(r"^[A-Z][A-Z0-9]{2,11}$")
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$")
+_TRADE_ID_DOMAIN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$")
+_TRADE_ID_SCOPES = ("ACCOUNT", "INSTRUMENT")
 
 
 def _digest(value: object, name: str) -> str:
@@ -394,6 +396,11 @@ class OrderExposureObservationProof:
     writer_owner_id: str
     writer_fencing_token: int
     writer_fence_sha256: str
+    # Optional DIM01 identity-isolation declaration.  Both fields are declared
+    # together by trusted source metadata; ``None`` keeps the legacy semantics
+    # (no cross-permit trade-identity occupancy) and the legacy fingerprint.
+    trade_id_domain_ref: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+    trade_id_scope: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
 
     def __post_init__(self) -> None:
         from .admission import AccountScope
@@ -559,13 +566,30 @@ class OrderExposureObservationProof:
                 raise ValueError("valuation facts outlive their FX evidence")
             if self.leaves_quantity > 0 and self.leaves_valuation_price is None:
                 raise ValueError("open leaves require a source-backed valuation price")
+        if (self.trade_id_domain_ref is None) != (self.trade_id_scope is None):
+            raise ValueError(
+                "trade identity domain reference and scope must be supplied together"
+            )
+        if self.trade_id_domain_ref is not None:
+            if (
+                type(self.trade_id_domain_ref) is not str
+                or _TRADE_ID_DOMAIN.fullmatch(self.trade_id_domain_ref) is None
+            ):
+                raise ValueError("invalid trade_id_domain_ref")
+            if self.trade_id_scope not in _TRADE_ID_SCOPES:
+                raise ValueError("trade_id_scope must be ACCOUNT or INSTRUMENT")
 
     @property
     def fingerprint(self) -> str:
         values: dict[str, object] = {}
+        legacy_identity_keys = {"trade_id_domain_ref", "trade_id_scope"}
         for name in self.__dataclass_fields__:
             value = getattr(self, name)
-            if name == "scope":
+            if name in legacy_identity_keys:
+                if self.trade_id_domain_ref is None:
+                    continue
+                values[name] = value
+            elif name == "scope":
                 values["scope_key"] = value.key
             elif isinstance(value, Decimal):
                 values[name] = _decimal_text(value)

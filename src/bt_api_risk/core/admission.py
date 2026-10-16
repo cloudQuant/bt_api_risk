@@ -4693,6 +4693,37 @@ class DurableRiskGate:
                 has_other_active_freezes=other_active is not None,
             )
 
+    def latch_dispatch_identity_conflict(self, permit_id: str) -> bool:
+        """Keep one exact dispatch latch active but stop it gating new increases.
+
+        A definitive provider identity conflict (a reused trade or provider
+        order identity, an unmapped legacy fill, or a contradicting declared
+        scope mode) leaves the dispatched order uncreditable while its claim
+        latch stays valid evidence.  Such a conflict is accounted, not a
+        pending unknown outcome, so it must not wedge the account scope for
+        later risk-increasing intents.  This converts only the exact active
+        latch of one dispatch claim into the non-blocking state and never
+        writes a resolution row.
+        """
+        if type(permit_id) is not str or not permit_id or permit_id != permit_id.strip():
+            return False
+        with self._transaction() as connection:
+            claim = connection.execute(
+                "SELECT scope_key, cause_id FROM risk_dispatch_claims WHERE permit_id = ?",
+                (permit_id,),
+            ).fetchone()
+            if claim is None:
+                return False
+            self._ensure_policy_binding(connection, str(claim["scope_key"]))
+            updated = connection.execute(
+                """
+                UPDATE risk_freezes SET blocking = 0, updated_at = ?
+                WHERE scope_key = ? AND cause_id = ? AND active = 1 AND blocking = 1
+                """,
+                (self._clock(), str(claim["scope_key"]), str(claim["cause_id"])),
+            )
+            return updated.rowcount == 1
+
     @staticmethod
     def _assert_cancel_dispatch_proof_matches_claim(
         proof: CancelDispatchResolutionProof, claim: DispatchClaimBinding
@@ -5242,8 +5273,8 @@ class DurableRiskGate:
                             proof.fingerprint,
                             observation.fingerprint,
                             observation.state.value,
-                            _decimal_text(observation.requested_quantity),
-                            _decimal_text(observation.cumulative_filled_quantity),
+                            _canonical_decimal_text(observation.requested_quantity),
+                            _canonical_decimal_text(observation.cumulative_filled_quantity),
                             observation.fill_trade_count,
                             observation.fill_ids_sha256,
                             observation.order_revision,
@@ -5469,8 +5500,8 @@ class DurableRiskGate:
             and proof_sha256 == str(exposure["dispatch_proof_sha256"])
             and exposure_proof_sha256 == str(exposure["proof_sha256"])
             and final_state.value == exposure["state"]
-            and _decimal_text(requested) == exposure["requested_quantity"]
-            and _decimal_text(filled) == exposure["cumulative_filled_quantity"]
+            and _canonical_decimal_text(requested) == exposure["requested_quantity"]
+            and _canonical_decimal_text(filled) == exposure["cumulative_filled_quantity"]
             and Decimal(0) == _as_decimal(exposure["leaves_quantity"])
             and trade_count == int(exposure["fill_trade_count"])
             and fill_ids_sha == str(exposure["fill_ids_sha256"])
@@ -5916,10 +5947,11 @@ class DurableRiskGate:
                     )
 
     def active_freeze_reasons(self, scope: AccountScope) -> list[str]:
-        """Return current independent freeze causes for the scope."""
+        """Return current independent freeze causes that gate the scope."""
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT reason FROM risk_freezes WHERE scope_key = ? AND active = 1 ORDER BY cause_id",
+                "SELECT reason FROM risk_freezes "
+                "WHERE scope_key = ? AND active = 1 AND blocking = 1 ORDER BY cause_id",
                 (scope.key,),
             ).fetchall()
         return [str(row["reason"]) for row in rows]
@@ -7074,10 +7106,11 @@ class DurableRiskGate:
         return all(
             (
                 prior["state"] == proof.state.value,
-                prior["requested_quantity"] == _decimal_text(proof.requested_quantity),
+                prior["requested_quantity"]
+                == _canonical_decimal_text(proof.requested_quantity),
                 prior["cumulative_filled_quantity"]
-                == _decimal_text(proof.cumulative_filled_quantity),
-                prior["leaves_quantity"] == _decimal_text(proof.leaves_quantity),
+                == _canonical_decimal_text(proof.cumulative_filled_quantity),
+                prior["leaves_quantity"] == _canonical_decimal_text(proof.leaves_quantity),
                 int(prior["fill_trade_count"]) == proof.fill_trade_count,
                 prior["fill_ids_sha256"] == proof.fill_ids_sha256,
             )
@@ -7103,7 +7136,7 @@ class DurableRiskGate:
             ("position_effect", proof.position_effect),
             ("instrument_id", proof.instrument_id),
             ("instrument_version", proof.instrument_version),
-            ("instrument_multiplier", _decimal_text(proof.instrument_multiplier)),
+            ("instrument_multiplier", _canonical_decimal_text(proof.instrument_multiplier)),
             ("quote_currency", proof.quote_currency),
             ("valuation_unit", proof.valuation_unit),
             ("instrument_metadata_sha256", proof.instrument_metadata_sha256),
@@ -7152,10 +7185,10 @@ class DurableRiskGate:
                     "a previously accepted immutable fill is missing or changed",
                 )
 
-    @staticmethod
     def _persist_order_fill_facts(
-        connection: sqlite3.Connection, proof: OrderExposureObservationProof
+        self, connection: sqlite3.Connection, proof: OrderExposureObservationProof
     ) -> None:
+        self._occupy_trade_identities(connection, proof)
         for fact in proof.fills:
             connection.execute(
                 """INSERT OR IGNORE INTO risk_order_exposure_fills (
@@ -7167,11 +7200,11 @@ class DurableRiskGate:
                     proof.permit_id,
                     fact.trade_id,
                     fact.fingerprint,
-                    _decimal_text(fact.quantity),
-                    _decimal_text(fact.price),
+                    _canonical_decimal_text(fact.quantity),
+                    _canonical_decimal_text(fact.price),
                     fact.side,
                     fact.position_effect,
-                    _decimal_text(fact.fee_amount),
+                    _canonical_decimal_text(fact.fee_amount),
                     fact.fee_currency,
                     fact.source_record_sha256,
                     fact.source_revision,
@@ -7184,11 +7217,11 @@ class DurableRiskGate:
             assert stored is not None
             expected = (
                 fact.fingerprint,
-                _decimal_text(fact.quantity),
-                _decimal_text(fact.price),
+                _canonical_decimal_text(fact.quantity),
+                _canonical_decimal_text(fact.price),
                 fact.side,
                 fact.position_effect,
-                _decimal_text(fact.fee_amount),
+                _canonical_decimal_text(fact.fee_amount),
                 fact.fee_currency,
                 fact.source_record_sha256,
                 fact.source_revision,
@@ -7209,6 +7242,97 @@ class DurableRiskGate:
                     "ORDER_EXPOSURE_FILL_IDENTITY_CONFLICT",
                     "fill identity was reused with different immutable facts",
                 )
+
+    def _occupy_trade_identities(
+        self, connection: sqlite3.Connection, proof: OrderExposureObservationProof
+    ) -> None:
+        """Atomically claim declared DIM01 trade identities for this permit.
+
+        This runs inside the same transaction as the fill persistence of both
+        the incremental post-ACK path and the terminal first-fill path.  A
+        proof that declares no identity domain keeps the legacy semantics.  A
+        declared domain fixes its scope mode on first use, every fill identity
+        is claimed at most once with immutable content, and legacy fill rows
+        without a trusted domain mapping refuse the new claim instead of
+        guessing a domain or picking a winner.
+        """
+
+        domain_ref = proof.trade_id_domain_ref
+        if domain_ref is None:
+            return
+        identity_scope = "" if proof.trade_id_scope == "ACCOUNT" else proof.instrument_id
+        bound = connection.execute(
+            "SELECT trade_id_scope, scope_key FROM risk_trade_identity_domains "
+            "WHERE trade_id_domain_ref = ?",
+            (domain_ref,),
+        ).fetchone()
+        if bound is None:
+            connection.execute(
+                "INSERT INTO risk_trade_identity_domains "
+                "(trade_id_domain_ref, trade_id_scope, scope_key, bound_at) "
+                "VALUES (?, ?, ?, ?)",
+                (domain_ref, proof.trade_id_scope, proof.scope.key, self._clock()),
+            )
+        else:
+            if str(bound["trade_id_scope"]) != proof.trade_id_scope:
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_TRADE_IDENTITY_MODE_MISMATCH",
+                    "the trade identity domain is already fixed to another scope mode",
+                )
+            if str(bound["scope_key"]) != proof.scope.key:
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_TRADE_IDENTITY_DOMAIN_REUSED",
+                    "the trade identity domain is already bound to another account scope",
+                )
+        for fact in proof.fills:
+            claim = connection.execute(
+                "SELECT * FROM risk_trade_identity_claims "
+                "WHERE trade_id_domain_ref = ? AND identity_scope = ? AND trade_id = ?",
+                (domain_ref, identity_scope, fact.trade_id),
+            ).fetchone()
+            if claim is not None:
+                if (
+                    str(claim["permit_id"]) != proof.permit_id
+                    or str(claim["scope_key"]) != proof.scope.key
+                    or str(claim["fact_sha256"]) != fact.fingerprint
+                ):
+                    raise RiskDeniedError(
+                        "ORDER_EXPOSURE_TRADE_IDENTITY_CONFLICT",
+                        "the declared trade identity is already occupied by other facts",
+                    )
+                continue
+            legacy = connection.execute(
+                "SELECT fill.permit_id FROM risk_order_exposure_fills AS fill "
+                "JOIN risk_order_exposures AS exposure USING (permit_id) "
+                "WHERE fill.trade_id = ? AND fill.permit_id != ? "
+                "AND exposure.scope_key = ? "
+                "AND NOT EXISTS ("
+                "SELECT 1 FROM risk_trade_identity_claims AS claim "
+                "WHERE claim.permit_id = fill.permit_id AND claim.trade_id = fill.trade_id"
+                ") LIMIT 1",
+                (fact.trade_id, proof.permit_id, proof.scope.key),
+            ).fetchone()
+            if legacy is not None:
+                raise RiskDeniedError(
+                    "ORDER_EXPOSURE_TRADE_IDENTITY_UNMAPPED",
+                    "a legacy fill identity has no trusted trade identity domain mapping",
+                )
+            connection.execute(
+                "INSERT INTO risk_trade_identity_claims ("
+                "trade_id_domain_ref, identity_scope, trade_id, scope_key, "
+                "permit_id, instrument_id, fact_sha256, claimed_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    domain_ref,
+                    identity_scope,
+                    fact.trade_id,
+                    proof.scope.key,
+                    proof.permit_id,
+                    proof.instrument_id,
+                    fact.fingerprint,
+                    self._clock(),
+                ),
+            )
 
     @staticmethod
     def _dispatch_latch_active(
@@ -7395,16 +7519,16 @@ class DurableRiskGate:
             "source_alias_map_sha256": proof.source_alias_map_sha256,
             "proof_sha256": proof.fingerprint,
             "state": proof.state.value,
-            "requested_quantity": _decimal_text(requested),
-            "cumulative_filled_quantity": _decimal_text(filled_quantity),
-            "leaves_quantity": _decimal_text(leaves_quantity),
+            "requested_quantity": _canonical_decimal_text(requested),
+            "cumulative_filled_quantity": _canonical_decimal_text(filled_quantity),
+            "leaves_quantity": _canonical_decimal_text(leaves_quantity),
             "leaves_valuation_price": (
                 None
                 if proof.leaves_valuation_price is None
-                else _decimal_text(proof.leaves_valuation_price)
+                else _canonical_decimal_text(proof.leaves_valuation_price)
             ),
-            "filled_gross_notional": _decimal_text(filled_gross),
-            "open_gross_notional": _decimal_text(open_gross),
+            "filled_gross_notional": _canonical_decimal_text(filled_gross),
+            "open_gross_notional": _canonical_decimal_text(open_gross),
             "notional_unit": proof.notional_unit,
             "complete_order_snapshot": int(proof.complete_order_snapshot),
             "complete_fill_history": int(proof.complete_fill_history),
@@ -7421,7 +7545,7 @@ class DurableRiskGate:
             "position_effect": proof.position_effect,
             "instrument_id": proof.instrument_id,
             "instrument_version": proof.instrument_version,
-            "instrument_multiplier": _decimal_text(proof.instrument_multiplier),
+            "instrument_multiplier": _canonical_decimal_text(proof.instrument_multiplier),
             "quote_currency": proof.quote_currency,
             "valuation_unit": proof.valuation_unit,
             "instrument_metadata_sha256": proof.instrument_metadata_sha256,
@@ -7445,7 +7569,7 @@ class DurableRiskGate:
                 else str(prior["fill_ids_sha256"])
             ),
             "fx_pair": proof.fx_pair,
-            "fx_rate": None if proof.fx_rate is None else _decimal_text(proof.fx_rate),
+            "fx_rate": None if proof.fx_rate is None else _canonical_decimal_text(proof.fx_rate),
             "fx_observed_at_ns": proof.fx_observed_at_ns,
             "fx_valid_until_ns": proof.fx_valid_until_ns,
             "observed_at_ns": proof.observed_at_ns,
@@ -8072,17 +8196,19 @@ class DurableRiskGate:
     ) -> None:
         connection.execute(
             """
-            INSERT INTO risk_freezes (scope_key, cause_id, reason, active, updated_at)
-            VALUES (?, ?, ?, 1, ?)
+            INSERT INTO risk_freezes (scope_key, cause_id, reason, active, blocking, updated_at)
+            VALUES (?, ?, ?, 1, 1, ?)
             ON CONFLICT(scope_key, cause_id) DO UPDATE SET
-                reason = excluded.reason, active = 1, updated_at = excluded.updated_at
+                reason = excluded.reason, active = 1, blocking = 1,
+                updated_at = excluded.updated_at
             """,
             (scope.key, cause_id, reason, updated_at),
         )
 
     def _freeze_reasons(self, connection: sqlite3.Connection, scope: AccountScope) -> list[str]:
         rows = connection.execute(
-            "SELECT reason FROM risk_freezes WHERE scope_key = ? AND active = 1 ORDER BY cause_id",
+            "SELECT reason FROM risk_freezes "
+            "WHERE scope_key = ? AND active = 1 AND blocking = 1 ORDER BY cause_id",
             (scope.key,),
         ).fetchall()
         return [str(row["reason"]) for row in rows]
@@ -8197,6 +8323,7 @@ class DurableRiskGate:
                     cause_id TEXT NOT NULL,
                     reason TEXT NOT NULL,
                     active INTEGER NOT NULL,
+                    blocking INTEGER NOT NULL DEFAULT 1,
                     updated_at REAL NOT NULL,
                     PRIMARY KEY(scope_key, cause_id)
                 );
@@ -8489,10 +8616,59 @@ class DurableRiskGate:
                 BEGIN
                     SELECT RAISE(ABORT, 'order exposure fill facts are immutable');
                 END;
+                CREATE TABLE IF NOT EXISTS risk_trade_identity_domains (
+                    trade_id_domain_ref TEXT PRIMARY KEY,
+                    trade_id_scope TEXT NOT NULL
+                        CHECK(trade_id_scope IN ('ACCOUNT', 'INSTRUMENT')),
+                    scope_key TEXT NOT NULL,
+                    bound_at INTEGER NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS risk_trade_identity_claims (
+                    trade_id_domain_ref TEXT NOT NULL,
+                    identity_scope TEXT NOT NULL,
+                    trade_id TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    permit_id TEXT NOT NULL,
+                    instrument_id TEXT NOT NULL,
+                    fact_sha256 TEXT NOT NULL,
+                    claimed_at INTEGER NOT NULL,
+                    PRIMARY KEY(trade_id_domain_ref, identity_scope, trade_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS risk_trade_identity_domains_immutable_update
+                BEFORE UPDATE ON risk_trade_identity_domains
+                BEGIN
+                    SELECT RAISE(ABORT, 'trade identity domain bindings are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS risk_trade_identity_domains_immutable_delete
+                BEFORE DELETE ON risk_trade_identity_domains
+                BEGIN
+                    SELECT RAISE(ABORT, 'trade identity domain bindings are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS risk_trade_identity_claims_immutable_update
+                BEFORE UPDATE ON risk_trade_identity_claims
+                BEGIN
+                    SELECT RAISE(ABORT, 'trade identity claims are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS risk_trade_identity_claims_immutable_delete
+                BEFORE DELETE ON risk_trade_identity_claims
+                BEGIN
+                    SELECT RAISE(ABORT, 'trade identity claims are immutable');
+                END;
                 CREATE INDEX IF NOT EXISTS idx_risk_order_exposures_scope
                     ON risk_order_exposures(scope_key, state, journal_revision);
                 """
             )
+            freeze_columns = {
+                str(row["name"])
+                for row in connection.execute("PRAGMA table_info(risk_freezes)").fetchall()
+            }
+            if "blocking" not in freeze_columns:
+                # Existing dispatch latches keep gating new increases; only an
+                # explicit identity-conflict latch converts one to the exact
+                # active-but-non-blocking recovery state.
+                connection.execute(
+                    "ALTER TABLE risk_freezes ADD COLUMN blocking INTEGER NOT NULL DEFAULT 1"
+                )
             dispatch_resolution_columns = {
                 str(row["name"])
                 for row in connection.execute(
@@ -8878,6 +9054,24 @@ def _decimal_upper_bound_from_fraction(value: Fraction, *, places: int = 28) -> 
 
 def _decimal_text(value: Decimal) -> str:
     return format(value, "f")
+
+
+def _canonical_decimal_text(value: Decimal) -> str:
+    """Render a persisted exposure fact without insignificant trailing zeros.
+
+    Fingerprint payloads keep the scale-preserving ``_decimal_text`` spelling
+    byte for byte.  The materialized exposure/fill/resolution tables instead
+    publish the canonical text the journal and receipts already use, so one
+    stored fact reads back identically no matter which decimal scale the
+    arithmetic that produced it happened to carry.
+    """
+
+    if value == 0:
+        return "0"
+    result = format(value, "f")
+    if "." in result:
+        result = result.rstrip("0").rstrip(".")
+    return result
 
 
 def _canonical_json(value: object) -> str:
