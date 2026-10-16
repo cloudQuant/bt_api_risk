@@ -5541,8 +5541,11 @@ class DurableRiskGate:
         live_gross = self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS
         with self._transaction() as connection:
             self._assert_current_instrument_facts(intent, invalid=True)
-            if live_gross:
-                now = self._clock()
+            # BEGIN IMMEDIATE can wait behind another process. Refresh the
+            # clock after the lock is acquired for every accounting mode so a
+            # permit cannot become usable solely because the lock wait was
+            # excluded from its TTL check.
+            now = self._clock()
             reservation_row = connection.execute(
                 "SELECT group_id FROM risk_reservations WHERE permit_id = ?", (permit_id,)
             ).fetchone()
@@ -5597,6 +5600,18 @@ class DurableRiskGate:
                     self._assert_not_frozen(connection, permit.scope)
                     self._assert_live_gross_limits(connection, intent, include_intent=False)
             self._assert_current_instrument_facts(intent, invalid=True)
+            if permit.action is IntentAction.CANCEL:
+                # Quota or SQLite waits can consume the entire cancellation
+                # permit TTL. Revalidate immediately before persisting the
+                # single-use dispatch claim; a stale permit must leave no
+                # claim or dispatch freeze behind.
+                now = self._clock()
+                self._expire_active(connection, now)
+                permit = self._validate_active_permit(connection, permit_id, intent)
+                if permit.expires_at <= now:
+                    raise PermitInvalidError(
+                        "PERMIT_NOT_ACTIVE", "cancel permit expired before dispatch claim"
+                    )
             connection.execute(
                 """
                 INSERT INTO risk_dispatch_claims (
@@ -5614,12 +5629,15 @@ class DurableRiskGate:
             )
             self._freeze_in_transaction(connection, permit.scope, cause_id, cause_id, now)
             self._assert_current_instrument_facts(intent, invalid=True)
-            if live_gross and permit.action is IntentAction.INCREASE:
+            if permit.action is IntentAction.CANCEL or (
+                live_gross and permit.action is IntentAction.INCREASE
+            ):
                 commit_now = self._clock()
                 if permit.expires_at <= commit_now:
                     raise PermitInvalidError(
                         "PERMIT_NOT_ACTIVE", "permit expired before dispatch claim committed"
                     )
+            if live_gross and permit.action is IntentAction.INCREASE:
                 self._assert_live_gross_limits(connection, intent, include_intent=False)
             # The LIVE_GROSS scan can take long enough for the instrument or
             # FX interval to expire.  Keep this check at the end of the write
