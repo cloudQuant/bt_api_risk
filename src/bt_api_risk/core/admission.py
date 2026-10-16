@@ -427,6 +427,32 @@ class StrategyAllocationSnapshot:
     reason: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
 
 
+@dataclass(frozen=True)
+class ClosablePositionSnapshot:
+    """Immutable local-ledger view of one strategy's declared closable quantity.
+
+    ``declared_quantity`` is the account owner's statement of how much of the
+    account's real closable position on one instrument this strategy owns.
+    ``used_quantity`` sums this package's own ACTIVE and SETTLED bound-close
+    reservations for the exact ``(account, instrument, strategy)`` key.  This
+    is not provider position, position-mode, or close-effect evidence, and it
+    expresses only the net attribution model.
+    """
+
+    scope: AccountScope
+    instrument: str
+    strategy_id: str
+    revision: Optional[str]  # noqa: UP045 -- Python 3.9 is supported.
+    declared_quantity: Optional[Decimal]  # noqa: UP045 -- Python 3.9 is supported.
+    used_quantity: Optional[Decimal]  # noqa: UP045 -- Python 3.9 is supported.
+    available_quantity: Optional[Decimal]  # noqa: UP045 -- Python 3.9 is supported.
+    quantity_unit: Optional[str]  # noqa: UP045 -- Python 3.9 is supported.
+    as_of: float
+    source: str = field(default="local_closable_position_ledger", init=False)
+    completeness: str = "LOCAL_LEDGER_COMPLETE"
+    reason: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+
+
 class FreezeResolutionStatus(str, Enum):
     """Result of resolving one exact ordinary freeze cause."""
 
@@ -2543,6 +2569,188 @@ class DurableRiskGate:
                 ),
             )
 
+    def set_closable_position(
+        self,
+        scope: AccountScope,
+        instrument: str,
+        strategy_id: str,
+        allocation_version: str,
+        *,
+        closable_quantity: Decimal,
+        quantity_unit: str,
+    ) -> None:
+        """Install the owner-declared closable quantity for one strategy key.
+
+        This is a local attribution seam, not an authenticated position
+        authority: the account owner states how much of the account's real
+        closable position on ``instrument`` this strategy owns, and only
+        bound close reservations consume it.  One key exists per
+        ``(account, instrument, strategy)``, which is the net model; the
+        declaration never reads a provider position, never distributes one
+        strategy's share to another key, and never widens account control.
+        Versions are immutable and cannot be replayed once a later version
+        replaced them.  A revision gates future reservations only;
+        outstanding reservations keep their face-value occupation, released
+        and expired reservations return credit, and settled ones stay
+        consumed.
+        """
+
+        if not isinstance(scope, AccountScope):
+            raise ValueError("scope must be an AccountScope")
+        if type(instrument) is not str or not _ALLOCATION_INSTRUMENT.fullmatch(instrument):
+            raise ValueError("invalid instrument")
+        if type(strategy_id) is not str or not _ALLOCATION_ID.fullmatch(strategy_id):
+            raise ValueError("invalid strategy_id")
+        if type(allocation_version) is not str or not _ALLOCATION_ID.fullmatch(allocation_version):
+            raise ValueError("invalid allocation_version")
+        if type(quantity_unit) is not str or not _ALLOCATION_ID.fullmatch(quantity_unit):
+            raise ValueError("invalid quantity_unit")
+        try:
+            normalized_quantity = _as_decimal(closable_quantity)
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("closable_quantity must be a non-negative finite decimal") from exc
+        if normalized_quantity < Decimal("0"):
+            raise ValueError("closable_quantity must be a non-negative finite decimal")
+
+        now = self._clock()
+        with self._transaction() as connection:
+            self._ensure_policy_binding(connection, scope.key)
+            current = connection.execute(
+                """SELECT * FROM risk_closable_positions
+                   WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
+                (scope.key, instrument, strategy_id),
+            ).fetchone()
+            if current is not None and current["allocation_version"] == allocation_version:
+                same_facts = (
+                    current["closable_quantity"] == _decimal_text(normalized_quantity)
+                    and current["quantity_unit"] == quantity_unit
+                )
+                if same_facts:
+                    return
+                raise ValueError("closable position version cannot be reused with changed facts")
+            prior_version = connection.execute(
+                """SELECT 1 FROM risk_closable_position_versions
+                   WHERE scope_key = ? AND instrument = ? AND strategy_id = ?
+                     AND allocation_version = ?""",
+                (scope.key, instrument, strategy_id, allocation_version),
+            ).fetchone()
+            if prior_version is not None:
+                raise ValueError("closable position version cannot be reused")
+
+            connection.execute(
+                """INSERT INTO risk_closable_position_versions (
+                       scope_key, instrument, strategy_id, allocation_version,
+                       closable_quantity, quantity_unit, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    scope.key,
+                    instrument,
+                    strategy_id,
+                    allocation_version,
+                    _decimal_text(normalized_quantity),
+                    quantity_unit,
+                    now,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO risk_closable_positions (
+                       scope_key, instrument, strategy_id, allocation_version,
+                       closable_quantity, quantity_unit, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(scope_key, instrument, strategy_id) DO UPDATE SET
+                       allocation_version = excluded.allocation_version,
+                       closable_quantity = excluded.closable_quantity,
+                       quantity_unit = excluded.quantity_unit,
+                       updated_at = excluded.updated_at""",
+                (
+                    scope.key,
+                    instrument,
+                    strategy_id,
+                    allocation_version,
+                    _decimal_text(normalized_quantity),
+                    quantity_unit,
+                    now,
+                ),
+            )
+
+    def get_closable_position(
+        self, scope: AccountScope, instrument: str, strategy_id: str
+    ) -> ClosablePositionSnapshot:
+        """Read one declared closable quantity and its local attribution ledger.
+
+        ``used_quantity`` sums this package's ACTIVE and SETTLED bound-close
+        reservations for the exact key; released and expired reservations do
+        not occupy.  The read never expires reservations and never mutates
+        any state.  It is not provider position, account, or close-effect
+        evidence, and it expresses only the net model.
+        """
+
+        if not isinstance(scope, AccountScope):
+            raise ValueError("scope must be an AccountScope")
+        if type(instrument) is not str or not _ALLOCATION_INSTRUMENT.fullmatch(instrument):
+            raise ValueError("invalid instrument")
+        if type(strategy_id) is not str or not _ALLOCATION_ID.fullmatch(strategy_id):
+            raise ValueError("invalid strategy_id")
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            try:
+                declaration = connection.execute(
+                    """SELECT * FROM risk_closable_positions
+                       WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
+                    (scope.key, instrument, strategy_id),
+                ).fetchone()
+                if declaration is None:
+                    raise RiskDeniedError(
+                        "CLOSE_POSITION_UNCONFIGURED",
+                        "strategy has no declared closable position on this instrument",
+                    )
+                rows = connection.execute(
+                    """SELECT quantity, quantity_unit FROM risk_reservations
+                       WHERE scope_key = ? AND strategy_id = ? AND instrument = ?
+                         AND action = ? AND status IN (?, ?)
+                         AND close_position_version IS NOT NULL""",
+                    (
+                        scope.key,
+                        strategy_id,
+                        instrument,
+                        IntentAction.REDUCE.value,
+                        self._ACTIVE,
+                        self._SETTLED,
+                    ),
+                ).fetchall()
+                as_of = float(self._clock())
+                connection.execute("COMMIT")
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+        declared = _as_decimal(declaration["closable_quantity"])
+        unit = str(declaration["quantity_unit"])
+        used: Optional[Decimal] = None  # noqa: UP045 -- Python 3.9 is supported.
+        available: Optional[Decimal] = None  # noqa: UP045 -- Python 3.9 is supported.
+        completeness = "LOCAL_LEDGER_COMPLETE"
+        reason = None
+        if all(row["quantity"] is not None and row["quantity_unit"] == unit for row in rows):
+            used = _sum_decimal_exact(_as_decimal(row["quantity"]) for row in rows)
+            available = _decimal_from_fraction(
+                max(Fraction(0), Fraction(declared) - Fraction(used))
+            )
+        else:
+            completeness = "LOCAL_LEDGER_INCOMPLETE"
+            reason = "CLOSE_POSITION_USAGE_UNAVAILABLE"
+        return ClosablePositionSnapshot(
+            scope=scope,
+            instrument=instrument,
+            strategy_id=strategy_id,
+            revision=str(declaration["allocation_version"]),
+            declared_quantity=declared,
+            used_quantity=used,
+            available_quantity=available,
+            quantity_unit=unit,
+            as_of=as_of,
+            completeness=completeness,
+            reason=reason,
+        )
+
     def reserve(self, intent: RiskIntent) -> RiskPermit:
         """Atomically reserve an account-scoped permit for ``intent``.
 
@@ -2590,14 +2798,18 @@ class DurableRiskGate:
                     "UNKNOWN_EFFECT",
                     "intents with unknown effect are not eligible for admission",
                 )
+            close_position_version = None
             if intent.action is IntentAction.INCREASE:
                 self._assert_not_frozen(connection, intent.scope)
                 self._assert_intent_notional_unit(intent)
                 self._assert_increase_limit(connection, intent)
                 self._assert_strategy_allocation_limit(connection, intent)
                 self._assert_margin_pool_limit(connection, intent)
+                self._assert_self_trade_absent(connection, intent)
                 if live_gross:
                     self._assert_live_gross_limits(connection, intent)
+            elif intent.action is IntentAction.REDUCE:
+                close_position_version = self._assert_closable_position(connection, intent)
 
             generation = self._next_generation(connection, intent.scope.key)
             permit = RiskPermit(
@@ -2626,9 +2838,10 @@ class DurableRiskGate:
                     strategy_id, allocation_version, instrument, quantity, quantity_unit,
                     notional_unit, group_id, group_fingerprint, group_leg_id,
                     group_deadline_ns, group_expires_at_ns, group_leg_count,
-                    group_exposure_profile_fingerprint, resource_product_type, resource_margin_pool
+                    group_exposure_profile_fingerprint, resource_product_type, resource_margin_pool,
+                    close_position_version
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?,
-                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?)
                 """,
                 (
                     permit.permit_id,
@@ -2653,6 +2866,7 @@ class DurableRiskGate:
                     permit.notional_unit,
                     None if intent.resource is None else intent.resource.product_type,
                     None if intent.resource is None else intent.resource.margin_pool,
+                    close_position_version,
                 ),
             )
             if live_gross and intent.action is IntentAction.INCREASE:
@@ -2823,6 +3037,7 @@ class DurableRiskGate:
                 self._assert_increase_limit(connection, intent)
                 self._assert_strategy_allocation_limit(connection, intent)
                 self._assert_margin_pool_limit(connection, intent)
+                self._assert_self_trade_absent(connection, intent)
                 if live_gross:
                     self._assert_live_gross_limits(connection, intent)
                 generation = self._next_generation(connection, scope.key)
@@ -2852,9 +3067,9 @@ class DurableRiskGate:
                            group_fingerprint, group_leg_id, group_deadline_ns,
                            group_expires_at_ns, group_leg_count,
                            group_exposure_profile_fingerprint,
-                           resource_product_type, resource_margin_pool
+                           resource_product_type, resource_margin_pool, close_position_version
                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?,
-                                 ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                                 ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         permit.permit_id,
                         permit.intent_id,
@@ -2885,6 +3100,7 @@ class DurableRiskGate:
                         intent.exposure_profile_fingerprint,
                         None if intent.resource is None else intent.resource.product_type,
                         None if intent.resource is None else intent.resource.margin_pool,
+                        None,
                     ),
                 )
             commit_now_ns = self._now_ns()
@@ -3168,6 +3384,65 @@ class DurableRiskGate:
                 (scope.key, group_id),
             ).fetchall()
             return self._group_receipt_in_transaction(connection, scope, group_id, rows)
+
+    def release_strategy_unclaimed(
+        self, scope: AccountScope, strategy_id: str, reason: str
+    ) -> tuple[str, ...]:
+        """Release exactly this strategy's ACTIVE, never-claimed reservations.
+
+        One account can host several strategies; a strategy-level batch
+        cancel must never reach another strategy's rows, and it must never
+        pretend an in-flight order was cancelled.  A claimed member that has
+        not been resolved keeps the whole batch fail-closed, mirroring the
+        group discipline, and this operation only transitions local
+        reservations: it sends no order, flattens no position, and grants no
+        new account control.  Returns the released permit IDs in sorted
+        order.
+        """
+
+        if not isinstance(scope, AccountScope):
+            raise ValueError("scope must be an AccountScope")
+        if type(strategy_id) is not str or not _ALLOCATION_ID.fullmatch(strategy_id):
+            raise ValueError("invalid strategy_id")
+        if type(reason) is not str or not reason.strip():
+            raise ValueError("release reason is required")
+        with self._transaction() as connection:
+            now = self._clock()
+            self._ensure_policy_binding(connection, scope.key)
+            self._expire_active(connection, now)
+            active_rows = connection.execute(
+                """SELECT permit_id FROM risk_reservations
+                   WHERE scope_key = ? AND strategy_id = ? AND status = ?
+                   ORDER BY permit_id""",
+                (scope.key, strategy_id, self._ACTIVE),
+            ).fetchall()
+            if not active_rows:
+                return ()
+            unresolved = connection.execute(
+                """SELECT 1 FROM risk_reservations
+                   WHERE scope_key = ? AND strategy_id = ? AND status = ?
+                     AND EXISTS (
+                       SELECT 1 FROM risk_dispatch_claims
+                       WHERE risk_dispatch_claims.permit_id = risk_reservations.permit_id
+                     )
+                   LIMIT 1""",
+                (scope.key, strategy_id, self._ACTIVE),
+            ).fetchone()
+            if unresolved is not None:
+                raise RiskDeniedError(
+                    "STRATEGY_CLAIM_UNRESOLVED",
+                    "a claimed strategy permit is unresolved; the batch cannot release",
+                )
+            connection.execute(
+                """UPDATE risk_reservations SET status = ?, reason = ?
+                   WHERE scope_key = ? AND strategy_id = ? AND status = ?
+                     AND NOT EXISTS (
+                       SELECT 1 FROM risk_dispatch_claims
+                       WHERE risk_dispatch_claims.permit_id = risk_reservations.permit_id
+                     )""",
+                (self._RELEASED, reason, scope.key, strategy_id, self._ACTIVE),
+            )
+            return tuple(str(row["permit_id"]) for row in active_rows)
 
     def claim_group_leg(
         self,
@@ -7970,6 +8245,132 @@ class DurableRiskGate:
                 "margin-pool increase notional limit exceeded",
             )
 
+    @staticmethod
+    def _is_bound_close_intent(intent: RiskIntent) -> bool:
+        """Return True for a REDUCE carrying the full close attribution binding."""
+
+        return (
+            intent.action is IntentAction.REDUCE
+            and intent.strategy_id is not None
+            and intent.instrument is not None
+            and intent.quantity is not None
+            and intent.quantity_unit is not None
+        )
+
+    def _assert_closable_position(
+        self, connection: sqlite3.Connection, intent: RiskIntent
+    ) -> Optional[str]:  # noqa: UP045 -- Python 3.9 is supported.
+        """Enforce the declared per-strategy closable quantity for a bound close.
+
+        Only REDUCE intents that carry the full attribution binding
+        (strategy, instrument, quantity, unit) participate; partial or
+        unbound reduces keep their established behavior untouched.  Usage
+        sums every ACTIVE and SETTLED bound-close reservation of the same
+        account and instrument at its exact reserved quantity, so a settled
+        late fill stays consumed and a sibling strategy can never reach this
+        strategy's declared share.  The check shares the caller's
+        ``BEGIN IMMEDIATE`` transaction, so concurrent contenders are
+        accounted atomically before any insert commits.  Returns the
+        declaration version that authorized the reservation for durable
+        attribution.
+        """
+
+        if not self._is_bound_close_intent(intent):
+            return None
+        self._assert_self_trade_absent(connection, intent)
+        declaration = connection.execute(
+            """SELECT allocation_version, closable_quantity, quantity_unit
+               FROM risk_closable_positions
+               WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
+            (intent.scope.key, intent.instrument, intent.strategy_id),
+        ).fetchone()
+        if declaration is None:
+            raise RiskDeniedError(
+                "CLOSE_POSITION_UNCONFIGURED",
+                "bound close has no declared closable position for its strategy and instrument",
+            )
+        if intent.quantity_unit != declaration["quantity_unit"]:
+            raise RiskDeniedError(
+                "CLOSE_POSITION_UNIT_MISMATCH",
+                "intent quantity unit does not match the declared closable position",
+            )
+        rows = connection.execute(
+            """SELECT quantity, quantity_unit FROM risk_reservations
+               WHERE scope_key = ? AND strategy_id = ? AND instrument = ?
+                 AND action = ? AND status IN (?, ?)
+                 AND close_position_version IS NOT NULL""",
+            (
+                intent.scope.key,
+                intent.strategy_id,
+                intent.instrument,
+                IntentAction.REDUCE.value,
+                self._ACTIVE,
+                self._SETTLED,
+            ),
+        ).fetchall()
+        if any(
+            row["quantity"] is None or row["quantity_unit"] != declaration["quantity_unit"]
+            for row in rows
+        ):
+            raise RiskDeniedError(
+                "CLOSE_POSITION_USAGE_UNAVAILABLE",
+                "existing close reservations cannot be summed in the declared quantity unit",
+            )
+        used_quantity = sum(
+            (Fraction(_as_decimal(row["quantity"])) for row in rows), Fraction(0)
+        )
+        if used_quantity + Fraction(intent.quantity) > Fraction(
+            _as_decimal(declaration["closable_quantity"])
+        ):
+            raise RiskDeniedError(
+                "CLOSE_QUANTITY_EXHAUSTED",
+                "the strategy's declared closable quantity is exhausted",
+            )
+        return str(declaration["allocation_version"])
+
+    def _assert_self_trade_absent(
+        self, connection: sqlite3.Connection, intent: RiskIntent
+    ) -> None:
+        """Fail closed on an open/close pair that could cross on one account.
+
+        The ledger carries no order direction, so it cannot prove that an
+        opening reservation and a bound close reservation on the same
+        account and instrument will not cross (self-trade/wash).  This
+        conservative guard engages in exactly two directions: a bound close
+        is refused while any ACTIVE increase reservation exists, and a new
+        increase is refused while any ACTIVE bound-close reservation exists.
+        Legacy reduces without the close binding never create or trip this
+        guard, so established keyless behavior is unchanged.  Under the net
+        model two closes on one instrument are the same side and therefore
+        do not conflict with each other.
+        """
+
+        instrument = intent.instrument
+        if instrument is None:
+            return
+        if intent.action is IntentAction.INCREASE:
+            opposing = connection.execute(
+                """SELECT 1 FROM risk_reservations
+                   WHERE scope_key = ? AND instrument = ? AND action = ? AND status = ?
+                     AND close_position_version IS NOT NULL
+                   LIMIT 1""",
+                (intent.scope.key, instrument, IntentAction.REDUCE.value, self._ACTIVE),
+            ).fetchone()
+        elif self._is_bound_close_intent(intent):
+            opposing = connection.execute(
+                """SELECT 1 FROM risk_reservations
+                   WHERE scope_key = ? AND instrument = ? AND action = ? AND status = ?
+                   LIMIT 1""",
+                (intent.scope.key, instrument, IntentAction.INCREASE.value, self._ACTIVE),
+            ).fetchone()
+        else:
+            return
+        if opposing is not None:
+            raise RiskDeniedError(
+                "SELF_TRADE_CONFLICT",
+                "an opposite-side live reservation on the same account instrument may cross",
+            )
+
     def _assert_strategy_allocation_limit(
         self, connection: sqlite3.Connection, intent: RiskIntent
     ) -> None:
@@ -8495,7 +8896,8 @@ class DurableRiskGate:
                     group_leg_count INTEGER,
                     group_exposure_profile_fingerprint TEXT,
                     resource_product_type TEXT,
-                    resource_margin_pool TEXT
+                    resource_margin_pool TEXT,
+                    close_position_version TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_risk_reservations_scope_status
                     ON risk_reservations(scope_key, status, action);
@@ -8701,6 +9103,26 @@ class DurableRiskGate:
                     notional_unit TEXT NOT NULL,
                     created_at REAL NOT NULL,
                     PRIMARY KEY(scope_key, product_type, margin_pool, allocation_version)
+                );
+                CREATE TABLE IF NOT EXISTS risk_closable_positions (
+                    scope_key TEXT NOT NULL,
+                    instrument TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    allocation_version TEXT NOT NULL,
+                    closable_quantity TEXT NOT NULL,
+                    quantity_unit TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(scope_key, instrument, strategy_id)
+                );
+                CREATE TABLE IF NOT EXISTS risk_closable_position_versions (
+                    scope_key TEXT NOT NULL,
+                    instrument TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    allocation_version TEXT NOT NULL,
+                    closable_quantity TEXT NOT NULL,
+                    quantity_unit TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(scope_key, instrument, strategy_id, allocation_version)
                 );
                 CREATE TABLE IF NOT EXISTS risk_gross_exposure_baselines (
                     scope_key TEXT PRIMARY KEY,
@@ -8931,6 +9353,7 @@ class DurableRiskGate:
                 ("group_exposure_profile_fingerprint", "TEXT"),
                 ("resource_product_type", "TEXT"),
                 ("resource_margin_pool", "TEXT"),
+                ("close_position_version", "TEXT"),
             ):
                 if name not in reservation_columns:
                     connection.execute(
@@ -9042,6 +9465,10 @@ class DurableRiskGate:
                    ON risk_reservations(
                        scope_key, resource_product_type, resource_margin_pool, action, status
                    )"""
+            )
+            connection.execute(
+                """CREATE INDEX IF NOT EXISTS idx_risk_reservations_close_attribution
+                   ON risk_reservations(scope_key, instrument, strategy_id, action, status)"""
             )
             connection.execute(
                 """CREATE TRIGGER IF NOT EXISTS risk_group_reservation_identity_immutable
