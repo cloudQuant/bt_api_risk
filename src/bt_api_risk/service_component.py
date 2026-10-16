@@ -2117,6 +2117,145 @@ class PolicyCatalogStore:
             raise PolicyCatalogError(failure)
         return result
 
+    def owner_confirm_budget_member(
+        self,
+        generation_ref: str,
+        account_ref: str,
+        *,
+        principal_ref: str,
+        scope: object,
+        confirmation_store: ConfirmedPolicyStore | None,
+    ) -> Mapping[str, object]:
+        """Confirm one published member from its catalog-owned receipt.
+
+        The caller supplies only an authenticated principal and its registered
+        member scope. The publication receipt is read and checked inside the
+        catalog transaction, FX sources are revalidated, and the exact
+        catalog receipt is written to the owner-side confirmation store before
+        the member can advance. Repeating the same operation is safe because
+        the confirmation store pins an immutable receipt and the catalog
+        confirmation is idempotent.
+        """
+
+        generation_ref = _policy_reference(generation_ref)
+        if not _valid_wire_text(principal_ref) or not _valid_wire_text(account_ref):
+            raise PolicyCatalogError("INVALID_BUDGET_MEMBER")
+        if confirmation_store is not None and type(confirmation_store) is not ConfirmedPolicyStore:
+            raise PolicyCatalogError("INVALID_CONFIRMATION_STORE")
+        if confirmation_store is None:
+            raise PolicyCatalogError("CONFIRMATION_STORE_UNAVAILABLE")
+        _, scope_json = _management_scope(scope)
+
+        # Hold the catalog write lock while deriving the receipt and writing
+        # the separate confirmation database. If the process stops between
+        # those commits, retrying the same operation replays the same pinned
+        # receipt; no generation or reservation is released by this step.
+        with self._immediate():
+            generation = self._budget_generation_row(generation_ref)
+            if generation is None:
+                raise PolicyCatalogError("BUDGET_GENERATION_NOT_FOUND")
+            member = self._budget_member_row(generation_ref, account_ref)
+            if member is None:
+                raise PolicyCatalogError("BUDGET_MEMBER_NOT_FOUND")
+            if (
+                principal_ref != member["owner_principal"]
+                or scope_json != member["owner_scope_json"]
+            ):
+                raise PolicyCatalogError("BUDGET_MEMBER_OWNER_REQUIRED")
+            if member["state"] == "rejected":
+                raise PolicyCatalogError("BUDGET_MEMBER_REJECTED")
+            if generation["state"] not in (
+                "publishing",
+                "partial_hold",
+                "unknown_hold",
+                "authority_ready",
+            ):
+                raise PolicyCatalogError("INVALID_BUDGET_STATE")
+            if member["receipt_json"] is None:
+                raise PolicyCatalogError("BUDGET_MEMBER_NOT_PUBLISHED")
+
+            observations = self._budget_generation_fx_observations(
+                generation, check_source=True
+            )
+            policy = self._row(member["policy_ref"])
+            if (
+                policy is None
+                or policy["state"] != "published"
+                or policy["digest"] != member["policy_digest"]
+                or policy["owner_principal"] != member["owner_principal"]
+                or policy["owner_scope_json"] != member["owner_scope_json"]
+            ):
+                raise PolicyCatalogError("BUDGET_POLICY_STATE_CONFLICT")
+            try:
+                content = json.loads(policy["content_json"])
+            except (TypeError, json.JSONDecodeError):
+                raise PolicyCatalogError("BUDGET_POLICY_CONTENT_MISMATCH") from None
+            if (
+                type(content) is not dict
+                or _canonical_json(content, path="$.content") != policy["content_json"]
+                or hashlib.sha256(policy["content_json"].encode("utf-8")).hexdigest()
+                != policy["digest"]
+            ):
+                raise PolicyCatalogError("BUDGET_POLICY_CONTENT_MISMATCH")
+            receipt = self._receipt_payload(
+                member["policy_ref"], policy, policy["published_utc"]
+            )
+            try:
+                stored_receipt = json.loads(member["receipt_json"])
+            except (TypeError, json.JSONDecodeError):
+                raise PolicyCatalogError("BUDGET_MEMBER_RECEIPT_MISMATCH") from None
+            if (
+                type(stored_receipt) is not dict
+                or set(stored_receipt) != set(receipt)
+                or stored_receipt != dict(receipt)
+                or _canonical_json(stored_receipt, path="$.budget_receipt")
+                != member["receipt_json"]
+            ):
+                raise PolicyCatalogError("BUDGET_MEMBER_RECEIPT_MISMATCH")
+
+            try:
+                confirmation_store.confirm(receipt)
+                confirmed = confirmation_store.resolve(member["policy_ref"])
+            except PolicyCatalogError:
+                raise
+            except sqlite3.Error:
+                raise PolicyCatalogError("CONFIRMATION_STORE_UNAVAILABLE") from None
+            if any(confirmed.get(key) != value for key, value in receipt.items()):
+                raise PolicyCatalogError("CONFIRMED_RECEIPT_MISMATCH")
+
+        # Reuse the established membership transition, which independently
+        # reads the persisted confirmation and checks FX again. This also
+        # keeps partial/UNKNOWN generations reserved until every exact member
+        # receipt is confirmed.
+        summary = self.confirm_budget_member(
+            generation_ref,
+            account_ref,
+            principal_ref=principal_ref,
+            scope=scope,
+            confirmation_store=confirmation_store,
+        )
+        members = summary["members"]
+        member_state = next(
+            (
+                item["state"]
+                for item in members
+                if item["account_ref"] == account_ref
+            ),
+            None,
+        )
+        if member_state != "confirmed":
+            raise PolicyCatalogError("BUDGET_AUTHORITY_NOT_READY")
+        return {
+            "generation_ref": generation_ref,
+            "pool_ref": summary["pool_ref"],
+            "account_ref": account_ref,
+            "member_state": member_state,
+            "state": summary["state"],
+            "authority_ready": summary["state"] == "authority_ready",
+            "consumer_effective": False,
+            "fx_observations": observations,
+        }
+
     def reject_budget_member(
         self,
         generation_ref: str,
@@ -2551,6 +2690,7 @@ class PolicyCatalogService:
             "policy.budget.approve",
             "policy.budget.publish_member",
             "policy.budget.confirm_member",
+            "policy.budget.owner_confirm_member",
             "policy.budget.reject_member",
             "policy.budget.mark_unknown",
             "policy.budget.retract",
@@ -2656,6 +2796,16 @@ class PolicyCatalogService:
                 if keys != self._BUDGET_MEMBER_ARGUMENTS:
                     raise PolicyCatalogError("INVALID_REQUEST")
                 result = self._store.confirm_budget_member(
+                    arguments["generation_ref"],
+                    arguments["account_ref"],
+                    principal_ref=principal_ref,
+                    scope=scope,
+                    confirmation_store=self._confirmation_store,
+                )
+            elif operation == "policy.budget.owner_confirm_member":
+                if keys != self._BUDGET_MEMBER_ARGUMENTS:
+                    raise PolicyCatalogError("INVALID_REQUEST")
+                result = self._store.owner_confirm_budget_member(
                     arguments["generation_ref"],
                     arguments["account_ref"],
                     principal_ref=principal_ref,

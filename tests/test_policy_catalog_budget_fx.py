@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import sqlite3
 import sys
 import time
 from dataclasses import replace
@@ -13,7 +14,9 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+import pytest
 from bt_api_base.service_protocol import WireScope
+
 from bt_api_risk.budget_admission import (
     BudgetAdmissionResolutionError,
     PolicyCatalogBudgetAdmissionResolver,
@@ -21,6 +24,7 @@ from bt_api_risk.budget_admission import (
 from bt_api_risk.portfolio_analytics import FxObservationV1
 from bt_api_risk.service_component import (
     ConfirmedPolicyStore,
+    PolicyCatalogError,
     PolicyCatalogService,
     PolicyCatalogStore,
 )
@@ -542,6 +546,248 @@ def test_budget_fx_generation_uses_real_catalog_and_rechecks_source_at_resolutio
             _GENERATION, scope=_group_scope()
         )
         assert after_idempotent_confirm == still_reserved, after_idempotent_confirm
+    finally:
+        service.close()
+        confirmations.close()
+        store.close()
+
+
+def test_owner_confirmation_reads_published_receipt_and_rechecks_live_fx(
+    tmp_path: Path,
+) -> None:
+    source_fact = _fx_fact()
+    observation = _fx_observation(source_fact)
+    source = _FxSource(source_fact)
+    clock = _FxClock(source_fact.as_of_ns + 1)
+    catalog_path = tmp_path / "catalog.sqlite3"
+    confirmation_path = tmp_path / "confirmed.sqlite3"
+    store, confirmations, service = _stores(tmp_path, source=source, clock=clock)
+    try:
+        proposal, _ = _draft(service, source_fact)
+        proposed = _propose(service, proposal)
+        assert proposed["consumer_effective"] is False, proposed
+        _call(
+            service,
+            "policy.budget.approve",
+            principal="checker",
+            scope=_group_scope(),
+            arguments={"generation_ref": _GENERATION},
+        )
+        publications = {
+            account_ref: _call(
+                service,
+                "policy.budget.publish_member",
+                principal="checker",
+                scope=_group_scope(),
+                arguments={"generation_ref": _GENERATION, "account_ref": account_ref},
+            )
+            for account_ref in ("acct-a", "acct-b")
+        }
+        assert all(item["consumer_effective"] is False for item in publications.values())
+        assert source.reads == [observation["observation_ref"]] * 4
+        for publication in publications.values():
+            with pytest.raises(PolicyCatalogError) as not_confirmed:
+                confirmations.resolve(publication["member"]["policy_ref"])
+            assert not_confirmed.value.code == "POLICY_NOT_CONFIRMED"
+
+        arguments = {"generation_ref": _GENERATION, "account_ref": "acct-a"}
+        _error(
+            service,
+            "policy.budget.owner_confirm_member",
+            principal="maker",
+            scope=_member_scope("acct-a"),
+            arguments={**arguments, "receipt": publications["acct-a"]["member"]},
+            code="INVALID_REQUEST",
+        )
+        _error(
+            service,
+            "policy.budget.owner_confirm_member",
+            principal="intruder",
+            scope=_member_scope("acct-a"),
+            arguments=arguments,
+            code="BUDGET_MEMBER_OWNER_REQUIRED",
+        )
+        _error(
+            service,
+            "policy.budget.owner_confirm_member",
+            principal="maker",
+            scope=_member_scope("acct-b"),
+            arguments=arguments,
+            code="BUDGET_MEMBER_OWNER_REQUIRED",
+        )
+
+        clock.now_ns = source_fact.as_of_ns + 86_400_000_000_001
+        _error(
+            service,
+            "policy.budget.owner_confirm_member",
+            principal="maker",
+            scope=_member_scope("acct-a"),
+            arguments=arguments,
+            code="BUDGET_FX_STALE",
+        )
+        with pytest.raises(PolicyCatalogError) as stale_not_confirmed:
+            confirmations.resolve("afi-budget-acct-a-v1")
+        assert stale_not_confirmed.value.code == "POLICY_NOT_CONFIRMED"
+        held = store.read_budget_generation(_GENERATION, scope=_group_scope())
+        assert held["state"] == "publishing", held
+        assert held["consumer_effective"] is False, held
+        pool = store.configure_budget_pool(
+            _POOL,
+            capacity_amount="30",
+            currency=_CURRENCY,
+            metric=_METRIC,
+            scale=1,
+            portfolio_ref=_PORTFOLIO,
+            membership_version=1,
+            membership_sha256=_MEMBERSHIP_DIGEST,
+            account_refs=("acct-a", "acct-b"),
+        )
+        assert pool["used_amount"] == "25", pool
+
+        clock.now_ns = source_fact.as_of_ns + 1
+        first = _call(
+            service,
+            "policy.budget.owner_confirm_member",
+            principal="maker",
+            scope=_member_scope("acct-a"),
+            arguments=arguments,
+        )
+        assert first["member_state"] == "confirmed", first
+        assert first["state"] == "publishing", first
+        assert first["authority_ready"] is False, first
+        assert first["consumer_effective"] is False, first
+        assert "receipt" not in first and "member" not in first, first
+        receipt_a = confirmations.resolve("afi-budget-acct-a-v1")
+        assert {
+            key: receipt_a[key]
+            for key in publications["acct-a"]["member"]
+        } == publications["acct-a"]["member"]
+        with pytest.raises(BudgetAdmissionResolutionError) as partial:
+            PolicyCatalogBudgetAdmissionResolver(store, confirmations).resolve(
+                _POOL, "acct-a", scope=_member_scope("acct-a")
+            )
+        assert partial.value.code == "BUDGET_AUTHORITY_NOT_READY"
+
+        source.observation = replace(source_fact, rate=Decimal("1.3"))
+        _error(
+            service,
+            "policy.budget.owner_confirm_member",
+            principal="maker",
+            scope=_member_scope("acct-b"),
+            arguments={"generation_ref": _GENERATION, "account_ref": "acct-b"},
+            code="BUDGET_FX_SOURCE_MISMATCH",
+        )
+        with pytest.raises(PolicyCatalogError) as mismatch_not_confirmed:
+            confirmations.resolve("afi-budget-acct-b-v1")
+        assert mismatch_not_confirmed.value.code == "POLICY_NOT_CONFIRMED"
+        held = store.read_budget_generation(_GENERATION, scope=_group_scope())
+        assert held["state"] == "publishing", held
+        pool = store.configure_budget_pool(
+            _POOL,
+            capacity_amount="30",
+            currency=_CURRENCY,
+            metric=_METRIC,
+            scale=1,
+            portfolio_ref=_PORTFOLIO,
+            membership_version=1,
+            membership_sha256=_MEMBERSHIP_DIGEST,
+            account_refs=("acct-a", "acct-b"),
+        )
+        assert pool["used_amount"] == "25", pool
+
+        source.observation = source_fact
+        confirm_original = confirmations.confirm
+
+        def confirm_then_fail(receipt: dict[str, object]) -> object:
+            confirm_original(receipt)
+            raise sqlite3.OperationalError("simulated catalog transition interruption")
+
+        confirmations.confirm = confirm_then_fail
+        try:
+            _error(
+                service,
+                "policy.budget.owner_confirm_member",
+                principal="maker",
+                scope=_member_scope("acct-b"),
+                arguments={"generation_ref": _GENERATION, "account_ref": "acct-b"},
+                code="CONFIRMATION_STORE_UNAVAILABLE",
+            )
+        finally:
+            confirmations.confirm = confirm_original
+        receipt_b = confirmations.resolve("afi-budget-acct-b-v1")
+        assert {
+            key: receipt_b[key]
+            for key in publications["acct-b"]["member"]
+        } == publications["acct-b"]["member"]
+        interrupted = store.read_budget_generation(_GENERATION, scope=_group_scope())
+        assert interrupted["state"] == "publishing", interrupted
+        with pytest.raises(BudgetAdmissionResolutionError) as transition_pending:
+            PolicyCatalogBudgetAdmissionResolver(store, confirmations).resolve(
+                _POOL, "acct-b", scope=_member_scope("acct-b")
+            )
+        assert transition_pending.value.code == "BUDGET_AUTHORITY_NOT_READY"
+        pool = store.configure_budget_pool(
+            _POOL,
+            capacity_amount="30",
+            currency=_CURRENCY,
+            metric=_METRIC,
+            scale=1,
+            portfolio_ref=_PORTFOLIO,
+            membership_version=1,
+            membership_sha256=_MEMBERSHIP_DIGEST,
+            account_refs=("acct-a", "acct-b"),
+        )
+        assert pool["used_amount"] == "25", pool
+
+        second_arguments = {"generation_ref": _GENERATION, "account_ref": "acct-b"}
+        second = _call(
+            service,
+            "policy.budget.owner_confirm_member",
+            principal="maker",
+            scope=_member_scope("acct-b"),
+            arguments=second_arguments,
+        )
+        assert second["state"] == "authority_ready", second
+        assert second["authority_ready"] is True, second
+        assert second["consumer_effective"] is False, second
+        replay = _call(
+            service,
+            "policy.budget.owner_confirm_member",
+            principal="maker",
+            scope=_member_scope("acct-b"),
+            arguments=second_arguments,
+        )
+        assert replay == second, replay
+        pool = store.configure_budget_pool(
+            _POOL,
+            capacity_amount="30",
+            currency=_CURRENCY,
+            metric=_METRIC,
+            scale=1,
+            portfolio_ref=_PORTFOLIO,
+            membership_version=1,
+            membership_sha256=_MEMBERSHIP_DIGEST,
+            account_refs=("acct-a", "acct-b"),
+        )
+        assert pool["used_amount"] == "25", pool
+    finally:
+        service.close()
+        confirmations.close()
+        store.close()
+
+    store = PolicyCatalogStore(
+        str(catalog_path),
+        trusted_approver_principals=("checker",),
+        trusted_fx_observation_reader=source,
+        fx_clock_ns=clock,
+    )
+    confirmations = ConfirmedPolicyStore(str(confirmation_path))
+    service = PolicyCatalogService(store, confirmation_store=confirmations)
+    try:
+        resolver = PolicyCatalogBudgetAdmissionResolver(store, confirmations)
+        resolved = resolver.resolve(_POOL, "acct-a", scope=_member_scope("acct-a"))
+        assert resolved.risk_policy.max_increase_notional == Decimal("12.5")
+        assert resolved.fx_observations == (observation,), resolved
     finally:
         service.close()
         confirmations.close()
