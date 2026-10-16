@@ -628,6 +628,18 @@ def _plain_scope(value: object) -> dict[str, object]:
     return canonical
 
 
+def _freeze_policy_value(value: object) -> object:
+    """Return recursively immutable JSON containers for a confirmed document."""
+
+    if isinstance(value, Mapping):
+        return MappingProxyType(
+            {key: _freeze_policy_value(item) for key, item in value.items()}
+        )
+    if type(value) is list:
+        return tuple(_freeze_policy_value(item) for item in value)
+    return value
+
+
 def _now_utc() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -2889,8 +2901,20 @@ class ConfirmedPolicyStore:
                 "owner_principal TEXT NOT NULL, "
                 "owner_scope_json TEXT NOT NULL, "
                 "published_utc TEXT NOT NULL, "
-                "confirmed_utc TEXT NOT NULL)"
+                "confirmed_utc TEXT NOT NULL, "
+                "content_json TEXT)"
             )
+            columns = {
+                row["name"]
+                for row in self._db.execute("PRAGMA table_info(confirmed_policies)")
+            }
+            if "content_json" not in columns:
+                # Preserve old receipt-only rows. They remain readable through
+                # resolve(), but cannot be treated as a cached executable
+                # policy document by resolve_document().
+                self._db.execute(
+                    "ALTER TABLE confirmed_policies ADD COLUMN content_json TEXT"
+                )
 
     def close(self) -> None:
         self._db.close()
@@ -2935,6 +2959,81 @@ class ConfirmedPolicyStore:
             ).fetchone()
         )
 
+    def confirm_document(
+        self, receipt: Mapping[str, object], content: object
+    ) -> Mapping[str, object]:
+        """Persist one exact receipt together with its immutable published document.
+
+        The caller is the trusted account owner after it has bound and read
+        back the policy from the durable account Risk gate. The receipt still
+        has to be the catalog's exact published receipt, and the canonical
+        document digest must equal that receipt's version. Receipt-only
+        confirmations remain supported by :meth:`confirm` and are never
+        upgraded into executable documents without this exact check.
+        """
+
+        if not isinstance(receipt, Mapping) or set(receipt) != self._RECEIPT_FIELDS:
+            raise PolicyCatalogError("INVALID_RECEIPT")
+        reference = _policy_reference(receipt["policy_ref"])
+        digest = _policy_digest(receipt["policy_version"])
+        principal = receipt["owner_principal"]
+        if not _valid_wire_text(principal):
+            raise PolicyCatalogError("INVALID_RECEIPT")
+        scope = _plain_scope(receipt["owner_scope"])
+        stamp = receipt["published_utc"]
+        if not _valid_wire_text(stamp) or len(stamp) > 64:
+            raise PolicyCatalogError("INVALID_RECEIPT")
+        document = _plain_wire_value(content)
+        if type(document) is not dict or not document:
+            raise PolicyCatalogError("INVALID_CONFIRMED_DOCUMENT")
+        content_json = _canonical_json(document, path="$.confirmed_document")
+        if hashlib.sha256(content_json.encode("utf-8")).hexdigest() != digest:
+            raise PolicyCatalogError("POLICY_DOCUMENT_DIGEST_MISMATCH")
+        scope_json = json.dumps(scope, sort_keys=True, separators=(",", ":"))
+        with self._db:
+            row = self._db.execute(
+                "SELECT * FROM confirmed_policies WHERE reference=?", (reference,)
+            ).fetchone()
+            if row is not None:
+                if (
+                    row["policy_version"] != digest
+                    or row["owner_principal"] != principal
+                    or row["owner_scope_json"] != scope_json
+                    or row["published_utc"] != stamp
+                    or (
+                        row["content_json"] is not None
+                        and row["content_json"] != content_json
+                    )
+                ):
+                    raise PolicyCatalogError("POLICY_VERSION_CONFLICT")
+                if row["content_json"] is None:
+                    # Filling a missing document is safe only for the exact
+                    # already-pinned receipt and its digest-verified content.
+                    self._db.execute(
+                        "UPDATE confirmed_policies SET content_json=? WHERE reference=?",
+                        (content_json, reference),
+                    )
+            else:
+                self._db.execute(
+                    "INSERT INTO confirmed_policies "
+                    "(reference, policy_version, owner_principal, owner_scope_json, "
+                    "published_utc, confirmed_utc, content_json) "
+                    "VALUES (?,?,?,?,?,?,?)",
+                    (
+                        reference,
+                        digest,
+                        principal,
+                        scope_json,
+                        stamp,
+                        _now_utc(),
+                        content_json,
+                    ),
+                )
+            persisted = self._db.execute(
+                "SELECT * FROM confirmed_policies WHERE reference=?", (reference,)
+            ).fetchone()
+        return self._document_record(persisted)
+
     def resolve(self, reference: object) -> Mapping[str, object]:
         reference = _policy_reference(reference)
         row = self._db.execute(
@@ -2943,6 +3042,36 @@ class ConfirmedPolicyStore:
         if row is None:
             raise PolicyCatalogError("POLICY_NOT_CONFIRMED")
         return self._record(row)
+
+    def resolve_document(self, reference: object) -> Mapping[str, object]:
+        """Read the confirmed receipt and its digest-verified document offline.
+
+        This never consults the policy catalog or a mutable latest pointer.
+        Legacy receipt-only rows remain readable via :meth:`resolve` but are
+        explicitly unavailable as executable policy documents.
+        """
+
+        reference = _policy_reference(reference)
+        row = self._db.execute(
+            "SELECT * FROM confirmed_policies WHERE reference=?", (reference,)
+        ).fetchone()
+        if row is None:
+            raise PolicyCatalogError("POLICY_NOT_CONFIRMED")
+        content_json = row["content_json"]
+        if content_json is None:
+            raise PolicyCatalogError("POLICY_DOCUMENT_UNAVAILABLE")
+        try:
+            document = json.loads(content_json)
+            canonical = _canonical_json(document, path="$.confirmed_document")
+        except (json.JSONDecodeError, PolicyCatalogError):
+            raise PolicyCatalogError("POLICY_DOCUMENT_CORRUPT") from None
+        if (
+            canonical != content_json
+            or hashlib.sha256(content_json.encode("utf-8")).hexdigest()
+            != row["policy_version"]
+        ):
+            raise PolicyCatalogError("POLICY_DOCUMENT_CORRUPT")
+        return self._document_record(row, document=document)
 
     @staticmethod
     def _record(row: sqlite3.Row) -> Mapping[str, object]:
@@ -2954,6 +3083,19 @@ class ConfirmedPolicyStore:
                 "owner_scope": json.loads(row["owner_scope_json"]),
                 "published_utc": row["published_utc"],
                 "confirmed_utc": row["confirmed_utc"],
+            }
+        )
+
+    @classmethod
+    def _document_record(
+        cls, row: sqlite3.Row, *, document: object | None = None
+    ) -> Mapping[str, object]:
+        if document is None:
+            document = json.loads(row["content_json"])
+        return MappingProxyType(
+            {
+                **dict(cls._record(row)),
+                "content": _freeze_policy_value(document),
             }
         )
 
