@@ -57,6 +57,10 @@ from .admission import (
     VerifiedExecutionJournalAuthority,
     VerifiedRecoveredExecutionJournalAuthority,
 )
+from .closable_position_rebase import (
+    ClosablePositionCloseReceiptV1,
+    ClosablePositionRebaseV1,
+)
 from .exposure import (
     ExposureAccountingMode,
     GrossExposureAuthority,
@@ -126,6 +130,8 @@ __all__ = [
     "LimitsManager",
     "PolicyEngine",
     "AccountScope",
+    "ClosablePositionCloseReceiptV1",
+    "ClosablePositionRebaseV1",
     "CancelDispatchResolutionProof",
     "CancelDispatchSource",
     "CancelDispatchTerminalState",

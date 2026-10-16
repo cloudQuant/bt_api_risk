@@ -82,6 +82,10 @@ from .core.admission import (
     VerifiedExecutionJournalAuthority,
     VerifiedRecoveredExecutionJournalAuthority,
 )
+from .core.closable_position_rebase import (
+    ClosablePositionCloseReceiptV1,
+    ClosablePositionRebaseV1,
+)
 from .core.exposure import (
     ExposureAccountingMode,
     GrossExposureAuthority,
@@ -170,6 +174,8 @@ __all__ = [
     "RiskLevel",
     # Durable execution-boundary admission
     "AccountScope",
+    "ClosablePositionCloseReceiptV1",
+    "ClosablePositionRebaseV1",
     "CancelDispatchResolutionProof",
     "CancelDispatchSource",
     "CancelDispatchTerminalState",
