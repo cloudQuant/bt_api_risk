@@ -1907,11 +1907,22 @@ class PolicyCatalogStore:
             generation = self._budget_generation_row(generation_ref)
             if generation is None:
                 raise PolicyCatalogError("BUDGET_GENERATION_NOT_FOUND")
-            if (
-                generation["approved_by"] != principal_ref
-                or generation["approved_scope_json"] != scope_json
-                or principal_ref not in self._trusted_approver_principals
-            ):
+            # Publication is the proposer's controlled release after a distinct
+            # trusted checker has approved the complete immutable generation.
+            # Keep the approved-checker path for existing direct catalog
+            # clients, but the normal owner API grants publish only to the
+            # proposer; a checker never needs account-write authority merely to
+            # approve a generation.
+            is_proposer = (
+                generation["proposer_principal"] == principal_ref
+                and generation["proposer_scope_json"] == scope_json
+            )
+            is_approved_checker = (
+                generation["approved_by"] == principal_ref
+                and generation["approved_scope_json"] == scope_json
+                and principal_ref in self._trusted_approver_principals
+            )
+            if not (is_proposer or is_approved_checker):
                 raise PolicyCatalogError("BUDGET_PUBLISH_NOT_AUTHORIZED")
             observations = self._budget_generation_fx_observations(
                 generation, check_source=True
@@ -1948,8 +1959,8 @@ class PolicyCatalogStore:
                 policy is None
                 or policy["state"] != "approved"
                 or policy["digest"] != member["policy_digest"]
-                or policy["approved_by"] != principal_ref
-                or policy["approved_scope_json"] != scope_json
+                or policy["approved_by"] != generation["approved_by"]
+                or policy["approved_scope_json"] != generation["approved_scope_json"]
             ):
                 raise PolicyCatalogError("BUDGET_POLICY_STATE_CONFLICT")
             receipt = self._publish_policy_row(policy)
