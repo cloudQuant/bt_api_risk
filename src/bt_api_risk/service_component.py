@@ -1777,6 +1777,174 @@ class PolicyCatalogStore:
             raise PolicyCatalogError("SCOPE_NOT_OWNER")
         return self._budget_generation_summary(generation)
 
+    def read_authority_ready_budget_member(
+        self,
+        pool_ref: str,
+        account_ref: str,
+        *,
+        scope: object,
+    ) -> Mapping[str, object]:
+        """Read one exact member from the pool's persisted ready generation.
+
+        This owner-local snapshot is intentionally not a service operation.
+        It resolves through the pool's durable authority pointer, rather than
+        trusting a generation reference supplied by a caller, and verifies
+        the complete generation/member state in one SQLite read transaction.
+        Confirmation-store readback is performed by the admission resolver.
+        """
+
+        pool_ref = _policy_reference(pool_ref)
+        if not _valid_wire_text(account_ref):
+            raise PolicyCatalogError("INVALID_BUDGET_MEMBER")
+        canonical_scope, scope_json = _management_scope(scope)
+        if canonical_scope["account_ref"] != account_ref:
+            raise PolicyCatalogError("BUDGET_MEMBER_SCOPE_MISMATCH")
+
+        with self._write_lock:
+            self._db.execute("BEGIN")
+            try:
+                pool = self._db.execute(
+                    "SELECT * FROM policy_budget_pools WHERE pool_ref=?", (pool_ref,)
+                ).fetchone()
+                if pool is None:
+                    raise PolicyCatalogError("BUDGET_POOL_NOT_FOUND")
+                if (
+                    canonical_scope["portfolio_ref"] != pool["portfolio_ref"]
+                    or account_ref not in json.loads(pool["account_refs_json"])
+                ):
+                    raise PolicyCatalogError("BUDGET_MEMBER_SCOPE_MISMATCH")
+
+                generation_ref = pool["authority_generation_ref"]
+                if generation_ref is None:
+                    raise PolicyCatalogError("BUDGET_AUTHORITY_NOT_READY")
+                generation = self._db.execute(
+                    "SELECT * FROM policy_budget_generations WHERE generation_ref=?",
+                    (generation_ref,),
+                ).fetchone()
+                if (
+                    generation is None
+                    or generation["pool_ref"] != pool_ref
+                    or generation["state"] != "authority_ready"
+                    or generation["portfolio_ref"] != pool["portfolio_ref"]
+                    or generation["membership_version"] != pool["membership_version"]
+                    or generation["membership_sha256"] != pool["membership_sha256"]
+                    or generation["currency"] != pool["currency"]
+                    or generation["metric"] != pool["metric"]
+                    or generation["metric"] != _BUDGET_METRIC
+                ):
+                    raise PolicyCatalogError("BUDGET_AUTHORITY_NOT_READY")
+
+                members = list(
+                    self._db.execute(
+                        "SELECT * FROM policy_budget_members WHERE generation_ref=? "
+                        "ORDER BY account_ref",
+                        (generation_ref,),
+                    ).fetchall()
+                )
+                if (
+                    not members
+                    or any(
+                        member["state"] != "confirmed" or member["receipt_json"] is None
+                        for member in members
+                    )
+                    or sum(member["amount_units"] for member in members)
+                    + generation["unallocated_units"]
+                    != generation["total_units"]
+                    or generation["total_units"] > pool["capacity_units"]
+                    or any(
+                        member["account_ref"]
+                        not in json.loads(pool["account_refs_json"])
+                        for member in members
+                    )
+                ):
+                    raise PolicyCatalogError("BUDGET_AUTHORITY_NOT_READY")
+
+                member = next(
+                    (item for item in members if item["account_ref"] == account_ref),
+                    None,
+                )
+                if member is None:
+                    raise PolicyCatalogError("BUDGET_MEMBER_NOT_FOUND")
+                if member["owner_scope_json"] != scope_json:
+                    raise PolicyCatalogError("BUDGET_MEMBER_SCOPE_MISMATCH")
+
+                policy = self._db.execute(
+                    "SELECT * FROM policy_catalog_versions WHERE reference=?",
+                    (member["policy_ref"],),
+                ).fetchone()
+                if (
+                    policy is None
+                    or policy["state"] != "published"
+                    or policy["digest"] != member["policy_digest"]
+                    or policy["owner_principal"] != member["owner_principal"]
+                    or policy["owner_scope_json"] != member["owner_scope_json"]
+                ):
+                    raise PolicyCatalogError("BUDGET_POLICY_STATE_CONFLICT")
+
+                content = json.loads(policy["content_json"])
+                if (
+                    type(content) is not dict
+                    or _canonical_json(content, path="$.content")
+                    != policy["content_json"]
+                    or hashlib.sha256(policy["content_json"].encode("utf-8")).hexdigest()
+                    != policy["digest"]
+                ):
+                    raise PolicyCatalogError("BUDGET_POLICY_CONTENT_MISMATCH")
+                receipt = json.loads(member["receipt_json"])
+                expected_receipt = dict(
+                    self._receipt_payload(
+                        member["policy_ref"], policy, policy["published_utc"]
+                    )
+                )
+                if (
+                    type(receipt) is not dict
+                    or set(receipt) != set(expected_receipt)
+                    or receipt != expected_receipt
+                ):
+                    raise PolicyCatalogError("BUDGET_MEMBER_RECEIPT_MISMATCH")
+
+                result = MappingProxyType(
+                    {
+                        "pool_ref": pool_ref,
+                        "generation_ref": generation_ref,
+                        "portfolio_ref": generation["portfolio_ref"],
+                        "membership_version": generation["membership_version"],
+                        "membership_sha256": generation["membership_sha256"],
+                        "allocation_set_sha256": generation["allocation_set_sha256"],
+                        "currency": generation["currency"],
+                        "metric": generation["metric"],
+                        "total_amount": _budget_units_text(
+                            generation["total_units"], pool["scale"]
+                        ),
+                        "unallocated_amount": _budget_units_text(
+                            generation["unallocated_units"], pool["scale"]
+                        ),
+                        "account_ref": member["account_ref"],
+                        "allocated_amount": member["amount_text"],
+                        "max_increase_count": member["max_increase_count"],
+                        "policy_ref": member["policy_ref"],
+                        "policy_version": member["policy_digest"],
+                        "owner_principal": member["owner_principal"],
+                        "owner_scope": MappingProxyType(
+                            json.loads(member["owner_scope_json"])
+                        ),
+                        "receipt": MappingProxyType(expected_receipt),
+                        "content": MappingProxyType(
+                            {
+                                key: MappingProxyType(value)
+                                for key, value in content.items()
+                                if type(value) is dict
+                            }
+                        ),
+                    }
+                )
+            except BaseException:
+                self._db.rollback()
+                raise
+            else:
+                self._db.commit()
+                return result
+
     def _budget_pool_summary(self, pool: sqlite3.Row) -> Mapping[str, object]:
         marks = ",".join("?" for _ in _BUDGET_HELD_STATES)
         with self._write_lock:
