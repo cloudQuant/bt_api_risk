@@ -21,7 +21,10 @@ from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, replace
 from decimal import Decimal, InvalidOperation, localcontext
 from fractions import Fraction
+from types import MappingProxyType
 from typing import Any, Optional
+
+from bt_api_base.account_protocol import AccountResourceKey
 
 from .admission import (
     AccountScope,
@@ -572,6 +575,12 @@ class InstrumentRiskRegistry:
 
         return self._records.get(instrument)
 
+    @property
+    def instruments(self) -> frozenset[str]:
+        """Return the immutable set of instruments covered by this registry."""
+
+        return frozenset(self._records)
+
     def assess(self, order: InstrumentRiskOrder, now_ns: int) -> InstrumentRiskAssessment:
         """Validate metadata/lattices and calculate the worst-case local bound."""
 
@@ -770,6 +779,9 @@ class InstrumentRiskAdmissionMapper:
         fx_rates_by_instrument: Optional[  # noqa: UP045 -- Python 3.9 is supported.
             Iterable[InstrumentRiskFxRate]
         ] = None,
+        resource_by_instrument: Optional[
+            Mapping[str, AccountResourceKey]
+        ] = None,  # noqa: UP045 -- Python 3.9 is supported.
     ) -> None:
         if not isinstance(scope, AccountScope):
             raise ValueError("scope must be an AccountScope")
@@ -806,12 +818,37 @@ class InstrumentRiskAdmissionMapper:
         self._allocation_reader = allocation_reader
         self._wire_account_ref = wire_account_ref
         self._fx_rates_by_instrument = fx_rates
+        resources: dict[str, AccountResourceKey] = {}
+        if resource_by_instrument is not None:
+            if not isinstance(resource_by_instrument, Mapping):
+                raise ValueError("resource_by_instrument must map instruments to resources")
+            for instrument, resource in resource_by_instrument.items():
+                if (
+                    type(instrument) is not str
+                    or instrument not in registry.instruments
+                    or type(resource) is not AccountResourceKey
+                ):
+                    raise ValueError("resource_by_instrument contains an invalid binding")
+                resources[instrument] = resource
+        self._resource_by_instrument = MappingProxyType(resources)
 
     @property
     def registry(self) -> InstrumentRiskRegistry:
         """Return the immutable registry used by this mapper."""
 
         return self._registry
+
+    @property
+    def scope(self) -> AccountScope:
+        """Return the account scope bound to this mapper."""
+
+        return self._scope
+
+    @property
+    def resource_by_instrument(self) -> Mapping[str, AccountResourceKey]:
+        """Return server-owned product/margin bindings for the registered instruments."""
+
+        return self._resource_by_instrument
 
     @property
     def wire_account_ref(self) -> str:
@@ -1116,6 +1153,11 @@ class InstrumentRiskAdmissionMapper:
             notional_unit=notional_unit,
             instrument_facts_observed_at_ns=instrument_facts_observed_at_ns,
             instrument_facts_valid_until_ns=instrument_facts_valid_until_ns,
+            resource=(
+                self._resource_by_instrument.get(order.instrument)
+                if action is IntentAction.INCREASE
+                else None
+            ),
         )
 
     def map_group_intent(self, intent: Any) -> RiskIntent:
