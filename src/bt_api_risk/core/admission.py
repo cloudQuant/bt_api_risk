@@ -1369,6 +1369,12 @@ class DispatchResolutionReceiptStatus(str, Enum):
     ACKED_TRACKED_RESOLVED = "ACKED_TRACKED_RESOLVED"
 
 
+class CancelDispatchResolutionReceiptStatus(str, Enum):
+    """Durable state of one exact cancellation-action claim."""
+
+    UNRESOLVED_ACTIVE = "UNRESOLVED_ACTIVE"
+    TERMINAL_RESOLVED = "TERMINAL_RESOLVED"
+
 @dataclass(frozen=True)
 class DispatchRecoveryAttestation:
     """New-fence journal evidence for recovering an immutable PROOF_READY event.
@@ -1936,6 +1942,43 @@ class VerifiedCancelDispatchResolution:
         if type(self.writer_fencing_token) is not int or self.writer_fencing_token <= 0:
             raise ValueError("invalid verified cancellation writer fencing token")
 
+
+@dataclass(frozen=True)
+class CancelDispatchResolutionReceipt:
+    """Read-only single-snapshot state of one cancellation-action claim."""
+
+    status: CancelDispatchResolutionReceiptStatus
+    claim: DispatchClaimBinding
+    proof: CancelDispatchResolutionProof | None = None
+    proof_sha256: str | None = None
+    dispatch_latch_active: bool = True
+    has_other_active_freezes: bool = False
+
+    def __post_init__(self) -> None:
+        if type(self.status) is not CancelDispatchResolutionReceiptStatus:
+            raise ValueError("invalid cancellation resolution receipt status")
+        if type(self.claim) is not DispatchClaimBinding:
+            raise ValueError("invalid cancellation resolution receipt claim")
+        if type(self.dispatch_latch_active) is not bool or type(
+            self.has_other_active_freezes
+        ) is not bool:
+            raise ValueError("invalid cancellation resolution receipt freeze state")
+        if self.status is CancelDispatchResolutionReceiptStatus.UNRESOLVED_ACTIVE:
+            if self.proof is not None or self.proof_sha256 is not None or not self.dispatch_latch_active:
+                raise ValueError("unresolved cancellation receipt must retain its latch")
+            return
+        if (
+            type(self.proof) is not CancelDispatchResolutionProof
+            or self.proof_sha256 != self.proof.fingerprint
+            or self.dispatch_latch_active
+            or self.claim.scope != self.proof.scope
+            or self.claim.permit_id != self.proof.permit_id
+            or self.claim.intent_id != self.proof.intent_id
+            or self.claim.intent_hash != self.proof.intent_hash
+            or self.claim.cause_id != self.proof.cause_id
+            or self.claim.claim_digest != self.proof.claim_digest
+        ):
+            raise ValueError("resolved cancellation receipt does not match its claim")
 
 class VerifiedCancellationJournalAuthority(Protocol):
     """Authority that rereads a terminal cancel event and target under its fence."""
@@ -5690,6 +5733,215 @@ class DurableRiskGate:
             else:
                 connection.execute("COMMIT")
                 return receipt
+
+    def cancel_dispatch_resolution_receipt(
+        self, permit_id: str
+    ) -> CancelDispatchResolutionReceipt:
+        """Read the exact durable state of one cancellation-action claim.
+
+        This query is read-only. A resolved receipt is returned only when the
+        persisted typed proof, cancellation reservation, exact claim, and
+        inactive dispatch latch agree in one SQLite snapshot. It never infers
+        resolution from an acknowledgement or from an order-level proof.
+        """
+
+        if type(permit_id) is not str or not permit_id or permit_id != permit_id.strip():
+            raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+        with self._connection() as connection:
+            connection.execute("PRAGMA query_only = ON")
+            connection.execute("BEGIN")
+            try:
+                receipt = self._cancel_dispatch_resolution_receipt_in_transaction(
+                    connection, permit_id
+                )
+            except BaseException:
+                if connection.in_transaction:
+                    connection.execute("ROLLBACK")
+                raise
+            else:
+                connection.execute("COMMIT")
+                return receipt
+
+    def _cancel_dispatch_resolution_receipt_in_transaction(
+        self, connection: sqlite3.Connection, permit_id: str
+    ) -> CancelDispatchResolutionReceipt:
+        reservation = connection.execute(
+            "SELECT * FROM risk_reservations WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        if reservation is None:
+            raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+        policy_error = self._policy_binding_read_error(
+            connection, str(reservation["scope_key"])
+        )
+        if policy_error is not None:
+            raise PermitInvalidError(
+                policy_error, "risk database is bound to another or unknown policy"
+            )
+        if (
+            reservation["action"] != IntentAction.CANCEL.value
+            or _as_decimal(reservation["notional"]) != Decimal("0")
+        ):
+            raise PermitInvalidError(
+                "CANCEL_DISPATCH_RESOLUTION_NOT_CANCEL",
+                "cancellation receipt requires a zero-notional CANCEL reservation",
+            )
+
+        claim_row = connection.execute(
+            "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?", (permit_id,)
+        ).fetchone()
+        if claim_row is None:
+            raise PermitInvalidError(
+                "PERMIT_NOT_DISPATCH_CLAIMED",
+                "cancellation receipt requires an exact durable claim",
+            )
+        expected_cause = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+        if (
+            claim_row["scope_key"] != reservation["scope_key"]
+            or claim_row["intent_id"] != reservation["intent_id"]
+            or claim_row["intent_hash"] != reservation["intent_hash"]
+            or claim_row["cause_id"] != expected_cause
+            or claim_row["group_id"] is not None
+            or claim_row["group_leg_id"] is not None
+            or reservation["group_id"] is not None
+            or reservation["group_leg_id"] is not None
+        ):
+            raise PermitInvalidError(
+                "CANCEL_DISPATCH_CLAIM_CONFLICT",
+                "cancellation receipt requires an exact non-group claim",
+            )
+        try:
+            claim = self._dispatch_claim_binding(reservation, claim_row)
+        except (KeyError, TypeError, ValueError, PermitInvalidError) as exc:
+            raise PermitInvalidError(
+                "CANCEL_DISPATCH_CLAIM_CONFLICT",
+                "cancellation claim cannot be reconstructed",
+            ) from exc
+        if claim.scope.key != reservation["scope_key"]:
+            raise PermitInvalidError(
+                "CANCEL_DISPATCH_RESOLUTION_STATE_CONFLICT",
+                "stored cancellation scope does not match its claim",
+            )
+
+        freeze = connection.execute(
+            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+            (reservation["scope_key"], expected_cause),
+        ).fetchone()
+        if freeze is None or type(freeze["active"]) is not int or freeze["active"] not in (0, 1):
+            raise PermitInvalidError(
+                "CANCEL_DISPATCH_RESOLUTION_STATE_CONFLICT",
+                "the exact cancellation dispatch latch is missing or invalid",
+            )
+        resolution = connection.execute(
+            "SELECT * FROM risk_cancel_dispatch_resolutions WHERE permit_id = ?",
+            (permit_id,),
+        ).fetchone()
+        generic_resolution = connection.execute(
+            "SELECT permit_id FROM risk_dispatch_resolutions WHERE permit_id = ?",
+            (permit_id,),
+        ).fetchone()
+        recovery_audit = connection.execute(
+            "SELECT permit_id FROM risk_dispatch_recovery_audits WHERE permit_id = ?",
+            (permit_id,),
+        ).fetchone()
+        other_freezes = connection.execute(
+            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id <> ?",
+            (reservation["scope_key"], expected_cause),
+        ).fetchall()
+        if any(type(row["active"]) is not int or row["active"] not in (0, 1) for row in other_freezes):
+            raise PermitInvalidError(
+                "CANCEL_DISPATCH_RESOLUTION_STATE_CONFLICT",
+                "another account freeze has an invalid active state",
+            )
+        has_other_active_freezes = any(row["active"] == 1 for row in other_freezes)
+
+        if resolution is None:
+            if (
+                generic_resolution is not None
+                or recovery_audit is not None
+                or freeze["active"] != 1
+                or reservation["status"] not in {self._ACTIVE, self._SETTLED}
+            ):
+                raise PermitInvalidError(
+                    "CANCEL_DISPATCH_RESOLUTION_STATE_CONFLICT",
+                    "unresolved cancel claim must retain its active latch",
+                )
+            return CancelDispatchResolutionReceipt(
+                status=CancelDispatchResolutionReceiptStatus.UNRESOLVED_ACTIVE,
+                claim=claim,
+                dispatch_latch_active=True,
+                has_other_active_freezes=has_other_active_freezes,
+            )
+
+        if (
+            generic_resolution is not None
+            or recovery_audit is not None
+            or reservation["status"] != self._SETTLED
+            or freeze["active"] != 0
+            or resolution["scope_key"] != reservation["scope_key"]
+            or resolution["intent_id"] != reservation["intent_id"]
+            or resolution["intent_hash"] != reservation["intent_hash"]
+            or resolution["cause_id"] != expected_cause
+            or resolution["claim_digest"] != claim.claim_digest
+        ):
+            raise PermitInvalidError(
+                "CANCEL_DISPATCH_RESOLUTION_STATE_CONFLICT",
+                "stored cancel resolution conflicts with its exact settled claim",
+            )
+        try:
+            proof = CancelDispatchResolutionProof(
+                scope=claim.scope,
+                permit_id=permit_id,
+                intent_id=str(resolution["intent_id"]),
+                intent_hash=str(resolution["intent_hash"]),
+                cause_id=str(resolution["cause_id"]),
+                claim_digest=str(resolution["claim_digest"]),
+                cancel_intent_fingerprint=str(resolution["cancel_intent_fingerprint"]),
+                execution_scope_key=str(resolution["execution_scope_key"]),
+                cancel_id=str(resolution["cancel_id"]),
+                target_intent_id=str(resolution["target_intent_id"]),
+                provider_order_id=str(resolution["provider_order_id"]),
+                terminal_state=CancelDispatchTerminalState(str(resolution["terminal_state"])),
+                evidence_class=DispatchEvidenceClass(str(resolution["evidence_class"])),
+                dispatch_attempt_count=int(resolution["dispatch_attempt_count"]),
+                cancel_event_id=str(resolution["cancel_event_id"]),
+                cancel_event_sequence=int(resolution["cancel_event_sequence"]),
+                cancel_event_sha256=str(resolution["cancel_event_sha256"]),
+                cancel_source=CancelDispatchSource(str(resolution["cancel_source"])),
+                source_evidence_sha256=str(resolution["source_evidence_sha256"]),
+                target_postcondition=CancelTargetPostcondition(
+                    str(resolution["target_postcondition"])
+                ),
+                target_state=str(resolution["target_state"]),
+                target_filled_quantity=str(resolution["target_filled_quantity"]),
+                target_updated_at_ns=int(resolution["target_updated_at_ns"]),
+                target_record_sha256=str(resolution["target_record_sha256"]),
+                target_event_id=str(resolution["target_event_id"]),
+                target_event_sequence=int(resolution["target_event_sequence"]),
+                target_event_type=str(resolution["target_event_type"]),
+                target_event_sha256=str(resolution["target_event_sha256"]),
+                writer_owner_id=str(resolution["writer_owner_id"]),
+                writer_fencing_token=int(resolution["writer_fencing_token"]),
+                writer_fence_sha256=str(resolution["writer_fence_sha256"]),
+            )
+            self._assert_cancel_dispatch_proof_matches_claim(proof, claim)
+        except (KeyError, TypeError, ValueError, PermitInvalidError) as exc:
+            raise PermitInvalidError(
+                "CANCEL_DISPATCH_RESOLUTION_STATE_CONFLICT",
+                "stored cancellation proof is invalid",
+            ) from exc
+        if not self._cancel_dispatch_resolution_row_matches_proof(resolution, proof):
+            raise PermitInvalidError(
+                "CANCEL_DISPATCH_RESOLUTION_STATE_CONFLICT",
+                "stored cancellation proof digest does not match its row",
+            )
+        return CancelDispatchResolutionReceipt(
+            status=CancelDispatchResolutionReceiptStatus.TERMINAL_RESOLVED,
+            claim=claim,
+            proof=proof,
+            proof_sha256=proof.fingerprint,
+            dispatch_latch_active=False,
+            has_other_active_freezes=has_other_active_freezes,
+        )
 
     def _dispatch_resolution_receipt_in_transaction(
         self, connection: sqlite3.Connection, permit_id: str

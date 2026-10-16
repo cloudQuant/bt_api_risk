@@ -12,6 +12,7 @@ import pytest
 
 from bt_api_risk import (
     AccountScope,
+    CancelDispatchResolutionReceiptStatus,
     CancelDispatchResolutionProof,
     CancelDispatchSource,
     CancelDispatchTerminalState,
@@ -238,6 +239,67 @@ def test_cancel_action_terminal_proof_settles_permit_and_clears_only_cancel_latc
         with pytest.raises(sqlite3.DatabaseError):
             connection.execute("DELETE FROM risk_cancel_dispatch_resolutions")
 
+
+def test_cancel_dispatch_resolution_receipt_projects_unresolved_active_latch(
+    tmp_path, scope, policy
+):
+    gate, _intent, permit, binding, *_ = _claimed_cancel(tmp_path, scope, policy, name="receipt-open")
+
+    receipt = gate.cancel_dispatch_resolution_receipt(permit.permit_id)
+
+    assert receipt.status is CancelDispatchResolutionReceiptStatus.UNRESOLVED_ACTIVE
+    assert receipt.claim == binding
+    assert receipt.proof is None
+    assert receipt.proof_sha256 is None
+    assert receipt.dispatch_latch_active is True
+    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+
+
+def test_cancel_dispatch_resolution_receipt_rejects_scope_key_mismatch(
+    tmp_path, scope, policy
+):
+    gate, _intent, permit, binding, *_ = _claimed_cancel(
+        tmp_path, scope, policy, name="receipt-scope-mismatch"
+    )
+    with sqlite3.connect(gate._database_path) as connection:
+        connection.execute(
+            "UPDATE risk_reservations SET account_id = ? WHERE permit_id = ?",
+            ("different-account", permit.permit_id),
+        )
+
+    with pytest.raises(PermitInvalidError) as exc_info:
+        gate.cancel_dispatch_resolution_receipt(permit.permit_id)
+
+    assert exc_info.value.code == "CANCEL_DISPATCH_RESOLUTION_STATE_CONFLICT"
+    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+
+
+def test_cancel_dispatch_resolution_receipt_reads_exact_persisted_terminal_proof(
+    tmp_path, scope, policy
+):
+    authority = FakeCancelJournalAuthority()
+    gate, _intent, permit, binding, execution_scope_key, cancel_id, fingerprint = _claimed_cancel(
+        tmp_path, scope, policy, authority=authority, name="receipt-resolved", track_open_order=True
+    )
+    proof = _cancel_proof(
+        binding,
+        execution_scope_key=execution_scope_key,
+        cancel_id=cancel_id,
+        cancel_fingerprint=fingerprint,
+    )
+    authority.register(proof)
+    gate.resolve_cancel_dispatch_freeze(proof)
+
+    receipt = gate.cancel_dispatch_resolution_receipt(permit.permit_id)
+
+    assert receipt.status is CancelDispatchResolutionReceiptStatus.TERMINAL_RESOLVED
+    assert receipt.claim == binding
+    assert receipt.proof == proof
+    assert receipt.proof_sha256 == proof.fingerprint
+    assert receipt.dispatch_latch_active is False
+    assert gate.active_freeze_reasons(scope) == []
+    assert gate.snapshot(scope)["increase_count"] == 1
+    assert gate.snapshot(scope)["increase_notional"] == Decimal("40")
 
 def test_rejected_cancel_action_resolution_preserves_open_target_fact(tmp_path, scope, policy):
     authority = FakeCancelJournalAuthority()

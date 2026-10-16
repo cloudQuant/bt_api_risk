@@ -10,6 +10,8 @@ from importlib import import_module
 from .admission import (
     AccountScope,
     CancelDispatchResolutionProof,
+    CancelDispatchResolutionReceipt,
+    CancelDispatchResolutionReceiptStatus,
     CancelDispatchSource,
     CancelDispatchTerminalState,
     CancelTargetPostcondition,
@@ -133,6 +135,8 @@ __all__ = [
     "ClosablePositionCloseReceiptV1",
     "ClosablePositionRebaseV1",
     "CancelDispatchResolutionProof",
+    "CancelDispatchResolutionReceipt",
+    "CancelDispatchResolutionReceiptStatus",
     "CancelDispatchSource",
     "CancelDispatchTerminalState",
     "CancelTargetPostcondition",

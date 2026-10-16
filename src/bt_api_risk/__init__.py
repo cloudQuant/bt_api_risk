@@ -35,6 +35,8 @@ from .containers.risk_metrics import RiskMetrics
 from .core.admission import (
     AccountScope,
     CancelDispatchResolutionProof,
+    CancelDispatchResolutionReceipt,
+    CancelDispatchResolutionReceiptStatus,
     CancelDispatchSource,
     CancelDispatchTerminalState,
     CancelTargetPostcondition,
@@ -177,6 +179,8 @@ __all__ = [
     "ClosablePositionCloseReceiptV1",
     "ClosablePositionRebaseV1",
     "CancelDispatchResolutionProof",
+    "CancelDispatchResolutionReceipt",
+    "CancelDispatchResolutionReceiptStatus",
     "CancelDispatchSource",
     "CancelDispatchTerminalState",
     "CancelTargetPostcondition",
