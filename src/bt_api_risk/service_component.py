@@ -782,12 +782,12 @@ class PolicyCatalogStore:
     The store is operator-owned: it is opened by the trusted resource provider
     and borrowed by the service adapter. Lifecycle is
     ``draft`` -> ``approved`` -> ``published``; a reference is a version-keyed
-    policy identifier (``...-vN``) and is deduplicated by exact reference.
-    Published rows are immutable: a same-content re-draft or re-publish is
-    rejected with ``POLICY_ALREADY_PUBLISHED`` and an already-published
-    reference can never be replaced with different content. Reads and
-    effective receipts resolve only exact published versions; there is no
-    mutable ``latest`` pointer.
+    policy identifier (``...-vN``). An exact re-draft by the original owner
+    principal and scope replays the persisted state; a reference cannot be
+    reused with different content or owner binding. Published rows remain
+    immutable, and re-publishing one is rejected with
+    ``POLICY_ALREADY_PUBLISHED``. Reads and effective receipts resolve only
+    exact published versions; there is no mutable ``latest`` pointer.
     """
 
     _STATES: Final[frozenset[str]] = frozenset({"draft", "approved", "published"})
@@ -1148,8 +1148,27 @@ class PolicyCatalogStore:
         content_json = _canonical_json(content, path="$.content")
         digest = hashlib.sha256(content_json.encode("utf-8")).hexdigest()
         with self._immediate():
-            if self._row(reference) is not None:
-                raise PolicyCatalogError("POLICY_ALREADY_PUBLISHED")
+            existing = self._row(reference)
+            if existing is not None:
+                # A caller may lose the HTTP/RPC reply after the immutable
+                # draft committed.  Replaying the exact same request is safe
+                # and reports the persisted state without resetting approval
+                # or publication metadata.  A reused reference with any
+                # different content or owner binding remains a hard conflict.
+                if (
+                    existing["digest"] != digest
+                    or existing["content_json"] != content_json
+                    or existing["owner_principal"] != principal_ref
+                    or existing["owner_scope_json"] != scope_json
+                ):
+                    raise PolicyCatalogError("POLICY_DRAFT_CONFLICT")
+                if existing["state"] not in {"draft", "approved", "published"}:
+                    raise PolicyCatalogError("POLICY_STATE_CONFLICT")
+                return {
+                    "policy_ref": reference,
+                    "policy_version": existing["digest"],
+                    "state": existing["state"],
+                }
             self._db.execute(
                 "INSERT INTO policy_catalog_versions "
                 "(reference, state, digest, content_json, owner_principal, "
