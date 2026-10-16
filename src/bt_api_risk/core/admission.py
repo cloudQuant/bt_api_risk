@@ -99,6 +99,111 @@ class IntentAction(str, Enum):
     UNKNOWN_EFFECT = "unknown_effect"
 
 
+class RiskExposureKind(str, Enum):
+    """Typed dimensions which may be atomically reserved with an increase."""
+
+    CONTRACT_NOTIONAL = "contract_notional"
+    UNDERLYING_NOTIONAL = "underlying_notional"
+    DELTA = "delta"
+    GAMMA = "gamma"
+    VEGA = "vega"
+
+    @property
+    def is_gross(self) -> bool:
+        return self in {
+            RiskExposureKind.CONTRACT_NOTIONAL,
+            RiskExposureKind.UNDERLYING_NOTIONAL,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RiskExposureLimit:
+    """One immutable account-policy ceiling for a canonical risk dimension."""
+
+    kind: RiskExposureKind
+    dimension_key: str
+    unit: str
+    max_abs_exposure: Decimal
+
+    def __post_init__(self) -> None:
+        if type(self.kind) is not RiskExposureKind:
+            raise ValueError("kind must be a RiskExposureKind")
+        if (
+            type(self.dimension_key) is not str
+            or not _ALLOCATION_INSTRUMENT.fullmatch(self.dimension_key)
+        ):
+            raise ValueError("invalid dimension_key")
+        unit_pattern = _NOTIONAL_UNIT if self.kind.is_gross else _ALLOCATION_ID
+        if type(self.unit) is not str or not unit_pattern.fullmatch(self.unit):
+            raise ValueError("invalid risk-dimension unit")
+        try:
+            value = _as_decimal(self.max_abs_exposure)
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError("max_abs_exposure must be a positive finite decimal") from error
+        if value <= 0:
+            raise ValueError("max_abs_exposure must be a positive finite decimal")
+        object.__setattr__(self, "max_abs_exposure", value)
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "dimension_key": self.dimension_key,
+            "kind": self.kind.value,
+            "max_abs_exposure": _decimal_text(self.max_abs_exposure),
+            "unit": self.unit,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class RiskExposureDimension:
+    """Source-bound exposure contribution carried by one mapped opening intent."""
+
+    kind: RiskExposureKind
+    dimension_key: str
+    unit: str
+    exposure: Decimal
+    source_sha256: str
+    observed_at_ns: int
+    valid_until_ns: int
+
+    def __post_init__(self) -> None:
+        if type(self.kind) is not RiskExposureKind:
+            raise ValueError("kind must be a RiskExposureKind")
+        if (
+            type(self.dimension_key) is not str
+            or not _ALLOCATION_INSTRUMENT.fullmatch(self.dimension_key)
+        ):
+            raise ValueError("invalid dimension_key")
+        unit_pattern = _NOTIONAL_UNIT if self.kind.is_gross else _ALLOCATION_ID
+        if type(self.unit) is not str or not unit_pattern.fullmatch(self.unit):
+            raise ValueError("invalid risk-dimension unit")
+        try:
+            value = _as_decimal(self.exposure)
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError("exposure must be a finite decimal") from error
+        if self.kind.is_gross and value <= 0:
+            raise ValueError("gross exposure must be a positive finite decimal")
+        _require_sha256(self.source_sha256, "source_sha256")
+        if (
+            type(self.observed_at_ns) is not int
+            or type(self.valid_until_ns) is not int
+            or self.observed_at_ns <= 0
+            or self.valid_until_ns <= self.observed_at_ns
+        ):
+            raise ValueError("risk-dimension facts require a positive ordered validity interval")
+        object.__setattr__(self, "exposure", value)
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "dimension_key": self.dimension_key,
+            "exposure": _decimal_text(self.exposure),
+            "kind": self.kind.value,
+            "observed_at_ns": self.observed_at_ns,
+            "source_sha256": self.source_sha256,
+            "unit": self.unit,
+            "valid_until_ns": self.valid_until_ns,
+        }
+
+
 @dataclass(frozen=True)
 class AccountScope:
     """The immutable account/environment boundary of a permit."""
@@ -149,6 +254,7 @@ class RiskPolicy:
     max_gross_occupancy_notional: Optional[Decimal] = None  # noqa: UP045 -- Python 3.9 is supported.
     max_gross_occupancy_intent_count: Optional[int] = None  # noqa: UP045 -- Python 3.9 is supported.
     max_exposure_facts_age_seconds: Optional[float] = None  # noqa: UP045 -- Python 3.9 is supported.
+    exposure_dimension_limits: tuple[RiskExposureLimit, ...] = ()
 
     def __post_init__(self) -> None:
         try:
@@ -216,9 +322,27 @@ class RiskPolicy:
                 raise ValueError(
                     "LIVE_GROSS requires a fixed unit, strategy allocations, and explicit caps/freshness"
                 )
+        try:
+            dimension_limits = tuple(self.exposure_dimension_limits)
+        except TypeError as exc:
+            raise ValueError("exposure_dimension_limits must be an iterable of limits") from exc
+        if any(type(limit) is not RiskExposureLimit for limit in dimension_limits):
+            raise ValueError("exposure_dimension_limits must contain typed limits")
+        dimension_limit_keys = [
+            (limit.kind, limit.dimension_key) for limit in dimension_limits
+        ]
+        if len(set(dimension_limit_keys)) != len(dimension_limit_keys):
+            raise ValueError("exposure_dimension_limits contains duplicate keys")
+        dimension_limits = tuple(
+            sorted(
+                dimension_limits,
+                key=lambda item: (item.kind.value, item.dimension_key, item.unit),
+            )
+        )
         object.__setattr__(self, "max_increase_notional", limit)
         if gross_cap is not None:
             object.__setattr__(self, "max_gross_occupancy_notional", gross_cap)
+        object.__setattr__(self, "exposure_dimension_limits", dimension_limits)
 
     @property
     def fingerprint(self) -> str:
@@ -247,6 +371,10 @@ class RiskPolicy:
                     ),
                 }
             )
+        if self.exposure_dimension_limits:
+            payload["exposure_dimension_limits"] = [
+                item.to_payload() for item in self.exposure_dimension_limits
+            ]
         return _sha256(_canonical_json(payload))
 
 
@@ -273,6 +401,7 @@ class RiskIntent:
     instrument_facts_observed_at_ns: Optional[int] = None  # noqa: UP045 -- Python 3.9 is supported.
     instrument_facts_valid_until_ns: Optional[int] = None  # noqa: UP045 -- Python 3.9 is supported.
     resource: Optional[AccountResourceKey] = None  # noqa: UP045 -- Python 3.9 is supported.
+    exposure_dimensions: tuple[RiskExposureDimension, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.intent_id.strip():
@@ -292,6 +421,24 @@ class RiskIntent:
             _require_sha256(self.exposure_profile_fingerprint, "exposure_profile_fingerprint")
         if self.resource is not None and not isinstance(self.resource, AccountResourceKey):
             raise ValueError("resource must be an AccountResourceKey")
+        try:
+            exposure_dimensions = tuple(self.exposure_dimensions)
+        except TypeError as exc:
+            raise ValueError("exposure_dimensions must be an iterable of typed dimensions") from exc
+        if any(type(item) is not RiskExposureDimension for item in exposure_dimensions):
+            raise ValueError("exposure_dimensions must contain typed dimensions")
+        dimension_keys = [(item.kind, item.dimension_key) for item in exposure_dimensions]
+        if len(set(dimension_keys)) != len(dimension_keys):
+            raise ValueError("exposure_dimensions contains duplicate keys")
+        if exposure_dimensions and self.action is not IntentAction.INCREASE:
+            raise ValueError("risk exposure dimensions may be carried only by increases")
+        exposure_dimensions = tuple(
+            sorted(
+                exposure_dimensions,
+                key=lambda item: (item.kind.value, item.dimension_key, item.unit),
+            )
+        )
+        object.__setattr__(self, "exposure_dimensions", exposure_dimensions)
         if any(
             value is not None
             for value in (
@@ -376,6 +523,10 @@ class RiskIntent:
                 "margin_pool": self.resource.margin_pool,
                 "product_type": self.resource.product_type,
             }
+        if self.exposure_dimensions:
+            payload["exposure_dimensions"] = [
+                item.to_payload() for item in self.exposure_dimensions
+            ]
         return _sha256(_canonical_json(payload))
 
 
@@ -3071,6 +3222,7 @@ class DurableRiskGate:
                 self._assert_increase_limit(connection, intent)
                 self._assert_strategy_allocation_limit(connection, intent)
                 self._assert_margin_pool_limit(connection, intent)
+                self._assert_exposure_dimension_limits(connection, intent)
                 self._assert_self_trade_absent(connection, intent)
                 if live_gross:
                     self._assert_live_gross_limits(connection, intent)
@@ -3138,6 +3290,7 @@ class DurableRiskGate:
                     None if shared_domain is None else shared_domain["revision"],
                 ),
             )
+            self._insert_exposure_dimensions(connection, permit.permit_id, intent)
             if live_gross and intent.action is IntentAction.INCREASE:
                 # Re-read the clock immediately before COMMIT.  The new permit
                 # is already in this transaction, so the usage projection
@@ -3315,6 +3468,7 @@ class DurableRiskGate:
                 self._assert_increase_limit(connection, intent)
                 self._assert_strategy_allocation_limit(connection, intent)
                 self._assert_margin_pool_limit(connection, intent)
+                self._assert_exposure_dimension_limits(connection, intent)
                 self._assert_self_trade_absent(connection, intent)
                 if live_gross:
                     self._assert_live_gross_limits(connection, intent)
@@ -3392,6 +3546,7 @@ class DurableRiskGate:
                         ),
                     ),
                 )
+                self._insert_exposure_dimensions(connection, permit.permit_id, intent)
             commit_now_ns = self._now_ns()
             for leg in ordered_legs:
                 self._assert_group_exposure_facts(leg.intent, commit_now_ns)
@@ -7062,12 +7217,14 @@ class DurableRiskGate:
             intent.action is not IntentAction.INCREASE
         ):
             return
+        now_ns = self._now_ns()
+        self._assert_exposure_dimension_facts(intent, now_ns, invalid=invalid)
         if (
             intent.instrument_facts_observed_at_ns is None
             and intent.instrument_facts_valid_until_ns is None
         ):
             return
-        self._assert_instrument_facts(intent, self._now_ns(), invalid=invalid)
+        self._assert_instrument_facts(intent, now_ns, invalid=invalid)
 
     @staticmethod
     def _assert_group_exposure_facts(
@@ -7096,6 +7253,28 @@ class DurableRiskGate:
                 "GROUP_EXPOSURE_FACTS_STALE",
                 "group instrument facts are not current at the Risk transaction boundary",
             )
+        DurableRiskGate._assert_exposure_dimension_facts(
+            intent, now_ns, invalid=invalid, error_type=error_type
+        )
+
+    @staticmethod
+    def _assert_exposure_dimension_facts(
+        intent: RiskIntent,
+        now_ns: int,
+        *,
+        invalid: bool = False,
+        error_type: Optional[type[RiskGateError]] = None,
+    ) -> None:
+        if not intent.exposure_dimensions:
+            return
+        if error_type is None:
+            error_type = PermitInvalidError if invalid else RiskDeniedError
+        for dimension in intent.exposure_dimensions:
+            if not dimension.observed_at_ns <= now_ns < dimension.valid_until_ns:
+                raise error_type(
+                    "RISK_EXPOSURE_DIMENSION_STALE",
+                    "risk dimension facts are not current at the reservation boundary",
+                )
 
     def _validate_group_claim_row(self, reservation: sqlite3.Row, claim: sqlite3.Row) -> RiskIntent:
         """Verify the immutable reservation-to-child claim row binding."""
@@ -8745,6 +8924,207 @@ class DurableRiskGate:
         )
         self._assert_shared_reservation_binding(connection, permit_id, shared_domain)
 
+    def _assert_exposure_dimension_limits(
+        self, connection: sqlite3.Connection, intent: RiskIntent
+    ) -> None:
+        """Check configured concentration and Greek dimensions under the writer lock."""
+
+        if intent.action is not IntentAction.INCREASE:
+            return
+        limits = self._policy.exposure_dimension_limits
+        if not limits:
+            if intent.exposure_dimensions:
+                raise RiskDeniedError(
+                    "RISK_EXPOSURE_DIMENSION_POLICY_UNAVAILABLE",
+                    "intent carries risk dimensions but the bound policy has no dimension limits",
+                )
+            return
+
+        required_kinds = {item.kind for item in limits}
+        dimensions_by_kind: dict[RiskExposureKind, list[RiskExposureDimension]] = {}
+        for dimension in intent.exposure_dimensions:
+            dimensions_by_kind.setdefault(dimension.kind, []).append(dimension)
+        if set(dimensions_by_kind) != required_kinds or any(
+            len(items) != 1 for items in dimensions_by_kind.values()
+        ):
+            raise RiskDeniedError(
+                "RISK_EXPOSURE_DIMENSIONS_INCOMPLETE",
+                "increase intent does not carry one trusted value for every configured risk dimension",
+            )
+
+        limits_by_key = {
+            (item.kind, item.dimension_key, item.unit): item for item in limits
+        }
+        for dimension in intent.exposure_dimensions:
+            limit = limits_by_key.get(
+                (dimension.kind, dimension.dimension_key, dimension.unit)
+            )
+            if limit is None:
+                raise RiskDeniedError(
+                    "RISK_EXPOSURE_DIMENSION_LIMIT_UNAVAILABLE",
+                    "risk dimension has no exact account-policy ceiling",
+                )
+
+        live_reservations = connection.execute(
+            """SELECT reservation.permit_id
+               FROM risk_reservations AS reservation
+               WHERE reservation.scope_key = ? AND reservation.action = ?
+                 AND (reservation.status IN (?, ?) OR EXISTS (
+                   SELECT 1 FROM risk_order_exposures AS exposure
+                   WHERE exposure.permit_id = reservation.permit_id AND exposure.state = ?
+                 ))""",
+            (
+                intent.scope.key,
+                IntentAction.INCREASE.value,
+                self._ACTIVE,
+                self._SETTLED,
+                OrderExposureState.UNKNOWN.value,
+            ),
+        ).fetchall()
+        if live_reservations:
+            live_permit_ids = {str(row["permit_id"]) for row in live_reservations}
+            live_dimensions = connection.execute(
+                """SELECT permit_id, dimension_kind, dimension_key, unit, exposure,
+                          source_sha256, observed_at_ns, valid_until_ns
+                   FROM risk_reservation_dimensions WHERE scope_key = ?""",
+                (intent.scope.key,),
+            ).fetchall()
+            dimensions_by_permit: dict[str, list[RiskExposureKind]] = {}
+            limits_by_identity = {
+                (item.kind, item.dimension_key, item.unit): item for item in limits
+            }
+            for row in live_dimensions:
+                permit_id = str(row["permit_id"])
+                if permit_id in live_permit_ids:
+                    try:
+                        kind = RiskExposureKind(str(row["dimension_kind"]))
+                        dimension_key = str(row["dimension_key"])
+                        unit = str(row["unit"])
+                        exposure = _as_decimal(row["exposure"])
+                        _require_sha256(row["source_sha256"], "stored source_sha256")
+                        observed_at_ns = int(row["observed_at_ns"])
+                        valid_until_ns = int(row["valid_until_ns"])
+                        if (
+                            observed_at_ns <= 0
+                            or valid_until_ns <= observed_at_ns
+                            or (kind.is_gross and exposure <= 0)
+                            or (kind, dimension_key, unit) not in limits_by_identity
+                        ):
+                            raise ValueError("stored dimension does not match configured policy")
+                    except (TypeError, ValueError) as error:
+                        raise RiskDeniedError(
+                            "RISK_EXPOSURE_DIMENSION_HISTORY_INVALID",
+                            "stored risk dimension is invalid or does not match the configured policy",
+                        ) from error
+                    dimensions_by_permit.setdefault(permit_id, []).append(kind)
+            if any(
+                set(dimensions_by_permit.get(permit_id, ())) != required_kinds
+                or len(dimensions_by_permit.get(permit_id, ())) != len(required_kinds)
+                for permit_id in live_permit_ids
+            ):
+                raise RiskDeniedError(
+                    "RISK_EXPOSURE_DIMENSION_HISTORY_UNAVAILABLE",
+                    "an active, settled, or UNKNOWN increase lacks the configured risk dimensions",
+                )
+
+        for dimension in intent.exposure_dimensions:
+            limit = limits_by_key[(dimension.kind, dimension.dimension_key, dimension.unit)]
+            other_units = connection.execute(
+                """SELECT DISTINCT dimension.unit
+                   FROM risk_reservation_dimensions AS dimension
+                   JOIN risk_reservations AS reservation
+                     ON reservation.permit_id = dimension.permit_id
+                   WHERE reservation.scope_key = ? AND reservation.action = ?
+                     AND dimension.dimension_kind = ? AND dimension.dimension_key = ?
+                     AND (reservation.status IN (?, ?) OR EXISTS (
+                       SELECT 1 FROM risk_order_exposures AS exposure
+                       WHERE exposure.permit_id = reservation.permit_id AND exposure.state = ?
+                     ))""",
+                (
+                    intent.scope.key,
+                    IntentAction.INCREASE.value,
+                    dimension.kind.value,
+                    dimension.dimension_key,
+                    self._ACTIVE,
+                    self._SETTLED,
+                    OrderExposureState.UNKNOWN.value,
+                ),
+            ).fetchall()
+            if any(str(row["unit"]) != dimension.unit for row in other_units):
+                raise RiskDeniedError(
+                    "RISK_EXPOSURE_DIMENSION_UNIT_UNAVAILABLE",
+                    "existing exposure for this dimension uses another unit",
+                )
+            rows = connection.execute(
+                """SELECT dimension.exposure
+                   FROM risk_reservation_dimensions AS dimension
+                   JOIN risk_reservations AS reservation
+                     ON reservation.permit_id = dimension.permit_id
+                   WHERE reservation.scope_key = ? AND reservation.action = ?
+                     AND dimension.dimension_kind = ? AND dimension.dimension_key = ?
+                     AND dimension.unit = ?
+                     AND (reservation.status IN (?, ?) OR EXISTS (
+                       SELECT 1 FROM risk_order_exposures AS exposure
+                       WHERE exposure.permit_id = reservation.permit_id AND exposure.state = ?
+                     ))""",
+                (
+                    intent.scope.key,
+                    IntentAction.INCREASE.value,
+                    dimension.kind.value,
+                    dimension.dimension_key,
+                    dimension.unit,
+                    self._ACTIVE,
+                    self._SETTLED,
+                    OrderExposureState.UNKNOWN.value,
+                ),
+            ).fetchall()
+            total = sum(
+                (
+                    abs(Fraction(_as_decimal(row["exposure"])))
+                    if dimension.kind.is_gross
+                    else Fraction(_as_decimal(row["exposure"]))
+                    for row in rows
+                ),
+                Fraction(0),
+            )
+            total += (
+                abs(Fraction(dimension.exposure))
+                if dimension.kind.is_gross
+                else Fraction(dimension.exposure)
+            )
+            if abs(total) > Fraction(limit.max_abs_exposure):
+                raise RiskDeniedError(
+                    "RISK_EXPOSURE_DIMENSION_LIMIT_EXHAUSTED",
+                    "atomic account concentration or Greek exposure limit exceeded",
+                )
+
+    @staticmethod
+    def _insert_exposure_dimensions(
+        connection: sqlite3.Connection, permit_id: str, intent: RiskIntent
+    ) -> None:
+        if not intent.exposure_dimensions:
+            return
+        connection.executemany(
+            """INSERT INTO risk_reservation_dimensions (
+                   permit_id, scope_key, dimension_kind, dimension_key, unit, exposure,
+                   source_sha256, observed_at_ns, valid_until_ns
+               ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                (
+                    permit_id,
+                    intent.scope.key,
+                    dimension.kind.value,
+                    dimension.dimension_key,
+                    dimension.unit,
+                    _decimal_text(dimension.exposure),
+                    dimension.source_sha256,
+                    dimension.observed_at_ns,
+                    dimension.valid_until_ns,
+                )
+                for dimension in intent.exposure_dimensions
+            ),
+        )
+
     def _assert_margin_pool_limit(self, connection: sqlite3.Connection, intent: RiskIntent) -> None:
         """Enforce the applicable margin-pool ceiling inside the write transaction.
 
@@ -9514,6 +9894,31 @@ class DurableRiskGate:
                     shared_collateral_domain_id TEXT,
                     shared_collateral_domain_revision TEXT
                 );
+                CREATE TABLE IF NOT EXISTS risk_reservation_dimensions (
+                    permit_id TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    dimension_kind TEXT NOT NULL,
+                    dimension_key TEXT NOT NULL,
+                    unit TEXT NOT NULL,
+                    exposure TEXT NOT NULL,
+                    source_sha256 TEXT NOT NULL,
+                    observed_at_ns INTEGER NOT NULL,
+                    valid_until_ns INTEGER NOT NULL,
+                    PRIMARY KEY(permit_id, dimension_kind, dimension_key),
+                    FOREIGN KEY(permit_id) REFERENCES risk_reservations(permit_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_risk_reservation_dimensions_scope
+                    ON risk_reservation_dimensions(scope_key, dimension_kind, dimension_key);
+                CREATE TRIGGER IF NOT EXISTS risk_reservation_dimensions_immutable_update
+                BEFORE UPDATE ON risk_reservation_dimensions
+                BEGIN
+                    SELECT RAISE(ABORT, 'reservation risk dimensions are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS risk_reservation_dimensions_immutable_delete
+                BEFORE DELETE ON risk_reservation_dimensions
+                BEGIN
+                    SELECT RAISE(ABORT, 'reservation risk dimensions are immutable');
+                END;
                 CREATE INDEX IF NOT EXISTS idx_risk_reservations_scope_status
                     ON risk_reservations(scope_key, status, action);
                 CREATE TABLE IF NOT EXISTS risk_freezes (
@@ -10222,6 +10627,12 @@ def _risk_intent_json(intent: RiskIntent) -> str:
         },
         "strategy_id": intent.strategy_id,
     }
+    if intent.exposure_dimensions:
+        # Preserve canonical bytes for historical group intents while ensuring
+        # newly dimensioned child intents are fully recoverable and pinned.
+        payload["exposure_dimensions"] = [
+            item.to_payload() for item in intent.exposure_dimensions
+        ]
     if intent.resource is not None:
         # Older stored documents never carry this key; keep them canonical by
         # adding the resource section only for intents that declare one.
@@ -10252,10 +10663,13 @@ def _risk_intent_from_json(raw: str) -> RiskIntent:
         "scope",
         "strategy_id",
     }
-    if type(parsed) is not dict or set(parsed) not in (
+    allowed_shapes = (
         expected_keys,
         expected_keys | {"resource"},
-    ):
+        expected_keys | {"exposure_dimensions"},
+        expected_keys | {"resource", "exposure_dimensions"},
+    )
+    if type(parsed) is not dict or set(parsed) not in allowed_shapes:
         raise ValueError("invalid stored child intent shape")
     scope_raw = parsed["scope"]
     if type(scope_raw) is not dict or set(scope_raw) != {
@@ -10270,6 +10684,39 @@ def _risk_intent_from_json(raw: str) -> RiskIntent:
             resource = AccountResourceKey.from_dict(parsed["resource"])
         except (TypeError, ValueError) as exc:
             raise ValueError("invalid stored child intent resource") from exc
+    exposure_dimensions: tuple[RiskExposureDimension, ...] = ()
+    if "exposure_dimensions" in parsed:
+        raw_dimensions = parsed["exposure_dimensions"]
+        if type(raw_dimensions) is not list:
+            raise ValueError("invalid stored child risk dimensions")
+        try:
+            exposure_dimensions = tuple(
+                RiskExposureDimension(
+                    kind=RiskExposureKind(item["kind"]),
+                    dimension_key=item["dimension_key"],
+                    unit=item["unit"],
+                    exposure=Decimal(item["exposure"]),
+                    source_sha256=item["source_sha256"],
+                    observed_at_ns=item["observed_at_ns"],
+                    valid_until_ns=item["valid_until_ns"],
+                )
+                for item in raw_dimensions
+                if type(item) is dict
+                and set(item)
+                == {
+                    "dimension_key",
+                    "exposure",
+                    "kind",
+                    "observed_at_ns",
+                    "source_sha256",
+                    "unit",
+                    "valid_until_ns",
+                }
+            )
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("invalid stored child risk dimensions") from exc
+        if len(exposure_dimensions) != len(raw_dimensions):
+            raise ValueError("invalid stored child risk dimensions")
     intent = RiskIntent(
         intent_id=parsed["intent_id"],
         scope=AccountScope(
@@ -10290,6 +10737,7 @@ def _risk_intent_from_json(raw: str) -> RiskIntent:
         instrument_facts_observed_at_ns=parsed["instrument_facts_observed_at_ns"],
         instrument_facts_valid_until_ns=parsed["instrument_facts_valid_until_ns"],
         resource=resource,
+        exposure_dimensions=exposure_dimensions,
     )
     if _risk_intent_json(intent) != raw:
         raise ValueError("stored child intent is not canonical")
@@ -10423,6 +10871,9 @@ __all__ = [
     "IntentAction",
     "PermitInvalidError",
     "RiskDeniedError",
+    "RiskExposureDimension",
+    "RiskExposureKind",
+    "RiskExposureLimit",
     "RiskGateError",
     "RiskGroupLegClaimReceipt",
     "RiskGroupLegIntent",

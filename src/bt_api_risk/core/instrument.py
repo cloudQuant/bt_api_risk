@@ -30,6 +30,9 @@ from .admission import (
     AccountScope,
     IntentAction,
     RiskDeniedError,
+    RiskExposureDimension,
+    RiskExposureKind,
+    RiskExposureLimit,
     RiskIntent,
     StrategyAllocationSnapshot,
 )
@@ -42,6 +45,7 @@ _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 _INSTRUMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,191}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 _NOTIONAL_UNIT = re.compile(r"^[A-Z][A-Z0-9]{2,11}$")
+_GREEK_UNIT = re.compile(r"^[A-Z][A-Z0-9.:-]{0,63}$")
 _BPS_DENOMINATOR = Decimal("10000")
 
 
@@ -184,6 +188,7 @@ class InstrumentRiskMetadata:
     quote_currency: Optional[str] = None  # noqa: UP045 -- package supports Python 3.9.
     fx_source_ref: Optional[str] = None  # noqa: UP045 -- package supports Python 3.9.
     fixed_fee_unit: Optional[str] = None  # noqa: UP045 -- package supports Python 3.9.
+    underlying_ref: Optional[str] = None  # noqa: UP045 -- package supports Python 3.9.
 
     def __post_init__(self) -> None:
         object.__setattr__(
@@ -269,6 +274,12 @@ class InstrumentRiskMetadata:
                 allowed_fee_units.add(self.quote_currency)
             if self.fixed_fee_unit not in allowed_fee_units:
                 raise ValueError("fixed_fee_unit must match the quote or valuation unit")
+        if self.underlying_ref is not None:
+            object.__setattr__(
+                self,
+                "underlying_ref",
+                _identifier(self.underlying_ref, "underlying_ref", instrument=True),
+            )
         if cross_currency and self.fixed_fee > 0 and self.fixed_fee_unit is None:
             raise ValueError("cross-currency fixed_fee requires an explicit fixed_fee_unit")
         if (
@@ -307,6 +318,8 @@ class InstrumentRiskMetadata:
             payload["fx_source_ref"] = self.fx_source_ref
         if self.fixed_fee_unit is not None:
             payload["fixed_fee_unit"] = self.fixed_fee_unit
+        if self.underlying_ref is not None:
+            payload["underlying_ref"] = self.underlying_ref
         return payload
 
     @property
@@ -386,6 +399,83 @@ class InstrumentRiskFxRate:
     @property
     def digest(self) -> str:
         """Return the stable digest of the exact source-bound FX fact."""
+
+        return _sha256(_canonical_json(self.to_payload()))
+
+
+@dataclass(frozen=True)
+class InstrumentRiskGreeks:
+    """Time-bounded, source-bound per-contract Greeks for one instrument.
+
+    Values describe the position produced by buying one contract. The mapper
+    applies order side, quantity, and the trusted contract multiplier before
+    the account gate reserves the resulting signed dimensions.
+    """
+
+    instrument: str
+    underlying_ref: str
+    delta_per_contract: Decimal
+    delta_unit: str
+    gamma_per_contract: Decimal
+    gamma_unit: str
+    vega_per_contract: Decimal
+    vega_unit: str
+    observed_at_ns: int
+    valid_until_ns: int
+    source_ref: str
+    source_revision: str
+    source_record_sha256: str
+
+    def __post_init__(self) -> None:
+        object.__setattr__(
+            self,
+            "instrument",
+            _identifier(self.instrument, "instrument", instrument=True),
+        )
+        object.__setattr__(
+            self,
+            "underlying_ref",
+            _identifier(self.underlying_ref, "underlying_ref", instrument=True),
+        )
+        for name in ("delta_per_contract", "gamma_per_contract", "vega_per_contract"):
+            object.__setattr__(self, name, _decimal(getattr(self, name), name))
+        for name in ("delta_unit", "gamma_unit", "vega_unit"):
+            value = getattr(self, name)
+            if type(value) is not str or not _GREEK_UNIT.fullmatch(value):
+                raise ValueError("invalid " + name)
+        if type(self.observed_at_ns) is not int or self.observed_at_ns <= 0:
+            raise ValueError("invalid observed_at_ns")
+        if type(self.valid_until_ns) is not int or self.valid_until_ns <= self.observed_at_ns:
+            raise ValueError("invalid valid_until_ns")
+        object.__setattr__(self, "source_ref", _identifier(self.source_ref, "source_ref"))
+        object.__setattr__(
+            self,
+            "source_revision",
+            _identifier(self.source_revision, "source_revision"),
+        )
+        _digest(self.source_record_sha256, "source_record_sha256")
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "delta_per_contract": _decimal_text(self.delta_per_contract),
+            "delta_unit": self.delta_unit,
+            "gamma_per_contract": _decimal_text(self.gamma_per_contract),
+            "gamma_unit": self.gamma_unit,
+            "instrument": self.instrument,
+            "observed_at_ns": self.observed_at_ns,
+            "schema": "bt_api_risk.instrument-greeks.v1",
+            "source_record_sha256": self.source_record_sha256,
+            "source_ref": self.source_ref,
+            "source_revision": self.source_revision,
+            "underlying_ref": self.underlying_ref,
+            "valid_until_ns": self.valid_until_ns,
+            "vega_per_contract": _decimal_text(self.vega_per_contract),
+            "vega_unit": self.vega_unit,
+        }
+
+    @property
+    def digest(self) -> str:
+        """Return the stable digest of the exact source-bound Greeks fact."""
 
         return _sha256(_canonical_json(self.to_payload()))
 
@@ -782,6 +872,12 @@ class InstrumentRiskAdmissionMapper:
         resource_by_instrument: Optional[
             Mapping[str, AccountResourceKey]
         ] = None,  # noqa: UP045 -- Python 3.9 is supported.
+        exposure_dimension_limits: Optional[
+            Iterable[RiskExposureLimit]
+        ] = None,  # noqa: UP045 -- Python 3.9 is supported.
+        greeks_by_instrument: Optional[
+            Iterable[InstrumentRiskGreeks]
+        ] = None,  # noqa: UP045 -- Python 3.9 is supported.
     ) -> None:
         if not isinstance(scope, AccountScope):
             raise ValueError("scope must be an AccountScope")
@@ -818,6 +914,45 @@ class InstrumentRiskAdmissionMapper:
         self._allocation_reader = allocation_reader
         self._wire_account_ref = wire_account_ref
         self._fx_rates_by_instrument = fx_rates
+        exposure_limits: list[RiskExposureLimit] = []
+        if exposure_dimension_limits is not None:
+            if isinstance(exposure_dimension_limits, (str, bytes)):
+                raise ValueError("exposure_dimension_limits must contain typed limits")
+            try:
+                for limit in exposure_dimension_limits:
+                    if type(limit) is not RiskExposureLimit:
+                        raise ValueError("exposure_dimension_limits must contain typed limits")
+                    if any(
+                        existing.kind is limit.kind
+                        and existing.dimension_key == limit.dimension_key
+                        for existing in exposure_limits
+                    ):
+                        raise ValueError("duplicate risk exposure dimension limit")
+                    exposure_limits.append(limit)
+            except TypeError as error:
+                raise ValueError("exposure_dimension_limits must be iterable") from error
+        greeks: dict[str, InstrumentRiskGreeks] = {}
+        if greeks_by_instrument is not None:
+            if isinstance(greeks_by_instrument, (str, bytes)):
+                raise ValueError("greeks_by_instrument must contain typed facts")
+            try:
+                for fact in greeks_by_instrument:
+                    if type(fact) is not InstrumentRiskGreeks:
+                        raise ValueError("greeks_by_instrument must contain typed facts")
+                    if fact.instrument not in registry.instruments:
+                        raise ValueError("Greeks fact instrument is not registered")
+                    if fact.instrument in greeks:
+                        raise ValueError("duplicate instrument Greeks fact")
+                    greeks[fact.instrument] = fact
+            except TypeError as error:
+                raise ValueError("greeks_by_instrument must be iterable") from error
+        self._exposure_dimension_limits = tuple(
+            sorted(
+                exposure_limits,
+                key=lambda item: (item.kind.value, item.dimension_key, item.unit),
+            )
+        )
+        self._greeks_by_instrument = MappingProxyType(greeks)
         resources: dict[str, AccountResourceKey] = {}
         if resource_by_instrument is not None:
             if not isinstance(resource_by_instrument, Mapping):
@@ -948,9 +1083,11 @@ class InstrumentRiskAdmissionMapper:
         notional_unit = None
         instrument_facts_observed_at_ns = None
         instrument_facts_valid_until_ns = None
+        exposure_dimensions: tuple[RiskExposureDimension, ...] = ()
         if position_effect == "OPEN":
             self._verify_fx_source_binding(order)
-            assessment = self._registry.assess(order, self._clock_ns())
+            assessment_now_ns = self._clock_ns()
+            assessment = self._registry.assess(order, assessment_now_ns)
             action = IntentAction.INCREASE
             notional = assessment.gross_notional
             payload_fingerprint = assessment.bound_payload_fingerprint(intent_fingerprint)
@@ -968,6 +1105,38 @@ class InstrumentRiskAdmissionMapper:
                 instrument_facts_valid_until_ns = min(
                     assessment.metadata.expires_at_ns,
                     assessment.fx_rate.valid_until_ns,
+                )
+            exposure_dimensions, dimensions_observed_at_ns, dimensions_valid_until_ns = (
+                self._build_exposure_dimensions(
+                    assessment,
+                    intent,
+                    intent_fingerprint,
+                    assessment_now_ns,
+                )
+            )
+            if exposure_dimensions:
+                if instrument_facts_observed_at_ns is None:
+                    instrument_facts_observed_at_ns = dimensions_observed_at_ns
+                    instrument_facts_valid_until_ns = dimensions_valid_until_ns
+                else:
+                    instrument_facts_observed_at_ns = max(
+                        instrument_facts_observed_at_ns,
+                        dimensions_observed_at_ns,
+                    )
+                    instrument_facts_valid_until_ns = min(
+                        instrument_facts_valid_until_ns,
+                        dimensions_valid_until_ns,
+                    )
+                payload_fingerprint = _sha256(
+                    _canonical_json(
+                        {
+                            "assessment_fingerprint": payload_fingerprint,
+                            "exposure_dimensions": [
+                                item.to_payload() for item in exposure_dimensions
+                            ],
+                            "schema": "bt_api_risk.instrument-exposure-binding.v1",
+                        }
+                    )
                 )
             if self._allocation_reader is not None:
                 try:
@@ -1158,7 +1327,172 @@ class InstrumentRiskAdmissionMapper:
                 if action is IntentAction.INCREASE
                 else None
             ),
+            exposure_dimensions=(
+                exposure_dimensions if action is IntentAction.INCREASE else ()
+            ),
         )
+
+    def _build_exposure_dimensions(
+        self,
+        assessment: InstrumentRiskAssessment,
+        intent: Any,
+        intent_fingerprint: str,
+        now_ns: int,
+    ) -> tuple[tuple[RiskExposureDimension, ...], Optional[int], Optional[int]]:
+        """Project trusted metadata/Greeks into the configured risk dimensions."""
+
+        limits = self._exposure_dimension_limits
+        if not limits:
+            return (), None, None
+        metadata = assessment.metadata
+        fx_rate = assessment.fx_rate
+        observed_at_ns = metadata.as_of_ns
+        valid_until_ns = metadata.expires_at_ns
+        if fx_rate is not None:
+            observed_at_ns = max(observed_at_ns, fx_rate.observed_at_ns)
+            valid_until_ns = min(valid_until_ns, fx_rate.valid_until_ns)
+        notional_source_sha256 = _sha256(
+            _canonical_json(
+                {
+                    "assessment_binding_sha256": assessment.bound_payload_fingerprint(
+                        intent_fingerprint
+                    ),
+                    "schema": "bt_api_risk.instrument-notional-source.v1",
+                }
+            )
+        )
+
+        required_kinds = sorted({limit.kind for limit in limits}, key=lambda item: item.value)
+        greek_kinds = {
+            RiskExposureKind.DELTA,
+            RiskExposureKind.GAMMA,
+            RiskExposureKind.VEGA,
+        }
+        needs_greeks = any(kind in greek_kinds for kind in required_kinds)
+        greeks = self._greeks_by_instrument.get(metadata.instrument) if needs_greeks else None
+        side_sign = 0
+        if needs_greeks:
+            if metadata.underlying_ref is None:
+                raise RiskDeniedError(
+                    "INSTRUMENT_GREEK_UNDERLYING_UNAVAILABLE",
+                    "trusted instrument metadata has no underlying reference",
+                )
+            if greeks is None:
+                raise RiskDeniedError(
+                    "INSTRUMENT_GREEKS_REQUIRED",
+                    "no trusted source-bound Greeks are configured for this instrument",
+                )
+            if greeks.underlying_ref != metadata.underlying_ref:
+                raise RiskDeniedError(
+                    "INSTRUMENT_GREEK_UNDERLYING_MISMATCH",
+                    "Greeks underlying does not match trusted instrument metadata",
+                )
+            if not greeks.observed_at_ns <= now_ns < greeks.valid_until_ns:
+                raise RiskDeniedError(
+                    "INSTRUMENT_GREEKS_STALE",
+                    "trusted Greeks are not current at the admission boundary",
+                )
+            side = getattr(getattr(intent, "side", None), "value", None)
+            if side not in {"BUY", "SELL"}:
+                raise RiskDeniedError(
+                    "INSTRUMENT_GREEK_SIDE_UNPROVEN",
+                    "Greek reservation requires a canonical BUY or SELL side",
+                )
+            side_sign = 1 if side == "BUY" else -1
+            observed_at_ns = max(observed_at_ns, greeks.observed_at_ns)
+            valid_until_ns = min(valid_until_ns, greeks.valid_until_ns)
+        if not observed_at_ns <= now_ns < valid_until_ns:
+            raise RiskDeniedError(
+                "INSTRUMENT_EXPOSURE_FACTS_STALE",
+                "instrument valuation and risk dimensions are not jointly current",
+            )
+
+        dimensions: list[RiskExposureDimension] = []
+        greek_values = {
+            RiskExposureKind.DELTA: (
+                None if greeks is None else greeks.delta_per_contract,
+                None if greeks is None else greeks.delta_unit,
+            ),
+            RiskExposureKind.GAMMA: (
+                None if greeks is None else greeks.gamma_per_contract,
+                None if greeks is None else greeks.gamma_unit,
+            ),
+            RiskExposureKind.VEGA: (
+                None if greeks is None else greeks.vega_per_contract,
+                None if greeks is None else greeks.vega_unit,
+            ),
+        }
+        for kind in required_kinds:
+            if kind is RiskExposureKind.CONTRACT_NOTIONAL:
+                dimension_key = metadata.instrument
+                unit = metadata.valuation_unit
+                exposure = assessment.gross_notional
+                source_sha256 = notional_source_sha256
+            elif kind is RiskExposureKind.UNDERLYING_NOTIONAL:
+                dimension_key = metadata.underlying_ref
+                unit = metadata.valuation_unit
+                exposure = assessment.gross_notional
+                source_sha256 = notional_source_sha256
+                if dimension_key is None:
+                    raise RiskDeniedError(
+                        "INSTRUMENT_UNDERLYING_UNAVAILABLE",
+                        "trusted instrument metadata has no underlying reference",
+                    )
+            else:
+                if greeks is None:
+                    raise RiskDeniedError(
+                        "INSTRUMENT_GREEKS_REQUIRED",
+                        "no trusted source-bound Greeks are configured for this instrument",
+                    )
+                dimension_key = metadata.underlying_ref
+                greek_value, unit = greek_values[kind]
+                if greek_value is None or unit is None:
+                    raise RiskDeniedError(
+                        "INSTRUMENT_GREEKS_REQUIRED",
+                        "trusted Greeks omit a required risk dimension",
+                    )
+                with localcontext() as context:
+                    context.prec = _precision(
+                        assessment.order.quantity,
+                        metadata.contract_multiplier,
+                        greek_value,
+                    )
+                    exposure = (
+                        assessment.order.quantity
+                        * metadata.contract_multiplier
+                        * greek_value
+                        * side_sign
+                    )
+                source_sha256 = greeks.digest
+            if dimension_key is None or unit is None:
+                raise RiskDeniedError(
+                    "INSTRUMENT_EXPOSURE_UNIT_UNAVAILABLE",
+                    "configured risk dimension lacks a trusted key or unit",
+                )
+            matching_limits = [
+                limit
+                for limit in limits
+                if limit.kind is kind
+                and limit.dimension_key == dimension_key
+                and limit.unit == unit
+            ]
+            if len(matching_limits) != 1:
+                raise RiskDeniedError(
+                    "INSTRUMENT_EXPOSURE_LIMIT_UNAVAILABLE",
+                    "instrument facts do not match exactly one configured dimension key and unit",
+                )
+            dimensions.append(
+                RiskExposureDimension(
+                    kind=kind,
+                    dimension_key=dimension_key,
+                    unit=unit,
+                    exposure=exposure,
+                    source_sha256=source_sha256,
+                    observed_at_ns=observed_at_ns,
+                    valid_until_ns=valid_until_ns,
+                )
+            )
+        return tuple(dimensions), observed_at_ns, valid_until_ns
 
     def map_group_intent(self, intent: Any) -> RiskIntent:
         """Map an opening group order and bind its mapper-owned economic profile.
@@ -1212,6 +1546,27 @@ class InstrumentRiskAdmissionMapper:
             value = getattr(metadata, name)
             if value is not None:
                 profile_payload[name] = value
+        if self._exposure_dimension_limits:
+            profile_payload["risk_dimension_limits"] = [
+                item.to_payload() for item in self._exposure_dimension_limits
+            ]
+            profile_payload["underlying_ref"] = metadata.underlying_ref
+            greek_kinds = {
+                RiskExposureKind.DELTA,
+                RiskExposureKind.GAMMA,
+                RiskExposureKind.VEGA,
+            }
+            if any(item.kind in greek_kinds for item in self._exposure_dimension_limits):
+                greek_fact = self._greeks_by_instrument.get(metadata.instrument)
+                if greek_fact is None:
+                    # ``self(intent)`` normally raises this first. Keep the
+                    # group profile independently fail-closed if a subclass
+                    # or future mapper changes that projection.
+                    raise RiskDeniedError(
+                        "INSTRUMENT_GREEKS_REQUIRED",
+                        "group risk profile requires source-bound Greeks",
+                    )
+                profile_payload["greeks_fact"] = greek_fact.to_payload()
         profile = _sha256(_canonical_json(profile_payload))
         facts_observed_at_ns = observed_at_ns
         facts_valid_until_ns = metadata.expires_at_ns
@@ -1272,6 +1627,7 @@ __all__ = [
     "InstrumentRiskAdmissionMapper",
     "InstrumentRiskAssessment",
     "InstrumentRiskFxRate",
+    "InstrumentRiskGreeks",
     "InstrumentRiskMetadata",
     "InstrumentRiskOrder",
     "InstrumentRiskRegistry",
