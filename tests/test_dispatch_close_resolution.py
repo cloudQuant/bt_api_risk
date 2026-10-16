@@ -20,6 +20,7 @@ from bt_api_risk import (
     OrderExposureState,
     OrderFillFact,
     PermitInvalidError,
+    RiskDeniedError,
     RiskIntent,
     RiskPolicy,
     VerifiedDispatchExposureResolution,
@@ -68,20 +69,29 @@ class _Authority:
         )
 
 
-def _close_proof(gate: DurableRiskGate, scope: AccountScope):
+def _close_proof(
+    gate: DurableRiskGate,
+    scope: AccountScope,
+    *,
+    position_side: str = "NET",
+    position_bucket: str = "ALL",
+    intent_id: str = "close-1",
+):
     intent = RiskIntent(
-        intent_id="close-1",
+        intent_id=intent_id,
         scope=scope,
         action=IntentAction.REDUCE,
         notional=Decimal("0"),
-        payload_fingerprint=_sha("intent:close-1"),
+        payload_fingerprint=_sha("intent:" + intent_id),
         strategy_id="strategy-a",
         allocation_version="allocation-v1",
         instrument="venue/contract-a",
         quantity=Decimal("2"),
         quantity_unit="contract",
         notional_unit="USD",
-        exposure_profile_fingerprint=_sha("profile:close-1"),
+        position_side=position_side,
+        position_bucket=position_bucket,
+        exposure_profile_fingerprint=_sha("profile:" + intent_id),
         instrument_facts_observed_at_ns=_NOW_NS,
         instrument_facts_valid_until_ns=_NOW_NS + 3_600_000_000_000,
     )
@@ -90,14 +100,14 @@ def _close_proof(gate: DurableRiskGate, scope: AccountScope):
     claim = gate.dispatch_claim_binding(permit.permit_id)
     gate.settle(permit.permit_id)
     fill = OrderFillFact(
-        trade_id="trade-close-1",
+        trade_id="trade-" + intent_id,
         quantity=Decimal("2"),
         price=Decimal("100"),
         side="SELL",
         position_effect="CLOSE",
         fee_amount=Decimal("0"),
         fee_currency="USD",
-        source_record_sha256=_sha("fill:close-1"),
+        source_record_sha256=_sha("fill:" + intent_id),
         source_revision=3,
     )
     observation = OrderExposureObservationProof(
@@ -107,15 +117,15 @@ def _close_proof(gate: DurableRiskGate, scope: AccountScope):
         intent_hash=claim.intent_hash,
         dispatch_claim_digest=claim.claim_digest,
         dispatch_proof_sha256=None,
-        provider_order_id="paper-order-close-1",
-        accepted_request_sha256=_sha("request:close-1"),
-        exposure_reservation_id="paper-close-ref-1",
-        exposure_reservation_sha256=_sha("paper-close-ref-digest:1"),
+        provider_order_id="paper-order-" + intent_id,
+        accepted_request_sha256=_sha("request:" + intent_id),
+        exposure_reservation_id="paper-close-ref-" + intent_id,
+        exposure_reservation_sha256=_sha("paper-close-ref-digest:" + intent_id),
         order_revision=2,
         journal_revision=6,
-        journal_record_sha256=_sha("journal-record:close-1"),
-        observation_sha256=_sha("observation:close-1"),
-        fill_history_sha256=_sha("fill-history:close-1"),
+        journal_record_sha256=_sha("journal-record:" + intent_id),
+        observation_sha256=_sha("observation:" + intent_id),
+        fill_history_sha256=_sha("fill-history:" + intent_id),
         source_alias_map_sha256=_sha("source-aliases"),
         state=OrderExposureState.FILLED,
         requested_quantity=Decimal("2"),
@@ -134,6 +144,8 @@ def _close_proof(gate: DurableRiskGate, scope: AccountScope):
         normalizer_schema_version="paper-normalizer-v1",
         order_side="SELL",
         position_effect="CLOSE",
+        position_side=position_side,
+        position_bucket=position_bucket,
         fills=(fill,),
         fill_trade_count=1,
         fill_ids_sha256=fill_ids_sha256((fill,)),
@@ -162,7 +174,7 @@ def _close_proof(gate: DurableRiskGate, scope: AccountScope):
         claim=claim,
         evidence_class=DispatchEvidenceClass.SIMULATION_JOURNAL,
         dispatch_attempt_count=1,
-        reconciliation_evidence_sha256=_sha("reconciliation:close-1"),
+        reconciliation_evidence_sha256=_sha("reconciliation:" + intent_id),
         observation=observation,
     )
 
@@ -244,3 +256,86 @@ def test_close_evidence_class_accepts_paper_but_rejects_unknown_and_native_fake(
             AccountScope("fake", "account", "sandbox"),
             DispatchEvidenceClass.NATIVE_PROVIDER_JOURNAL,
         )
+
+
+def test_terminal_close_receipt_binds_hedged_dated_slice_and_rejects_wrong_bucket(tmp_path):
+    scope = AccountScope("fixture", "paper-account", "sandbox")
+    database = tmp_path / "risk-close-dimensions.sqlite3"
+    policy = RiskPolicy(
+        "paper-close-policy",
+        Decimal("5000"),
+        8,
+        require_strategy_allocation=True,
+        notional_unit="USD",
+    )
+    gate = DurableRiskGate(
+        database, policy, clock=_Clock(), execution_journal_authority=_Authority()
+    )
+    try:
+        gate.set_strategy_allocation(
+            scope,
+            "strategy-a",
+            "allocation-v1",
+            max_notional=Decimal("5000"),
+            notional_unit="USD",
+        )
+        gate.set_closable_position(
+            scope,
+            "venue/contract-a",
+            "strategy-a",
+            "owner-declaration-long-today-v1",
+            closable_quantity=Decimal("5"),
+            quantity_unit="contract",
+            position_side="LONG",
+            position_bucket="TODAY",
+        )
+        wrong_initial = _close_proof(
+            gate,
+            scope,
+            position_side="LONG",
+            position_bucket="TODAY",
+            intent_id="close-wrong-bucket",
+        )
+        wrong_initial = replace(
+            wrong_initial,
+            observation=replace(wrong_initial.observation, position_bucket="YESTERDAY"),
+        )
+        with pytest.raises(RiskDeniedError) as initial_mismatch:
+            gate.resolve_dispatch_close(wrong_initial)
+        assert initial_mismatch.value.code == "ORDER_EXPOSURE_REQUEST_MISMATCH"
+        with gate._connection() as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM risk_close_order_resolutions"
+            ).fetchone()[0] == 0
+
+        proof = _close_proof(
+            gate, scope, position_side="LONG", position_bucket="TODAY"
+        )
+        receipt = gate.resolve_dispatch_close(proof)
+        assert receipt.status is DispatchExposureResolutionReceiptStatus.TERMINAL_CLOSE_RESOLVED
+        assert (receipt.position_side, receipt.position_bucket) == ("LONG", "TODAY")
+        assert gate.dispatch_close_resolution_receipt(proof.permit_id) == receipt
+        assert gate.resolve_dispatch_close(proof) == receipt
+
+        with gate._connection() as connection:
+            stored = connection.execute(
+                "SELECT position_side,position_bucket FROM risk_close_order_resolutions "
+                "WHERE permit_id=?",
+                (proof.permit_id,),
+            ).fetchone()
+            assert tuple(stored) == ("LONG", "TODAY")
+            assert connection.execute(
+                "SELECT COUNT(*) FROM risk_close_order_resolutions WHERE permit_id=?",
+                (proof.permit_id,),
+            ).fetchone()[0] == 1
+
+        wrong_bucket = replace(
+            proof,
+            observation=replace(proof.observation, position_bucket="YESTERDAY"),
+        )
+        with pytest.raises(PermitInvalidError) as mismatch:
+            gate.resolve_dispatch_close(wrong_bucket)
+        assert mismatch.value.code == "DISPATCH_PROOF_REPLAYED"
+        assert gate.dispatch_close_resolution_receipt(proof.permit_id) == receipt
+    finally:
+        gate.close()

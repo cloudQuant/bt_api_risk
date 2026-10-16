@@ -416,6 +416,8 @@ class RiskIntent:
     instrument_facts_valid_until_ns: Optional[int] = None  # noqa: UP045 -- Python 3.9 is supported.
     resource: Optional[AccountResourceKey] = None  # noqa: UP045 -- Python 3.9 is supported.
     exposure_dimensions: tuple[RiskExposureDimension, ...] = ()
+    position_side: str = "NET"
+    position_bucket: str = "ALL"
 
     def __post_init__(self) -> None:
         if not self.intent_id.strip():
@@ -426,6 +428,14 @@ class RiskIntent:
             raise ValueError("scope must be an AccountScope")
         if not isinstance(self.payload_fingerprint, str):
             raise ValueError("payload_fingerprint must be an immutable string")
+        if self.position_side not in {"NET", "LONG", "SHORT"}:
+            raise ValueError("position_side must be NET, LONG, or SHORT")
+        if self.position_bucket not in {"ALL", "TODAY", "YESTERDAY"}:
+            raise ValueError("position_bucket must be ALL, TODAY, or YESTERDAY")
+        if self.position_side == "NET" and self.position_bucket != "ALL":
+            raise ValueError("dated position buckets require LONG or SHORT")
+        if self.action is IntentAction.INCREASE and self.position_bucket != "ALL":
+            raise ValueError("risk-increasing intents cannot select a dated position bucket")
         if self.notional_unit is not None and (
             not isinstance(self.notional_unit, str)
             or not _NOTIONAL_UNIT.fullmatch(self.notional_unit)
@@ -541,6 +551,10 @@ class RiskIntent:
             payload["exposure_dimensions"] = [
                 item.to_payload() for item in self.exposure_dimensions
             ]
+        if self.position_side != "NET":
+            payload["position_side"] = self.position_side
+        if self.position_bucket != "ALL":
+            payload["position_bucket"] = self.position_bucket
         return _sha256(_canonical_json(payload))
 
 
@@ -563,6 +577,8 @@ class RiskPermit:
     quantity: Optional[Decimal] = None  # noqa: UP045 -- Python 3.9 is supported.
     quantity_unit: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
     notional_unit: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+    position_side: str = "NET"
+    position_bucket: str = "ALL"
 
 
 @dataclass(frozen=True)
@@ -616,6 +632,8 @@ class ClosablePositionSnapshot:
     source: str = field(default="local_closable_position_ledger", init=False)
     completeness: str = "LOCAL_LEDGER_COMPLETE"
     reason: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+    position_side: str = "NET"
+    position_bucket: str = "ALL"
 
 
 class FreezeResolutionStatus(str, Enum):
@@ -1157,6 +1175,8 @@ class DispatchExposureResolutionReceipt:
     dispatch_latch_active: bool = True
     has_other_active_freezes: bool = False
     position_effect: str = "OPEN"
+    position_side: str = "NET"
+    position_bucket: str = "ALL"
 
     def __post_init__(self) -> None:
         if type(self.status) is not DispatchExposureResolutionReceiptStatus:
@@ -1165,6 +1185,12 @@ class DispatchExposureResolutionReceipt:
             raise ValueError("invalid dispatch exposure receipt claim")
         if self.position_effect not in {"OPEN", "CLOSE"}:
             raise ValueError("invalid terminal order position effect")
+        if self.position_side not in {"NET", "LONG", "SHORT"}:
+            raise ValueError("invalid terminal order position side")
+        if self.position_bucket not in {"ALL", "TODAY", "YESTERDAY"}:
+            raise ValueError("invalid terminal order position bucket")
+        if self.position_side == "NET" and self.position_bucket != "ALL":
+            raise ValueError("NET terminal order requires the ALL bucket")
         if type(self.dispatch_latch_active) is not bool or type(
             self.has_other_active_freezes
         ) is not bool:
@@ -3071,6 +3097,8 @@ class DurableRiskGate:
         *,
         closable_quantity: Decimal,
         quantity_unit: str,
+        position_side: str = "NET",
+        position_bucket: str = "ALL",
     ) -> None:
         """Install the owner-declared closable quantity for one strategy key.
 
@@ -3098,6 +3126,14 @@ class DurableRiskGate:
             raise ValueError("invalid allocation_version")
         if type(quantity_unit) is not str or not _ALLOCATION_ID.fullmatch(quantity_unit):
             raise ValueError("invalid quantity_unit")
+        if type(position_side) is not str or position_side not in {"NET", "LONG", "SHORT"}:
+            raise ValueError("position_side must be NET, LONG, or SHORT")
+        if type(position_bucket) is not str or position_bucket not in {
+            "ALL", "TODAY", "YESTERDAY"
+        }:
+            raise ValueError("position_bucket must be ALL, TODAY, or YESTERDAY")
+        if position_side == "NET" and position_bucket != "ALL":
+            raise ValueError("dated closable positions require LONG or SHORT")
         try:
             normalized_quantity = _as_decimal(closable_quantity)
         except (InvalidOperation, ValueError) as exc:
@@ -3108,21 +3144,37 @@ class DurableRiskGate:
         now = self._clock()
         with self._transaction() as connection:
             self._ensure_policy_binding(connection, scope.key)
-            rebased = connection.execute(
-                """SELECT 1 FROM risk_closable_position_rebases
-                   WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
-                (scope.key, instrument, strategy_id),
-            ).fetchone()
-            if rebased is not None:
+            rebase_owner = None
+            if position_side == "NET" and position_bucket == "ALL":
+                rebase_owner = connection.execute(
+                    """SELECT 1 FROM risk_closable_position_rebases
+                       WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
+                    (scope.key, instrument, strategy_id),
+                ).fetchone()
+            if rebase_owner is not None:
                 raise RiskDeniedError(
                     "CLOSE_POSITION_REBASE_OWNS_SLICE",
-                    "an execution-book rebase owns this closable position",
+                    "an execution-book-owned closable slice can only be updated by rebase",
                 )
-            current = connection.execute(
-                """SELECT * FROM risk_closable_positions
-                   WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
-                (scope.key, instrument, strategy_id),
-            ).fetchone()
+            if position_side == "NET" and position_bucket == "ALL":
+                current = connection.execute(
+                    """SELECT * FROM risk_closable_positions
+                       WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
+                    (scope.key, instrument, strategy_id),
+                ).fetchone()
+            else:
+                current = connection.execute(
+                    """SELECT * FROM risk_closable_position_slices
+                       WHERE scope_key = ? AND instrument = ? AND strategy_id = ?
+                         AND position_side = ? AND position_bucket = ?""",
+                    (
+                        scope.key,
+                        instrument,
+                        strategy_id,
+                        position_side,
+                        position_bucket,
+                    ),
+                ).fetchone()
             if current is not None and current["allocation_version"] == allocation_version:
                 same_facts = (
                     current["closable_quantity"] == _decimal_text(normalized_quantity)
@@ -3131,53 +3183,119 @@ class DurableRiskGate:
                 if same_facts:
                     return
                 raise ValueError("closable position version cannot be reused with changed facts")
-            prior_version = connection.execute(
-                """SELECT 1 FROM risk_closable_position_versions
-                   WHERE scope_key = ? AND instrument = ? AND strategy_id = ?
-                     AND allocation_version = ?""",
-                (scope.key, instrument, strategy_id, allocation_version),
-            ).fetchone()
+            if position_side == "NET" and position_bucket == "ALL":
+                prior_version = connection.execute(
+                    """SELECT 1 FROM risk_closable_position_versions
+                       WHERE scope_key = ? AND instrument = ? AND strategy_id = ?
+                         AND allocation_version = ?""",
+                    (scope.key, instrument, strategy_id, allocation_version),
+                ).fetchone()
+            else:
+                prior_version = connection.execute(
+                    """SELECT 1 FROM risk_closable_position_slice_versions
+                       WHERE scope_key = ? AND instrument = ? AND strategy_id = ?
+                         AND position_side = ? AND position_bucket = ?
+                         AND allocation_version = ?""",
+                    (
+                        scope.key,
+                        instrument,
+                        strategy_id,
+                        position_side,
+                        position_bucket,
+                        allocation_version,
+                    ),
+                ).fetchone()
             if prior_version is not None:
                 raise ValueError("closable position version cannot be reused")
 
-            connection.execute(
-                """INSERT INTO risk_closable_position_versions (
-                       scope_key, instrument, strategy_id, allocation_version,
-                       closable_quantity, quantity_unit, created_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    scope.key,
-                    instrument,
-                    strategy_id,
-                    allocation_version,
-                    _decimal_text(normalized_quantity),
-                    quantity_unit,
-                    now,
-                ),
-            )
-            connection.execute(
-                """INSERT INTO risk_closable_positions (
-                       scope_key, instrument, strategy_id, allocation_version,
-                       closable_quantity, quantity_unit, updated_at
-                   ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                   ON CONFLICT(scope_key, instrument, strategy_id) DO UPDATE SET
-                       allocation_version = excluded.allocation_version,
-                       closable_quantity = excluded.closable_quantity,
-                       quantity_unit = excluded.quantity_unit,
-                       updated_at = excluded.updated_at""",
-                (
-                    scope.key,
-                    instrument,
-                    strategy_id,
-                    allocation_version,
-                    _decimal_text(normalized_quantity),
-                    quantity_unit,
-                    now,
-                ),
-            )
+            if position_side == "NET" and position_bucket == "ALL":
+                connection.execute(
+                    """INSERT INTO risk_closable_position_versions (
+                           scope_key, instrument, strategy_id, allocation_version,
+                           closable_quantity, quantity_unit, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        scope.key,
+                        instrument,
+                        strategy_id,
+                        allocation_version,
+                        _decimal_text(normalized_quantity),
+                        quantity_unit,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO risk_closable_positions (
+                           scope_key, instrument, strategy_id, allocation_version,
+                           closable_quantity, quantity_unit, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(scope_key, instrument, strategy_id) DO UPDATE SET
+                           allocation_version = excluded.allocation_version,
+                           closable_quantity = excluded.closable_quantity,
+                           quantity_unit = excluded.quantity_unit,
+                           updated_at = excluded.updated_at""",
+                    (
+                        scope.key,
+                        instrument,
+                        strategy_id,
+                        allocation_version,
+                        _decimal_text(normalized_quantity),
+                        quantity_unit,
+                        now,
+                    ),
+                )
+            else:
+                connection.execute(
+                    """INSERT INTO risk_closable_position_slice_versions (
+                           scope_key, instrument, strategy_id, position_side,
+                           position_bucket, allocation_version, closable_quantity,
+                           quantity_unit, created_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        scope.key,
+                        instrument,
+                        strategy_id,
+                        position_side,
+                        position_bucket,
+                        allocation_version,
+                        _decimal_text(normalized_quantity),
+                        quantity_unit,
+                        now,
+                    ),
+                )
+                connection.execute(
+                    """INSERT INTO risk_closable_position_slices (
+                           scope_key, instrument, strategy_id, position_side,
+                           position_bucket, allocation_version, closable_quantity,
+                           quantity_unit, updated_at
+                       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                       ON CONFLICT(scope_key, instrument, strategy_id, position_side,
+                                   position_bucket) DO UPDATE SET
+                           allocation_version = excluded.allocation_version,
+                           closable_quantity = excluded.closable_quantity,
+                           quantity_unit = excluded.quantity_unit,
+                           updated_at = excluded.updated_at""",
+                    (
+                        scope.key,
+                        instrument,
+                        strategy_id,
+                        position_side,
+                        position_bucket,
+                        allocation_version,
+                        _decimal_text(normalized_quantity),
+                        quantity_unit,
+                        now,
+                    ),
+                )
 
     def get_closable_position(
-        self, scope: AccountScope, instrument: str, strategy_id: str
+        self,
+        scope: AccountScope,
+        instrument: str,
+        strategy_id: str,
+        *,
+        position_side: str = "NET",
+        position_bucket: str = "ALL",
     ) -> ClosablePositionSnapshot:
         """Read one declared closable quantity and its local attribution ledger.
 
@@ -3194,14 +3312,36 @@ class DurableRiskGate:
             raise ValueError("invalid instrument")
         if type(strategy_id) is not str or not _ALLOCATION_ID.fullmatch(strategy_id):
             raise ValueError("invalid strategy_id")
+        if type(position_side) is not str or position_side not in {"NET", "LONG", "SHORT"}:
+            raise ValueError("position_side must be NET, LONG, or SHORT")
+        if type(position_bucket) is not str or position_bucket not in {
+            "ALL", "TODAY", "YESTERDAY"
+        }:
+            raise ValueError("position_bucket must be ALL, TODAY, or YESTERDAY")
+        if position_side == "NET" and position_bucket != "ALL":
+            raise ValueError("dated position buckets require LONG or SHORT")
         with self._connection() as connection:
             connection.execute("BEGIN")
             try:
-                declaration = connection.execute(
-                    """SELECT * FROM risk_closable_positions
-                       WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
-                    (scope.key, instrument, strategy_id),
-                ).fetchone()
+                if position_side == "NET" and position_bucket == "ALL":
+                    declaration = connection.execute(
+                        """SELECT * FROM risk_closable_positions
+                           WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
+                        (scope.key, instrument, strategy_id),
+                    ).fetchone()
+                else:
+                    declaration = connection.execute(
+                        """SELECT * FROM risk_closable_position_slices
+                           WHERE scope_key = ? AND instrument = ? AND strategy_id = ?
+                             AND position_side = ? AND position_bucket = ?""",
+                        (
+                            scope.key,
+                            instrument,
+                            strategy_id,
+                            position_side,
+                            position_bucket,
+                        ),
+                    ).fetchone()
                 if declaration is None:
                     raise RiskDeniedError(
                         "CLOSE_POSITION_UNCONFIGURED",
@@ -3211,8 +3351,10 @@ class DurableRiskGate:
                     """SELECT reservation.quantity, reservation.quantity_unit
                        FROM risk_reservations AS reservation
                        WHERE reservation.scope_key = ? AND reservation.strategy_id = ?
-                         AND reservation.instrument = ? AND reservation.action = ?
-                         AND reservation.status IN (?, ?)
+                         AND reservation.instrument = ?
+                         AND reservation.position_side = ?
+                         AND reservation.position_bucket = ?
+                         AND reservation.action = ? AND reservation.status IN (?, ?)
                          AND reservation.close_position_version IS NOT NULL
                          AND NOT EXISTS (
                              SELECT 1 FROM risk_closable_position_absorptions AS absorbed
@@ -3225,6 +3367,8 @@ class DurableRiskGate:
                         scope.key,
                         strategy_id,
                         instrument,
+                        position_side,
+                        position_bucket,
                         IntentAction.REDUCE.value,
                         self._ACTIVE,
                         self._SETTLED,
@@ -3261,6 +3405,8 @@ class DurableRiskGate:
             as_of=as_of,
             completeness=completeness,
             reason=reason,
+            position_side=position_side,
+            position_bucket=position_bucket,
         )
 
     def get_unabsorbed_settled_close_receipts(
@@ -3875,6 +4021,8 @@ class DurableRiskGate:
                 quantity=intent.quantity,
                 quantity_unit=intent.quantity_unit,
                 notional_unit=intent.notional_unit,
+                position_side=intent.position_side,
+                position_bucket=intent.position_bucket,
             )
             self._assert_current_instrument_facts(intent)
             connection.execute(
@@ -3883,13 +4031,14 @@ class DurableRiskGate:
                     permit_id, intent_id, intent_hash, scope_key, provider, account_id, environment,
                     action, notional, policy_hash, generation, issued_at, expires_at, status, reason,
                     strategy_id, allocation_version, instrument, quantity, quantity_unit,
-                    notional_unit, group_id, group_fingerprint, group_leg_id,
+                    position_side, position_bucket, notional_unit, group_id, group_fingerprint, group_leg_id,
                     group_deadline_ns, group_expires_at_ns, group_leg_count,
                     group_exposure_profile_fingerprint, resource_product_type, resource_margin_pool,
                     close_position_version, shared_collateral_domain_id,
                     shared_collateral_domain_revision
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?,
-                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL,
+                    ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                    ?, ?, ?, ?, ?)
                 """,
                 (
                     permit.permit_id,
@@ -3911,6 +4060,8 @@ class DurableRiskGate:
                     permit.instrument,
                     None if permit.quantity is None else _decimal_text(permit.quantity),
                     permit.quantity_unit,
+                    permit.position_side,
+                    permit.position_bucket,
                     permit.notional_unit,
                     None if intent.resource is None else intent.resource.product_type,
                     None if intent.resource is None else intent.resource.margin_pool,
@@ -7620,6 +7771,10 @@ class DurableRiskGate:
                                 close["intent_hash"] == proof.intent_hash,
                                 close["claim_digest"] == proof.claim_digest,
                                 close["position_effect"] == "CLOSE",
+                                close["position_side"] == reservation["position_side"]
+                                == observation.position_side,
+                                close["position_bucket"] == reservation["position_bucket"]
+                                == observation.position_bucket,
                                 close["provider_order_id"] == observation.provider_order_id,
                                 close["accepted_request_sha256"]
                                 == observation.accepted_request_sha256,
@@ -7699,15 +7854,16 @@ class DurableRiskGate:
                         INSERT INTO risk_close_order_resolutions (
                             permit_id, scope_key, intent_id, intent_hash, cause_id,
                             claim_digest, strategy_id, instrument, close_position_version,
-                            position_effect, provider_order_id, accepted_request_sha256,
+                            position_side, position_bucket, position_effect,
+                            provider_order_id, accepted_request_sha256,
                             close_reference_id, close_reference_sha256, terminal_state,
                             requested_quantity, filled_quantity, trade_count, fill_ids_sha256,
                             order_revision, journal_revision, journal_record_sha256,
                             reconciliation_evidence_sha256, proof_sha256, close_proof_sha256,
                             writer_owner_id, writer_fencing_token, writer_fence_sha256,
                             resolved_at
-                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'CLOSE', ?, ?, ?, ?, ?, ?, ?, ?, ?,
-                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'CLOSE', ?, ?, ?, ?, ?, ?, ?, ?,
+                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
                             proof.permit_id,
@@ -7719,6 +7875,8 @@ class DurableRiskGate:
                             str(reservation["strategy_id"]),
                             str(reservation["instrument"]),
                             str(reservation["close_position_version"]),
+                            str(reservation["position_side"]),
+                            str(reservation["position_bucket"]),
                             observation.provider_order_id,
                             observation.accepted_request_sha256,
                             observation.exposure_reservation_id,
@@ -7887,6 +8045,8 @@ class DurableRiskGate:
                 dispatch_latch_active=True,
                 has_other_active_freezes=other_active,
                 position_effect="CLOSE",
+                position_side=str(reservation["position_side"]),
+                position_bucket=str(reservation["position_bucket"]),
             )
         if (
             freeze["active"] != 0
@@ -7907,8 +8067,10 @@ class DurableRiskGate:
             or close["instrument"] != reservation["instrument"]
             or close["close_position_version"] != reservation["close_position_version"]
             or close["claim_digest"] != claim.claim_digest
-            or close["position_effect"] != "CLOSE"
-            or close["proof_sha256"] != resolution["resolution_proof_sha256"]
+                or close["position_effect"] != "CLOSE"
+                or close["position_side"] != reservation["position_side"]
+                or close["position_bucket"] != reservation["position_bucket"]
+                or close["proof_sha256"] != resolution["resolution_proof_sha256"]
             or close["close_proof_sha256"] != resolution["exposure_proof_sha256"]
             or close["provider_order_id"] != resolution["provider_order_id"]
             or close["accepted_request_sha256"] != resolution["accepted_request_sha256"]
@@ -7973,6 +8135,8 @@ class DurableRiskGate:
             dispatch_latch_active=False,
             has_other_active_freezes=other_active,
             position_effect="CLOSE",
+            position_side=str(close["position_side"]),
+            position_bucket=str(close["position_bucket"]),
         )
 
     def resolve_dispatch_freeze(
@@ -9511,6 +9675,13 @@ class DurableRiskGate:
                 and proof.valuation_unit != self._policy.notional_unit
             )
             or proof.position_effect != expected_effect
+            or (
+                expected_effect == "CLOSE"
+                and (
+                    proof.position_side != reservation["position_side"]
+                    or proof.position_bucket != reservation["position_bucket"]
+                )
+            )
         ):
             raise RiskDeniedError(
                 "ORDER_EXPOSURE_REQUEST_MISMATCH",
@@ -10909,12 +11080,27 @@ class DurableRiskGate:
         if not self._is_bound_close_intent(intent):
             return None
         self._assert_self_trade_absent(connection, intent)
-        declaration = connection.execute(
-            """SELECT allocation_version, closable_quantity, quantity_unit
-               FROM risk_closable_positions
-               WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
-            (intent.scope.key, intent.instrument, intent.strategy_id),
-        ).fetchone()
+        if intent.position_side == "NET" and intent.position_bucket == "ALL":
+            declaration = connection.execute(
+                """SELECT allocation_version, closable_quantity, quantity_unit
+                   FROM risk_closable_positions
+                   WHERE scope_key = ? AND instrument = ? AND strategy_id = ?""",
+                (intent.scope.key, intent.instrument, intent.strategy_id),
+            ).fetchone()
+        else:
+            declaration = connection.execute(
+                """SELECT allocation_version, closable_quantity, quantity_unit
+                   FROM risk_closable_position_slices
+                   WHERE scope_key = ? AND instrument = ? AND strategy_id = ?
+                     AND position_side = ? AND position_bucket = ?""",
+                (
+                    intent.scope.key,
+                    intent.instrument,
+                    intent.strategy_id,
+                    intent.position_side,
+                    intent.position_bucket,
+                ),
+            ).fetchone()
         if declaration is None:
             raise RiskDeniedError(
                 "CLOSE_POSITION_UNCONFIGURED",
@@ -10929,8 +11115,10 @@ class DurableRiskGate:
             """SELECT reservation.quantity, reservation.quantity_unit
                FROM risk_reservations AS reservation
                WHERE reservation.scope_key = ? AND reservation.strategy_id = ?
-                 AND reservation.instrument = ? AND reservation.action = ?
-                 AND reservation.status IN (?, ?)
+                 AND reservation.instrument = ?
+                 AND reservation.position_side = ?
+                 AND reservation.position_bucket = ?
+                 AND reservation.action = ? AND reservation.status IN (?, ?)
                  AND reservation.close_position_version IS NOT NULL
                  AND NOT EXISTS (
                      SELECT 1 FROM risk_closable_position_absorptions AS absorbed
@@ -10943,6 +11131,8 @@ class DurableRiskGate:
                 intent.scope.key,
                 intent.strategy_id,
                 intent.instrument,
+                intent.position_side,
+                intent.position_bucket,
                 IntentAction.REDUCE.value,
                 self._ACTIVE,
                 self._SETTLED,
@@ -11517,6 +11707,8 @@ class DurableRiskGate:
             quantity=None if row["quantity"] is None else _as_decimal(row["quantity"]),
             quantity_unit=row["quantity_unit"],
             notional_unit=row["notional_unit"],
+            position_side=str(row["position_side"]),
+            position_bucket=str(row["position_bucket"]),
         )
 
     def _initialize_schema(self) -> None:
@@ -11549,6 +11741,8 @@ class DurableRiskGate:
                     instrument TEXT,
                     quantity TEXT,
                     quantity_unit TEXT,
+                    position_side TEXT NOT NULL DEFAULT 'NET',
+                    position_bucket TEXT NOT NULL DEFAULT 'ALL',
                     notional_unit TEXT,
                     group_id TEXT,
                     group_fingerprint TEXT,
@@ -11735,6 +11929,8 @@ class DurableRiskGate:
                     strategy_id TEXT NOT NULL,
                     instrument TEXT NOT NULL,
                     close_position_version TEXT NOT NULL,
+                    position_side TEXT NOT NULL DEFAULT 'NET',
+                    position_bucket TEXT NOT NULL DEFAULT 'ALL',
                     position_effect TEXT NOT NULL CHECK(position_effect = 'CLOSE'),
                     provider_order_id TEXT NOT NULL,
                     accepted_request_sha256 TEXT NOT NULL,
@@ -11893,6 +12089,30 @@ class DurableRiskGate:
                     quantity_unit TEXT NOT NULL,
                     created_at REAL NOT NULL,
                     PRIMARY KEY(scope_key, instrument, strategy_id, allocation_version)
+                );
+                CREATE TABLE IF NOT EXISTS risk_closable_position_slices (
+                    scope_key TEXT NOT NULL,
+                    instrument TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    position_side TEXT NOT NULL CHECK(position_side IN ('LONG', 'SHORT')),
+                    position_bucket TEXT NOT NULL CHECK(position_bucket IN ('ALL', 'TODAY', 'YESTERDAY')),
+                    allocation_version TEXT NOT NULL,
+                    closable_quantity TEXT NOT NULL,
+                    quantity_unit TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(scope_key, instrument, strategy_id, position_side, position_bucket)
+                );
+                CREATE TABLE IF NOT EXISTS risk_closable_position_slice_versions (
+                    scope_key TEXT NOT NULL,
+                    instrument TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    position_side TEXT NOT NULL CHECK(position_side IN ('LONG', 'SHORT')),
+                    position_bucket TEXT NOT NULL CHECK(position_bucket IN ('ALL', 'TODAY', 'YESTERDAY')),
+                    allocation_version TEXT NOT NULL,
+                    closable_quantity TEXT NOT NULL,
+                    quantity_unit TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(scope_key, instrument, strategy_id, position_side, position_bucket, allocation_version)
                 );
                 CREATE TABLE IF NOT EXISTS risk_closable_position_rebases (
                     scope_key TEXT NOT NULL,
@@ -12181,6 +12401,8 @@ class DurableRiskGate:
                 ("instrument", "TEXT"),
                 ("quantity", "TEXT"),
                 ("quantity_unit", "TEXT"),
+                ("position_side", "TEXT NOT NULL DEFAULT 'NET'"),
+                ("position_bucket", "TEXT NOT NULL DEFAULT 'ALL'"),
                 ("notional_unit", "TEXT"),
                 ("group_id", "TEXT"),
                 ("group_fingerprint", "TEXT"),
@@ -12198,6 +12420,23 @@ class DurableRiskGate:
                 if name not in reservation_columns:
                     connection.execute(
                         "ALTER TABLE risk_reservations ADD COLUMN " + name + " " + column_type
+                    )
+            close_resolution_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(risk_close_order_resolutions)"
+                ).fetchall()
+            }
+            for name, column_type in (
+                ("position_side", "TEXT NOT NULL DEFAULT 'NET'"),
+                ("position_bucket", "TEXT NOT NULL DEFAULT 'ALL'"),
+            ):
+                if name not in close_resolution_columns:
+                    connection.execute(
+                        "ALTER TABLE risk_close_order_resolutions ADD COLUMN "
+                        + name
+                        + " "
+                        + column_type
                     )
             claim_columns = {
                 str(row["name"])

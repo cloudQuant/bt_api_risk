@@ -523,6 +523,8 @@ class OrderExposureObservationProof:
     # (no cross-permit trade-identity occupancy) and the legacy fingerprint.
     trade_id_domain_ref: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
     trade_id_scope: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
+    position_side: str = "NET"
+    position_bucket: str = "ALL"
 
     def __post_init__(self) -> None:
         from .admission import AccountScope
@@ -622,6 +624,20 @@ class OrderExposureObservationProof:
             raise ValueError("order_side must be a canonical BUY or SELL")
         if self.position_effect not in {"OPEN", "CLOSE"}:
             raise ValueError("order observation effect must be OPEN or net CLOSE")
+        if type(self.position_side) is not str or self.position_side not in {
+            "NET",
+            "LONG",
+            "SHORT",
+        }:
+            raise ValueError("position_side must be NET, LONG, or SHORT")
+        if type(self.position_bucket) is not str or self.position_bucket not in {
+            "ALL",
+            "TODAY",
+            "YESTERDAY",
+        }:
+            raise ValueError("position_bucket must be ALL, TODAY, or YESTERDAY")
+        if self.position_effect == "OPEN" and self.position_bucket != "ALL":
+            raise ValueError("an opening order cannot select a dated close bucket")
         fx_values = (self.fx_pair, self.fx_rate, self.fx_observed_at_ns, self.fx_valid_until_ns)
         if any(value is not None for value in fx_values):
             if not all(value is not None for value in fx_values):
@@ -719,6 +735,10 @@ class OrderExposureObservationProof:
                 values[name] = value.value
             elif name == "fills":
                 values[name] = [item.fingerprint for item in value]
+            elif name in {"position_side", "position_bucket"}:
+                default = "NET" if name == "position_side" else "ALL"
+                if value != default:
+                    values[name] = value
             else:
                 values[name] = value
         return _proof_hash(values)

@@ -1336,6 +1336,63 @@ class InstrumentRiskAdmissionMapper:
                 "INSTRUMENT_INTENT_INVALID", "intent lacks immutable identity"
             ) from error
         position_effect = getattr(getattr(intent, "position_effect", None), "value", None)
+        intent_side = getattr(getattr(intent, "side", None), "value", None)
+        position_side = getattr(intent, "position_side", "NET")
+        position_bucket = getattr(intent, "position_bucket", "ALL")
+        if (
+            type(position_side) is not str
+            or position_side not in {"NET", "LONG", "SHORT"}
+            or type(position_bucket) is not str
+            or position_bucket not in {"ALL", "TODAY", "YESTERDAY"}
+        ):
+            raise RiskDeniedError(
+                "INSTRUMENT_POSITION_DIMENSIONS_INVALID",
+                "position side and bucket must be exact supported values",
+            )
+        if position_effect == "CLOSE_TODAY":
+            if position_bucket not in {"ALL", "TODAY"}:
+                raise RiskDeniedError(
+                    "INSTRUMENT_POSITION_BUCKET_MISMATCH",
+                    "CLOSE_TODAY conflicts with the selected position bucket",
+                )
+            position_bucket = "TODAY"
+        elif position_effect == "CLOSE_YESTERDAY":
+            if position_bucket not in {"ALL", "YESTERDAY"}:
+                raise RiskDeniedError(
+                    "INSTRUMENT_POSITION_BUCKET_MISMATCH",
+                    "CLOSE_YESTERDAY conflicts with the selected position bucket",
+                )
+            position_bucket = "YESTERDAY"
+        elif position_effect not in {"OPEN", "CLOSE"}:
+            raise RiskDeniedError(
+                "INSTRUMENT_POSITION_EFFECT_UNPROVEN",
+                "intent position effect cannot be mapped to a risk action",
+            )
+        if position_side == "NET" and position_bucket != "ALL":
+            raise RiskDeniedError(
+                "INSTRUMENT_POSITION_BUCKET_UNPROVEN",
+                "dated position buckets require a source-bound long or short side",
+            )
+        if position_effect == "OPEN":
+            if position_bucket != "ALL":
+                raise RiskDeniedError(
+                    "INSTRUMENT_POSITION_BUCKET_INVALID_FOR_OPEN",
+                    "opening intents cannot select a dated close bucket",
+                )
+            if position_side != "NET" and intent_side != (
+                "BUY" if position_side == "LONG" else "SELL"
+            ):
+                raise RiskDeniedError(
+                    "INSTRUMENT_POSITION_SIDE_MISMATCH",
+                    "hedged opening side conflicts with the selected position side",
+                )
+        elif position_side in {"LONG", "SHORT"} and intent_side != (
+            "SELL" if position_side == "LONG" else "BUY"
+        ):
+            raise RiskDeniedError(
+                "INSTRUMENT_POSITION_SIDE_MISMATCH",
+                "close order direction conflicts with the selected long or short position",
+            )
         strategy_id = None
         allocation_version = None
         quantity_unit = None
@@ -1544,12 +1601,57 @@ class InstrumentRiskAdmissionMapper:
                         "strategy allocation limits are invalid",
                     ) from error
         elif position_effect in {"CLOSE", "CLOSE_TODAY", "CLOSE_YESTERDAY"}:
+            self._verify_fx_source_binding(order)
             metadata = self._registry.validate_reduction(order, self._clock_ns())
+            if self._allocation_reader is None:
+                raise RiskDeniedError(
+                    "STRATEGY_ALLOCATION_UNAVAILABLE",
+                    "a net close requires the account owner's current strategy allocation",
+                )
+            try:
+                strategy_id = _identifier(execution_scope.strategy_id, "strategy_id")
+                allocation = self._allocation_reader(execution_scope)
+            except (AttributeError, TypeError, ValueError) as error:
+                raise RiskDeniedError(
+                    "STRATEGY_ALLOCATION_UNAVAILABLE",
+                    "authoritative strategy allocation is unavailable or malformed",
+                ) from error
+            if (
+                type(allocation) is not StrategyAllocationSnapshot
+                or type(allocation.scope) is not AccountScope
+                or allocation.scope != self._scope
+                or allocation.strategy_id != strategy_id
+                or allocation.source != "local_risk_reservation_ledger"
+                or allocation.completeness != "LOCAL_LEDGER_COMPLETE"
+                or allocation.reason is not None
+            ):
+                raise RiskDeniedError(
+                    "STRATEGY_ALLOCATION_SCOPE_MISMATCH",
+                    "net close requires a complete current allocation for the exact strategy and account",
+                )
+            try:
+                allocation_version = _identifier(allocation.revision, "allocation_version")
+            except (TypeError, ValueError) as error:
+                raise RiskDeniedError(
+                    "STRATEGY_ALLOCATION_UNAVAILABLE",
+                    "authoritative strategy allocation revision is invalid",
+                ) from error
+            if (
+                metadata.quantity_unit is None
+                or metadata.valuation_unit is None
+                or allocation.notional_unit != metadata.valuation_unit
+            ):
+                raise RiskDeniedError(
+                    "STRATEGY_ALLOCATION_NOTIONAL_UNIT_UNAVAILABLE",
+                    "close metadata and the current allocation must bind canonical units",
+                )
             action = IntentAction.REDUCE
             notional = Decimal("0")
             payload_fingerprint = _reduction_payload_fingerprint(
                 intent_fingerprint, order, metadata
             )
+            quantity_unit = metadata.quantity_unit
+            notional_unit = metadata.valuation_unit
         else:
             raise RiskDeniedError(
                 "INSTRUMENT_POSITION_EFFECT_UNPROVEN",
@@ -1565,17 +1667,29 @@ class InstrumentRiskAdmissionMapper:
             allocation_version=allocation_version,
             instrument=(
                 order.instrument
-                if action is IntentAction.INCREASE and quantity_unit is not None
+                if (
+                    action is IntentAction.INCREASE
+                    or position_effect in {"CLOSE", "CLOSE_TODAY", "CLOSE_YESTERDAY"}
+                )
+                and quantity_unit is not None
                 else None
             ),
             quantity=(
                 order.quantity
-                if action is IntentAction.INCREASE and quantity_unit is not None
+                if (
+                    action is IntentAction.INCREASE
+                    or position_effect in {"CLOSE", "CLOSE_TODAY", "CLOSE_YESTERDAY"}
+                )
+                and quantity_unit is not None
                 else None
             ),
             quantity_unit=(
                 quantity_unit
-                if action is IntentAction.INCREASE and quantity_unit is not None
+                if (
+                    action is IntentAction.INCREASE
+                    or position_effect in {"CLOSE", "CLOSE_TODAY", "CLOSE_YESTERDAY"}
+                )
+                and quantity_unit is not None
                 else None
             ),
             notional_unit=notional_unit,
@@ -1589,6 +1703,8 @@ class InstrumentRiskAdmissionMapper:
             exposure_dimensions=(
                 exposure_dimensions if action is IntentAction.INCREASE else ()
             ),
+            position_side=position_side,
+            position_bucket=position_bucket,
         )
 
     def _build_exposure_dimensions(
