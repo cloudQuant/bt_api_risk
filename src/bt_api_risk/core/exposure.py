@@ -125,8 +125,8 @@ class OrderFillFact:
         object.__setattr__(self, "fee_amount", _signed_decimal(self.fee_amount, "fill fee"))
         if self.side not in ("BUY", "SELL"):
             raise ValueError("fill side must be BUY or SELL")
-        if self.position_effect != "OPEN":
-            raise ValueError("only source-proven opening fills are supported")
+        if self.position_effect not in {"OPEN", "CLOSE"}:
+            raise ValueError("fill effect must be OPEN or net CLOSE")
         if type(self.fee_currency) is not str or _UNIT.fullmatch(self.fee_currency) is None:
             raise ValueError("invalid fill fee currency")
         _digest(self.source_record_sha256, "fill source record digest")
@@ -620,8 +620,8 @@ class OrderExposureObservationProof:
             raise ValueError("observation completeness flags must be boolean")
         if self.order_side not in ("BUY", "SELL"):
             raise ValueError("order_side must be a canonical BUY or SELL")
-        if self.position_effect != "OPEN":
-            raise ValueError("only source-proven opening exposure is supported")
+        if self.position_effect not in {"OPEN", "CLOSE"}:
+            raise ValueError("order observation effect must be OPEN or net CLOSE")
         fx_values = (self.fx_pair, self.fx_rate, self.fx_observed_at_ns, self.fx_valid_until_ns)
         if any(value is not None for value in fx_values):
             if not all(value is not None for value in fx_values):

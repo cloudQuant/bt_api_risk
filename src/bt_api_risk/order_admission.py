@@ -165,6 +165,24 @@ class DurableRiskAdmissionAdapter:
         except (RiskDeniedError, PermitInvalidError) as error:
             self._raise_neutral_denial(error)
 
+    def resolve_dispatch_close(
+        self, proof: DispatchExposureResolutionProof
+    ) -> DispatchExposureResolutionReceipt:
+        """Resolve an attributed terminal net close without gross exposure seeding."""
+        try:
+            return self._gate.resolve_dispatch_close(proof)
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
+    def dispatch_close_resolution_receipt(
+        self, permit_reference: str
+    ) -> DispatchExposureResolutionReceipt:
+        """Read the exact settled close resolution without changing occupancy."""
+        try:
+            return self._gate.dispatch_close_resolution_receipt(permit_reference)
+        except (RiskDeniedError, PermitInvalidError) as error:
+            self._raise_neutral_denial(error)
+
     def dispatch_exposure_resolution_receipt(
         self, permit_reference: str
     ) -> DispatchExposureResolutionReceipt:

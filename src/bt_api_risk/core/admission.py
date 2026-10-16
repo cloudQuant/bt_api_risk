@@ -1055,6 +1055,14 @@ class DispatchExposureResolutionProof:
             raise ValueError("terminal exposure proof requires positive fills and zero leaves")
         if observation.fill_trade_count <= 0 or not observation.fills:
             raise ValueError("terminal exposure proof requires immutable positive-fill facts")
+        if observation.position_effect not in {"OPEN", "CLOSE"}:
+            raise ValueError("terminal proof supports only OPEN or net CLOSE")
+        if observation.position_effect == "CLOSE" and not (
+            observation.state is OrderExposureState.FILLED
+            and observation.cumulative_filled_quantity == observation.requested_quantity
+            and observation.leaves_quantity == 0
+        ):
+            raise ValueError("terminal net-close proof requires a complete FILLED order")
 
     @property
     def scope(self) -> AccountScope:
@@ -1094,9 +1102,7 @@ class DispatchExposureResolutionProof:
 
     @property
     def fingerprint(self) -> str:
-        return _sha256(
-            _canonical_json(
-                {
+        payload = {
                     "claim_digest": self.claim.claim_digest,
                     "dispatch_attempt_count": self.dispatch_attempt_count,
                     "evidence_class": self.evidence_class.value,
@@ -1106,11 +1112,16 @@ class DispatchExposureResolutionProof:
                     "permit_id": self.permit_id,
                     "reconciliation_evidence_sha256": self.reconciliation_evidence_sha256,
                     "scope_key": self.scope.key,
-                    "schema": "bt-api-risk-dispatch-exposure-resolution-v1",
+                    "schema": (
+                        "bt-api-risk-dispatch-close-resolution-v1"
+                        if self.observation.position_effect == "CLOSE"
+                        else "bt-api-risk-dispatch-exposure-resolution-v1"
+                    ),
                     "writer_fence_sha256": self.writer_fence_sha256,
                 }
-            )
-        )
+        if self.observation.position_effect == "CLOSE":
+            payload["position_effect"] = "CLOSE"
+        return _sha256(_canonical_json(payload))
 
 
 class DispatchExposureResolutionReceiptStatus(str, Enum):
@@ -1118,6 +1129,7 @@ class DispatchExposureResolutionReceiptStatus(str, Enum):
 
     UNRESOLVED_ACTIVE = "UNRESOLVED_ACTIVE"
     TERMINAL_EXPOSURE_RESOLVED = "TERMINAL_EXPOSURE_RESOLVED"
+    TERMINAL_CLOSE_RESOLVED = "TERMINAL_CLOSE_RESOLVED"
 
 
 @dataclass(frozen=True)
@@ -1138,12 +1150,15 @@ class DispatchExposureResolutionReceipt:
     exposure_reservation_sha256: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
     dispatch_latch_active: bool = True
     has_other_active_freezes: bool = False
+    position_effect: str = "OPEN"
 
     def __post_init__(self) -> None:
         if type(self.status) is not DispatchExposureResolutionReceiptStatus:
             raise ValueError("invalid dispatch exposure receipt status")
         if type(self.claim) is not DispatchClaimBinding:
             raise ValueError("invalid dispatch exposure receipt claim")
+        if self.position_effect not in {"OPEN", "CLOSE"}:
+            raise ValueError("invalid terminal order position effect")
         if type(self.dispatch_latch_active) is not bool or type(
             self.has_other_active_freezes
         ) is not bool:
@@ -1166,6 +1181,13 @@ class DispatchExposureResolutionReceipt:
             return
         if any(value is None for value in optional_fields) or self.dispatch_latch_active:
             raise ValueError("resolved exposure receipt is incomplete or still latched")
+        expected_status = (
+            DispatchExposureResolutionReceiptStatus.TERMINAL_CLOSE_RESOLVED
+            if self.position_effect == "CLOSE"
+            else DispatchExposureResolutionReceiptStatus.TERMINAL_EXPOSURE_RESOLVED
+        )
+        if self.status is not expected_status:
+            raise ValueError("terminal receipt status does not match its position effect")
         _require_sha256(self.proof_sha256, "proof_sha256")
         _require_sha256(self.exposure_proof_sha256, "exposure_proof_sha256")
         _require_sha256(self.exposure_reservation_sha256, "exposure_reservation_sha256")
@@ -6590,6 +6612,543 @@ class DurableRiskGate:
             has_other_active_freezes=has_other_active_freezes,
         )
 
+    def resolve_dispatch_close(
+        self, proof: DispatchExposureResolutionProof
+    ) -> DispatchExposureResolutionReceipt:
+        """Resolve one source-complete net CLOSE without seeding OPEN exposure."""
+        if (
+            type(proof) is not DispatchExposureResolutionProof
+            or proof.observation.position_effect != "CLOSE"
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_CLOSE_PROOF_REQUIRED",
+                "a typed terminal net-close proof is required",
+            )
+        observation = proof.observation
+        if not (
+            observation.state is OrderExposureState.FILLED
+            and observation.cumulative_filled_quantity == observation.requested_quantity
+            and observation.leaves_quantity == 0
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_CLOSE_FULL_FILL_REQUIRED",
+                "net-close resolution requires a complete full fill",
+            )
+        if self._policy.notional_unit is not None and (
+            observation.notional_unit != self._policy.notional_unit
+            or observation.valuation_unit != self._policy.notional_unit
+        ):
+            raise RiskDeniedError(
+                "ORDER_EXPOSURE_UNIT_MISMATCH",
+                "terminal close valuation must use the fixed policy unit",
+            )
+        binding = self._load_dispatch_claim_binding(
+            proof.permit_id,
+            proof.journal_record_sha256,
+            allow_resolved_close_proof_sha256=proof.fingerprint,
+        )
+        if binding != proof.claim:
+            raise PermitInvalidError(
+                "DISPATCH_RESOLUTION_PROOF_SCOPE_MISMATCH",
+                "terminal close proof does not carry the current exact durable claim",
+            )
+        guard_factory = None
+        for authority in (self._gross_exposure_authority, self._execution_journal_authority):
+            candidate = getattr(authority, "dispatch_exposure_resolution_guard", None)
+            if callable(candidate):
+                guard_factory = candidate
+                break
+        if not callable(guard_factory):
+            raise PermitInvalidError(
+                "DISPATCH_EXPOSURE_AUTHORITY_REQUIRED",
+                "a current order-journal authority is required",
+            )
+        try:
+            with guard_factory(proof, claim=binding) as verified:
+                if not _verified_dispatch_exposure_matches(
+                    verified, proof=proof, claim=binding
+                ):
+                    raise PermitInvalidError(
+                        "DISPATCH_EXPOSURE_PROOF_REJECTED",
+                        "the journal authority did not verify these exact close facts and fence",
+                    )
+                with self._transaction() as connection:
+                    committed_at_ns = self._now_ns()
+                    self._ensure_policy_binding(connection, proof.scope.key)
+                    reservation = connection.execute(
+                        "SELECT * FROM risk_reservations WHERE permit_id = ?",
+                        (proof.permit_id,),
+                    ).fetchone()
+                    if reservation is None:
+                        raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+                    if (
+                        reservation["action"] != IntentAction.REDUCE.value
+                        or reservation["status"] != self._SETTLED
+                        or reservation["close_position_version"] is None
+                        or reservation["strategy_id"] is None
+                        or reservation["group_id"] is not None
+                    ):
+                        raise PermitInvalidError(
+                            "ORDER_CLOSE_REQUIRES_SETTLED_REDUCTION",
+                            "terminal close requires an attributed settled REDUCE reservation",
+                        )
+                    # An exact duplicate CLOSE proof may read back its
+                    # terminal receipt after the first commit cleared the
+                    # dispatch latch. New resolutions still prove the active
+                    # latch below before inserting terminal rows.
+                    claim_row = connection.execute(
+                        "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?",
+                        (proof.permit_id,),
+                    ).fetchone()
+                    if claim_row is None:
+                        raise PermitInvalidError(
+                            "PERMIT_NOT_DISPATCH_CLAIMED",
+                            "terminal close resolution requires the exact durable claim",
+                        )
+                    current_claim = self._dispatch_claim_binding(reservation, claim_row)
+                    if current_claim != binding or current_claim != proof.claim:
+                        raise PermitInvalidError(
+                            "DISPATCH_RESOLUTION_PROOF_SCOPE_MISMATCH",
+                            "the durable close claim changed before terminal commit",
+                        )
+                    self._assert_order_observation_identity(
+                        observation, reservation, claim_row=claim_row
+                    )
+                    self._assert_terminal_order_matches_actual_claim(
+                        observation, reservation, claim_row
+                    )
+                    prior_resolution = connection.execute(
+                        "SELECT permit_id FROM risk_dispatch_resolutions WHERE permit_id = ?",
+                        (proof.permit_id,),
+                    ).fetchone()
+                    prior_close = connection.execute(
+                        "SELECT permit_id FROM risk_close_order_resolutions WHERE permit_id = ?",
+                        (proof.permit_id,),
+                    ).fetchone()
+                    prior_open = connection.execute(
+                        "SELECT permit_id FROM risk_order_exposures WHERE permit_id = ?",
+                        (proof.permit_id,),
+                    ).fetchone()
+                    if prior_resolution is not None or prior_close is not None or prior_open is not None:
+                        if (
+                            prior_resolution is None
+                            or prior_close is None
+                            or prior_open is not None
+                        ):
+                            raise PermitInvalidError(
+                                "DISPATCH_CLOSE_STATE_CONFLICT",
+                                "existing close resolution rows are incomplete or conflicting",
+                            )
+                        resolution = connection.execute(
+                            "SELECT * FROM risk_dispatch_resolutions WHERE permit_id = ?",
+                            (proof.permit_id,),
+                        ).fetchone()
+                        close = connection.execute(
+                            "SELECT * FROM risk_close_order_resolutions WHERE permit_id = ?",
+                            (proof.permit_id,),
+                        ).fetchone()
+                        if resolution is None or close is None:
+                            raise PermitInvalidError(
+                                "DISPATCH_CLOSE_STATE_CONFLICT",
+                                "existing close resolution rows disappeared",
+                            )
+                        if not all(
+                            (
+                                resolution["proof_kind"] == "TERMINAL_CLOSE",
+                                resolution["resolution_proof_sha256"] == proof.fingerprint,
+                                resolution["exposure_proof_sha256"] == observation.fingerprint,
+                                resolution["claim_digest"] == binding.claim_digest,
+                                resolution["intent_id"] == binding.intent_id,
+                                resolution["intent_hash"] == binding.intent_hash,
+                                resolution["cause_id"] == binding.cause_id,
+                                resolution["journal_revision"] == observation.journal_revision,
+                                resolution["journal_record_sha256"] == observation.journal_record_sha256,
+                                resolution["reconciliation_evidence_sha256"]
+                                == proof.reconciliation_evidence_sha256,
+                                resolution["writer_fence_sha256"]
+                                == observation.writer_fence_sha256,
+                                resolution["provider_order_id"] == observation.provider_order_id,
+                                resolution["accepted_request_sha256"]
+                                == observation.accepted_request_sha256,
+                                resolution["exposure_reservation_id"]
+                                == observation.exposure_reservation_id,
+                                resolution["exposure_reservation_sha256"]
+                                == observation.exposure_reservation_sha256,
+                                resolution["terminal_state"] == observation.state.value,
+                                resolution["requested_quantity"]
+                                == _canonical_decimal_text(observation.requested_quantity),
+                                resolution["cumulative_filled_quantity"]
+                                == _canonical_decimal_text(
+                                    observation.cumulative_filled_quantity
+                                ),
+                                resolution["exposure_fill_trade_count"]
+                                == observation.fill_trade_count,
+                                resolution["exposure_fill_ids_sha256"]
+                                == observation.fill_ids_sha256,
+                                resolution["exposure_order_revision"]
+                                == observation.order_revision,
+                                close["proof_sha256"] == proof.fingerprint,
+                                close["close_proof_sha256"] == observation.fingerprint,
+                                close["scope_key"] == proof.scope.key,
+                                close["intent_id"] == proof.intent_id,
+                                close["intent_hash"] == proof.intent_hash,
+                                close["claim_digest"] == proof.claim_digest,
+                                close["position_effect"] == "CLOSE",
+                                close["provider_order_id"] == observation.provider_order_id,
+                                close["accepted_request_sha256"]
+                                == observation.accepted_request_sha256,
+                                close["close_reference_id"]
+                                == observation.exposure_reservation_id,
+                                close["close_reference_sha256"]
+                                == observation.exposure_reservation_sha256,
+                                close["terminal_state"] == observation.state.value,
+                                close["requested_quantity"]
+                                == _canonical_decimal_text(observation.requested_quantity),
+                                close["filled_quantity"]
+                                == _canonical_decimal_text(
+                                    observation.cumulative_filled_quantity
+                                ),
+                                close["trade_count"] == observation.fill_trade_count,
+                                close["fill_ids_sha256"] == observation.fill_ids_sha256,
+                                close["order_revision"] == observation.order_revision,
+                                close["journal_revision"] == observation.journal_revision,
+                                close["journal_record_sha256"]
+                                == observation.journal_record_sha256,
+                                close["reconciliation_evidence_sha256"]
+                                == proof.reconciliation_evidence_sha256,
+                                close["proof_sha256"] == resolution["resolution_proof_sha256"],
+                                close["close_proof_sha256"]
+                                == resolution["exposure_proof_sha256"],
+                            )
+                        ):
+                            raise PermitInvalidError(
+                                "DISPATCH_ALREADY_RECONCILED",
+                                "a different terminal proof already resolved this close claim",
+                            )
+                        result = self._dispatch_close_resolution_receipt_in_transaction(
+                            connection, proof.permit_id
+                        )
+                        if not (
+                            result.status
+                            is DispatchExposureResolutionReceiptStatus.TERMINAL_CLOSE_RESOLVED
+                            and result.dispatch_latch_active is False
+                            and result.claim == binding
+                            and result.proof_sha256 == proof.fingerprint
+                            and result.exposure_proof_sha256 == observation.fingerprint
+                            and result.final_state is observation.state
+                            and result.requested_quantity == observation.requested_quantity
+                            and result.filled_quantity
+                            == observation.cumulative_filled_quantity
+                            and result.trade_count == observation.fill_trade_count
+                            and result.order_revision == observation.order_revision
+                            and result.journal_revision == observation.journal_revision
+                            and result.exposure_reservation_id
+                            == observation.exposure_reservation_id
+                            and result.exposure_reservation_sha256
+                            == observation.exposure_reservation_sha256
+                        ):
+                            raise PermitInvalidError(
+                                "DISPATCH_ALREADY_RECONCILED",
+                                "the prior close receipt does not match this exact proof",
+                            )
+                        return result
+                    self._assert_terminal_observation_current(proof, committed_at_ns)
+                    if reservation["group_id"] is not None:
+                        raise PermitInvalidError(
+                            "GROUP_CLOSE_UNSUPPORTED",
+                            "this net-close path accepts singleton strategy orders only",
+                        )
+                    cause = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+                    freeze = connection.execute(
+                        "SELECT active FROM risk_freezes WHERE scope_key=? AND cause_id=?",
+                        (proof.scope.key, cause),
+                    ).fetchone()
+                    if freeze is None or int(freeze["active"]) != 1:
+                        raise PermitInvalidError(
+                            "DISPATCH_FREEZE_MISSING",
+                            "the exact close dispatch latch was not active at terminal commit",
+                        )
+                    connection.execute(
+                        """
+                        INSERT INTO risk_close_order_resolutions (
+                            permit_id, scope_key, intent_id, intent_hash, cause_id,
+                            claim_digest, strategy_id, instrument, close_position_version,
+                            position_effect, provider_order_id, accepted_request_sha256,
+                            close_reference_id, close_reference_sha256, terminal_state,
+                            requested_quantity, filled_quantity, trade_count, fill_ids_sha256,
+                            order_revision, journal_revision, journal_record_sha256,
+                            reconciliation_evidence_sha256, proof_sha256, close_proof_sha256,
+                            writer_owner_id, writer_fencing_token, writer_fence_sha256,
+                            resolved_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'CLOSE', ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                                  ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            proof.permit_id,
+                            proof.scope.key,
+                            proof.intent_id,
+                            proof.intent_hash,
+                            proof.cause_id,
+                            proof.claim_digest,
+                            str(reservation["strategy_id"]),
+                            str(reservation["instrument"]),
+                            str(reservation["close_position_version"]),
+                            observation.provider_order_id,
+                            observation.accepted_request_sha256,
+                            observation.exposure_reservation_id,
+                            observation.exposure_reservation_sha256,
+                            observation.state.value,
+                            _canonical_decimal_text(observation.requested_quantity),
+                            _canonical_decimal_text(observation.cumulative_filled_quantity),
+                            observation.fill_trade_count,
+                            observation.fill_ids_sha256,
+                            observation.order_revision,
+                            observation.journal_revision,
+                            observation.journal_record_sha256,
+                            proof.reconciliation_evidence_sha256,
+                            proof.fingerprint,
+                            observation.fingerprint,
+                            observation.writer_owner_id,
+                            observation.writer_fencing_token,
+                            observation.writer_fence_sha256,
+                            self._clock(),
+                        ),
+                    )
+                    connection.execute(
+                        """
+                        INSERT INTO risk_dispatch_resolutions (
+                            permit_id, scope_key, intent_id, intent_hash, cause_id,
+                            claim_digest, proof_kind, evidence_class,
+                            dispatch_attempt_count, journal_revision,
+                            journal_record_sha256, reconciliation_evidence_sha256,
+                            writer_fence_sha256, provider_order_id, accepted_request_sha256,
+                            exposure_reservation_id, exposure_reservation_sha256,
+                            filled_quantity, trade_count, resolved_at,
+                            resolution_proof_sha256, exposure_proof_sha256,
+                            terminal_state, requested_quantity, cumulative_filled_quantity,
+                            exposure_fill_trade_count, exposure_fill_ids_sha256,
+                            exposure_order_revision
+                        ) VALUES (?, ?, ?, ?, ?, ?, 'TERMINAL_CLOSE', ?, 1, ?, ?, ?, ?, ?, ?, ?, ?,
+                                  0, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            proof.permit_id,
+                            proof.scope.key,
+                            proof.intent_id,
+                            proof.intent_hash,
+                            proof.cause_id,
+                            proof.claim_digest,
+                            proof.evidence_class.value,
+                            observation.journal_revision,
+                            observation.journal_record_sha256,
+                            proof.reconciliation_evidence_sha256,
+                            observation.writer_fence_sha256,
+                            observation.provider_order_id,
+                            observation.accepted_request_sha256,
+                            observation.exposure_reservation_id,
+                            observation.exposure_reservation_sha256,
+                            self._clock(),
+                            proof.fingerprint,
+                            observation.fingerprint,
+                            observation.state.value,
+                            _canonical_decimal_text(observation.requested_quantity),
+                            _canonical_decimal_text(observation.cumulative_filled_quantity),
+                            observation.fill_trade_count,
+                            observation.fill_ids_sha256,
+                            observation.order_revision,
+                        ),
+                    )
+                    cleared = connection.execute(
+                        "UPDATE risk_freezes SET active=0, updated_at=? "
+                        "WHERE scope_key=? AND cause_id=? AND active=1",
+                        (self._clock(), proof.scope.key, proof.cause_id),
+                    )
+                    if cleared.rowcount != 1:
+                        raise PermitInvalidError(
+                            "DISPATCH_FREEZE_MISSING",
+                            "the exact close dispatch latch was not active at terminal commit",
+                        )
+                    result = self._dispatch_close_resolution_receipt_in_transaction(
+                        connection, proof.permit_id
+                    )
+                    self._assert_terminal_observation_current(proof, self._now_ns())
+                return result
+        except (PermitInvalidError, RiskDeniedError):
+            raise
+        except Exception as exc:
+            raise PermitInvalidError(
+                "DISPATCH_CLOSE_PROOF_REJECTED",
+                "the journal authority could not verify this terminal net-close proof",
+            ) from exc
+
+    def dispatch_close_resolution_receipt(
+        self, permit_id: str
+    ) -> DispatchExposureResolutionReceipt:
+        """Read one exact close claim/resolution snapshot without mutation."""
+        if type(permit_id) is not str or not permit_id or permit_id != permit_id.strip():
+            raise PermitInvalidError("PERMIT_UNKNOWN", "permit reference is invalid")
+        with self._connection() as connection:
+            connection.execute("BEGIN")
+            try:
+                result = self._dispatch_close_resolution_receipt_in_transaction(
+                    connection, permit_id
+                )
+            except BaseException:
+                connection.execute("ROLLBACK")
+                raise
+            connection.execute("ROLLBACK")
+            return result
+
+    def _dispatch_close_resolution_receipt_in_transaction(
+        self, connection: sqlite3.Connection, permit_id: str
+    ) -> DispatchExposureResolutionReceipt:
+        reservation = connection.execute(
+            "SELECT * FROM risk_reservations WHERE permit_id=?", (permit_id,)
+        ).fetchone()
+        if reservation is None:
+            raise PermitInvalidError("PERMIT_UNKNOWN", "permit does not exist")
+        if (
+            reservation["action"] != IntentAction.REDUCE.value
+            or reservation["status"] != self._SETTLED
+            or reservation["close_position_version"] is None
+            or reservation["strategy_id"] is None
+            or reservation["group_id"] is not None
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_CLOSE_STATE_CONFLICT",
+                "terminal close receipt requires an attributed settled REDUCE reservation",
+            )
+        policy_error = self._policy_binding_read_error(connection, str(reservation["scope_key"]))
+        if policy_error is not None:
+            raise PermitInvalidError(policy_error, "risk database policy binding is invalid")
+        claim_row = connection.execute(
+            "SELECT * FROM risk_dispatch_claims WHERE permit_id=?", (permit_id,)
+        ).fetchone()
+        if claim_row is None:
+            raise PermitInvalidError("PERMIT_NOT_DISPATCH_CLAIMED", "permit was not claimed")
+        claim = self._dispatch_claim_binding(reservation, claim_row)
+        cause = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+        if claim.cause_id != cause:
+            raise PermitInvalidError("DISPATCH_CLOSE_STATE_CONFLICT", "close claim cause is invalid")
+        freeze = connection.execute(
+            "SELECT active FROM risk_freezes WHERE scope_key=? AND cause_id=?",
+            (reservation["scope_key"], cause),
+        ).fetchone()
+        if freeze is None or type(freeze["active"]) is not int or freeze["active"] not in (0, 1):
+            raise PermitInvalidError("DISPATCH_CLOSE_STATE_CONFLICT", "close latch is missing")
+        other_freezes = connection.execute(
+            "SELECT active FROM risk_freezes WHERE scope_key=? AND cause_id<>?",
+            (reservation["scope_key"], cause),
+        ).fetchall()
+        if any(type(row["active"]) is not int or row["active"] not in (0, 1) for row in other_freezes):
+            raise PermitInvalidError("DISPATCH_CLOSE_STATE_CONFLICT", "another freeze is invalid")
+        other_active = any(int(row["active"]) == 1 for row in other_freezes)
+        resolution = connection.execute(
+            "SELECT * FROM risk_dispatch_resolutions WHERE permit_id=?", (permit_id,)
+        ).fetchone()
+        close = connection.execute(
+            "SELECT * FROM risk_close_order_resolutions WHERE permit_id=?", (permit_id,)
+        ).fetchone()
+        open_exposure = connection.execute(
+            "SELECT permit_id FROM risk_order_exposures WHERE permit_id=?", (permit_id,)
+        ).fetchone()
+        if resolution is None:
+            if freeze["active"] != 1 or close is not None or open_exposure is not None:
+                raise PermitInvalidError("DISPATCH_CLOSE_STATE_CONFLICT", "unresolved close state changed")
+            return DispatchExposureResolutionReceipt(
+                status=DispatchExposureResolutionReceiptStatus.UNRESOLVED_ACTIVE,
+                claim=claim,
+                dispatch_latch_active=True,
+                has_other_active_freezes=other_active,
+                position_effect="CLOSE",
+            )
+        if (
+            freeze["active"] != 0
+            or resolution["proof_kind"] != "TERMINAL_CLOSE"
+            or resolution["scope_key"] != reservation["scope_key"]
+            or resolution["intent_id"] != reservation["intent_id"]
+            or resolution["intent_hash"] != reservation["intent_hash"]
+            or resolution["cause_id"] != cause
+            or int(resolution["dispatch_attempt_count"]) != 1
+            or resolution["claim_digest"] != claim.claim_digest
+            or close is None
+            or open_exposure is not None
+            or close["scope_key"] != reservation["scope_key"]
+            or close["intent_id"] != reservation["intent_id"]
+            or close["intent_hash"] != reservation["intent_hash"]
+            or close["cause_id"] != cause
+            or close["strategy_id"] != reservation["strategy_id"]
+            or close["instrument"] != reservation["instrument"]
+            or close["close_position_version"] != reservation["close_position_version"]
+            or close["claim_digest"] != claim.claim_digest
+            or close["position_effect"] != "CLOSE"
+            or close["proof_sha256"] != resolution["resolution_proof_sha256"]
+            or close["close_proof_sha256"] != resolution["exposure_proof_sha256"]
+            or close["provider_order_id"] != resolution["provider_order_id"]
+            or close["accepted_request_sha256"] != resolution["accepted_request_sha256"]
+            or close["close_reference_id"] != resolution["exposure_reservation_id"]
+            or close["close_reference_sha256"] != resolution["exposure_reservation_sha256"]
+            or close["terminal_state"] != resolution["terminal_state"]
+            or close["requested_quantity"] != resolution["requested_quantity"]
+            or close["filled_quantity"] != resolution["cumulative_filled_quantity"]
+            or int(close["trade_count"]) != int(resolution["exposure_fill_trade_count"])
+            or close["fill_ids_sha256"] != resolution["exposure_fill_ids_sha256"]
+            or int(close["order_revision"]) != int(resolution["exposure_order_revision"])
+            or int(close["journal_revision"]) != int(resolution["journal_revision"])
+            or close["journal_record_sha256"] != resolution["journal_record_sha256"]
+            or close["reconciliation_evidence_sha256"] != resolution["reconciliation_evidence_sha256"]
+            or close["writer_fence_sha256"] != resolution["writer_fence_sha256"]
+        ):
+            raise PermitInvalidError(
+                "DISPATCH_CLOSE_STATE_CONFLICT",
+                "stored terminal close, reservation attribution, claim, or latch is inconsistent",
+            )
+        try:
+            final_state = OrderExposureState(str(close["terminal_state"]))
+            requested = _as_decimal(close["requested_quantity"])
+            filled = _as_decimal(close["filled_quantity"])
+            trade_count = int(close["trade_count"])
+            order_revision = int(close["order_revision"])
+            journal_revision = int(close["journal_revision"])
+            proof_sha = _require_sha256(str(close["proof_sha256"]), "close proof digest")
+            close_proof_sha = _require_sha256(str(close["close_proof_sha256"]), "close fact digest")
+            reference_sha = _require_sha256(str(close["close_reference_sha256"]), "close reference digest")
+            _require_sha256(str(close["fill_ids_sha256"]), "close fill digest")
+            _require_sha256(str(close["journal_record_sha256"]), "journal digest")
+        except (TypeError, ValueError) as exc:
+            raise PermitInvalidError("DISPATCH_CLOSE_STATE_CONFLICT", "stored close facts are malformed") from exc
+        if not (
+            final_state is OrderExposureState.FILLED
+            and requested > 0
+            and requested == _as_decimal(reservation["quantity"])
+            and filled == requested
+            and trade_count > 0
+            and order_revision > 0
+            and journal_revision > 0
+            and close["provider_order_id"]
+            and close["close_reference_id"]
+            and int(resolution["filled_quantity"]) == 0
+            and int(resolution["trade_count"]) == 0
+        ):
+            raise PermitInvalidError("DISPATCH_CLOSE_STATE_CONFLICT", "terminal close facts are invalid")
+        return DispatchExposureResolutionReceipt(
+            status=DispatchExposureResolutionReceiptStatus.TERMINAL_CLOSE_RESOLVED,
+            claim=claim,
+            proof_sha256=proof_sha,
+            exposure_proof_sha256=close_proof_sha,
+            final_state=final_state,
+            requested_quantity=requested,
+            filled_quantity=filled,
+            trade_count=trade_count,
+            order_revision=order_revision,
+            journal_revision=journal_revision,
+            exposure_reservation_id=str(close["close_reference_id"]),
+            exposure_reservation_sha256=reference_sha,
+            dispatch_latch_active=False,
+            has_other_active_freezes=other_active,
+            position_effect="CLOSE",
+        )
+
     def resolve_dispatch_freeze(
         self, proof: DispatchResolutionProof
     ) -> Optional[DispatchTerminalResolutionReceipt]:  # noqa: UP045 -- Python 3.9 is supported.
@@ -8104,6 +8663,13 @@ class DurableRiskGate:
         claim_row: sqlite3.Row,
     ) -> None:
         quantity, _notional = self._actual_claim_order_bounds(reservation, claim_row)
+        expected_effect = (
+            "OPEN"
+            if reservation["action"] == IntentAction.INCREASE.value
+            else "CLOSE"
+            if reservation["action"] == IntentAction.REDUCE.value
+            else None
+        )
         if (
             proof.requested_quantity != quantity
             or proof.instrument_id != reservation["instrument"]
@@ -8118,7 +8684,7 @@ class DurableRiskGate:
                 self._policy.notional_unit is not None
                 and proof.valuation_unit != self._policy.notional_unit
             )
-            or proof.position_effect != "OPEN"
+            or proof.position_effect != expected_effect
         ):
             raise RiskDeniedError(
                 "ORDER_EXPOSURE_REQUEST_MISMATCH",
@@ -9915,14 +10481,27 @@ class DurableRiskGate:
         )
 
     def _load_dispatch_claim_binding(
-        self, permit_id: str, journal_record_sha256: str
+        self,
+        permit_id: str,
+        journal_record_sha256: str,
+        *,
+        allow_resolved_close_proof_sha256: str | None = None,
     ) -> DispatchClaimBinding:
         with self._connection() as connection:
             prior_proof = connection.execute(
-                "SELECT permit_id FROM risk_dispatch_resolutions WHERE journal_record_sha256 = ?",
+                "SELECT permit_id, proof_kind, resolution_proof_sha256 "
+                "FROM risk_dispatch_resolutions WHERE journal_record_sha256 = ?",
                 (journal_record_sha256,),
             ).fetchone()
-            if prior_proof is not None:
+            exact_close_replay = (
+                prior_proof is not None
+                and type(allow_resolved_close_proof_sha256) is str
+                and prior_proof["permit_id"] == permit_id
+                and prior_proof["proof_kind"] == "TERMINAL_CLOSE"
+                and prior_proof["resolution_proof_sha256"]
+                == allow_resolved_close_proof_sha256
+            )
+            if prior_proof is not None and not exact_close_replay:
                 raise PermitInvalidError(
                     "DISPATCH_PROOF_REPLAYED",
                     "this immutable journal proof was already consumed",
@@ -9967,7 +10546,10 @@ class DurableRiskGate:
                 "SELECT journal_record_sha256 FROM risk_dispatch_resolutions WHERE permit_id = ?",
                 (permit_id,),
             ).fetchone()
-            if prior is not None:
+            if prior is not None and not (
+                exact_close_replay
+                and prior["journal_record_sha256"] == journal_record_sha256
+            ):
                 raise PermitInvalidError(
                     "DISPATCH_ALREADY_RECONCILED",
                     "this dispatch claim already has a terminal resolution",
@@ -9976,10 +10558,12 @@ class DurableRiskGate:
                 "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
                 (reservation["scope_key"], expected_cause),
             ).fetchone()
-            if freeze is None or freeze["active"] != 1:
+            if freeze is None or freeze["active"] not in (0, 1) or (
+                freeze["active"] != 1 and not exact_close_replay
+            ):
                 raise PermitInvalidError(
                     "DISPATCH_FREEZE_MISSING",
-                    "the exact dispatch latch is not active",
+                    "the exact dispatch latch is not active for a new resolution",
                 )
             if reservation["status"] != self._SETTLED:
                 raise PermitInvalidError(
@@ -10305,6 +10889,48 @@ class DurableRiskGate:
                 BEFORE DELETE ON risk_cancel_dispatch_resolutions
                 BEGIN
                     SELECT RAISE(ABORT, 'cancel dispatch resolution is immutable');
+                END;
+                CREATE TABLE IF NOT EXISTS risk_close_order_resolutions (
+                    permit_id TEXT PRIMARY KEY,
+                    scope_key TEXT NOT NULL,
+                    intent_id TEXT NOT NULL,
+                    intent_hash TEXT NOT NULL,
+                    cause_id TEXT NOT NULL,
+                    claim_digest TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    instrument TEXT NOT NULL,
+                    close_position_version TEXT NOT NULL,
+                    position_effect TEXT NOT NULL CHECK(position_effect = 'CLOSE'),
+                    provider_order_id TEXT NOT NULL,
+                    accepted_request_sha256 TEXT NOT NULL,
+                    close_reference_id TEXT NOT NULL,
+                    close_reference_sha256 TEXT NOT NULL,
+                    terminal_state TEXT NOT NULL CHECK(terminal_state = 'FILLED'),
+                    requested_quantity TEXT NOT NULL,
+                    filled_quantity TEXT NOT NULL,
+                    trade_count INTEGER NOT NULL CHECK(trade_count > 0),
+                    fill_ids_sha256 TEXT NOT NULL,
+                    order_revision INTEGER NOT NULL CHECK(order_revision > 0),
+                    journal_revision INTEGER NOT NULL CHECK(journal_revision > 0),
+                    journal_record_sha256 TEXT NOT NULL UNIQUE,
+                    reconciliation_evidence_sha256 TEXT NOT NULL,
+                    proof_sha256 TEXT NOT NULL UNIQUE,
+                    close_proof_sha256 TEXT NOT NULL,
+                    writer_owner_id TEXT NOT NULL,
+                    writer_fencing_token INTEGER NOT NULL CHECK(writer_fencing_token > 0),
+                    writer_fence_sha256 TEXT NOT NULL,
+                    resolved_at REAL NOT NULL,
+                    FOREIGN KEY(permit_id) REFERENCES risk_reservations(permit_id)
+                );
+                CREATE TRIGGER IF NOT EXISTS risk_close_order_resolution_immutable_update
+                BEFORE UPDATE ON risk_close_order_resolutions
+                BEGIN
+                    SELECT RAISE(ABORT, 'close order resolutions are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS risk_close_order_resolution_immutable_delete
+                BEFORE DELETE ON risk_close_order_resolutions
+                BEGIN
+                    SELECT RAISE(ABORT, 'close order resolutions are immutable');
                 END;
                 CREATE TABLE IF NOT EXISTS risk_generations (
                     scope_key TEXT PRIMARY KEY,
