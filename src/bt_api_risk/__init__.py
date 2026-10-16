@@ -116,13 +116,31 @@ _ADMISSION_EXPORTS = {
     "RiskAdmissionDeniedError": ".order_admission",
 }
 
+# Optional features whose implementation imports live outside the base
+# dependency set. Requesting them without the extra must fail explicitly
+# instead of surfacing a bare module-not-found from deep inside the package.
+_OPTIONAL_EXTRAS = {
+    "RiskManager": "analytics",
+    "AnomalyDetector": "ml",
+    "RiskEnsembleModel": "ml",
+}
+
 
 def __getattr__(name: str):
     """Load optional features only when explicitly requested by the caller."""
     module = _ANALYSIS_EXPORTS.get(name) or _ADMISSION_EXPORTS.get(name)
     if module is None:
         raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    value = getattr(import_module(module, __name__), name)
+    try:
+        value = getattr(import_module(module, __name__), name)
+    except ImportError as error:
+        extra = _OPTIONAL_EXTRAS.get(name)
+        if extra is None:
+            raise
+        raise ImportError(
+            f"{name} requires the {extra!r} extra of bt_api_risk "
+            f"(install bt_api_risk[{extra}]): {error}"
+        ) from error
     globals()[name] = value
     return value
 

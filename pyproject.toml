@@ -27,13 +27,21 @@ authors = [
 ]
 dependencies = [
     "bt_api_base>=0.15.5,<0.16",
-    "numpy>=1.26.0",
     "pydantic>=2.0.0",
     "typing-extensions>=4.8.0",
-    "scikit-learn>=1.0.0",
 ]
 
 [project.optional-dependencies]
+# Analytics-only numerics (RiskManager / RiskCalculator). The account
+# admission path, the risk service component and RiskAssessor never import
+# these modules, so base installs keep serving admission and policy roles.
+analytics = [
+    "numpy>=1.26.0",
+]
+# Machine-learning models (AnomalyDetector / RiskEnsembleModel).
+ml = [
+    "scikit-learn>=1.0.0",
+]
 dev = [
     "pytest>=7.0",
     "ruff>=0.1.0",
