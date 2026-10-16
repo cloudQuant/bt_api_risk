@@ -9,17 +9,21 @@ inputs carry explicit offline spot, NAV, loss, and scenario datasets for the
 accepted deterministic metrics. No optional analytics or ML dependency
 (``numpy``/``sklearn`` and friends) is imported here.
 
-Execution model (minimal vertical slice)
-----------------------------------------
+Execution model
+---------------
 ``AnalysisTaskStore`` is durable (SQLite) and shared by exactly one
 ``PortfolioAnalyticsTaskService``. The host drives ``maintain`` on its owner
-thread; each invocation (a) sweeps expired pending tasks without a time gate
-and (b) advances at most one task state transition, additionally rate-limited
-to one transition per second of the injected store clock. The clock gate keeps
-progression deterministic for operators that inject a controllable clock,
-while a production wall clock simply paces work at one transition per second.
-``running`` rows found when the store is opened are failed closed as
-``TASK_INTERRUPTED`` instead of being silently re-executed.
+thread; each invocation sweeps expired pending tasks and advances at most one
+new task claim per elapsed second of the injected store clock. V1 calculation
+retains its synchronous one-transition-per-tick behavior. V2 is dispatched to
+a bounded spawned process and polled asynchronously. ``max_concurrent_tasks``
+limits non-terminal submissions per scope; ``max_concurrent_workers`` is a
+separate host-wide cap on active V2 child processes. Its monotonic execution
+deadline starts only when the child enters its worker function, after any queue
+delay. A cancelled, timed out, or shutting-down V2 worker is not made terminal
+until its process has been reaped and its pipes closed. ``running`` rows found
+when the store is opened are failed closed as ``TASK_INTERRUPTED`` instead of
+being silently re-executed.
 
 Every error surfaced to a caller is one of this module's constant code
 strings; no caller-supplied value is ever echoed in a rejection.
@@ -29,10 +33,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import multiprocessing
+from multiprocessing.connection import wait as wait_for_connections
 import re
 import sqlite3
+import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal, InvalidOperation
 from typing import Final
@@ -68,6 +77,9 @@ _TASK_REF_PATTERN: Final[re.Pattern[str]] = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.
 _SUPPORTED_SOURCE_MODES: Final[frozenset[str]] = frozenset({"research", "imported", "paper"})
 _MAX_PAYLOAD_DEPTH: Final[int] = 32
 _EXECUTOR_GATE_NS: Final[int] = 1_000_000_000
+_WORKER_STARTUP_TIMEOUT_NS: Final[int] = 10_000_000_000
+_WORKER_STOP_GRACE_SECONDS: Final[float] = 0.5
+_MAX_WORKER_FRAME_BYTES: Final[int] = 1_048_576
 _TERMINAL_STATES: Final[frozenset[str]] = frozenset(
     {"succeeded", "unavailable", "failed", "cancelled", "expired"}
 )
@@ -535,6 +547,8 @@ class AnalysisTaskStore:
         model_profile: PortfolioAnalyticsModelProfileV1,
         allowed_source_modes: tuple[str, ...] | list[str],
         max_concurrent_tasks: int = 4,
+        max_concurrent_workers: int = 4,
+        execution_timeout_seconds: int | float = 30,
         pending_ttl_seconds: int = 900,
         clock: Callable[[], int] = _now_ns,
     ) -> None:
@@ -553,6 +567,13 @@ class AnalysisTaskStore:
             raise AnalysisTaskError("DUPLICATE_SOURCE_MODE")
         if type(max_concurrent_tasks) is not int or not 1 <= max_concurrent_tasks <= 64:
             raise AnalysisTaskError("INVALID_TASK_QUOTA")
+        if type(max_concurrent_workers) is not int or not 1 <= max_concurrent_workers <= 64:
+            raise AnalysisTaskError("INVALID_WORKER_QUOTA")
+        if (
+            type(execution_timeout_seconds) not in (int, float)
+            or not 0 < execution_timeout_seconds <= 3_600
+        ):
+            raise AnalysisTaskError("INVALID_EXECUTION_TIMEOUT")
         if type(pending_ttl_seconds) is not int or not 1 <= pending_ttl_seconds <= 604_800:
             raise AnalysisTaskError("INVALID_TASK_TTL")
         if not callable(clock):
@@ -560,8 +581,14 @@ class AnalysisTaskStore:
         self._model_profile = model_profile
         self._allowed_source_modes = modes
         self._max_concurrent_tasks = max_concurrent_tasks
+        self._max_concurrent_workers = max_concurrent_workers
+        self._execution_timeout_ns = int(execution_timeout_seconds * 1_000_000_000)
+        if self._execution_timeout_ns < 1:
+            raise AnalysisTaskError("INVALID_EXECUTION_TIMEOUT")
         self._pending_ttl_ns = pending_ttl_seconds * 1_000_000_000
         self._clock = clock
+        self._shutdown_callback: Callable[[], None] | None = None
+        self._closed = False
         # Validate the injected clock before any durable state is touched.
         opened_ns = self.now_ns()
         self._db = sqlite3.connect(path, check_same_thread=False)
@@ -590,14 +617,23 @@ class AnalysisTaskStore:
                 "result_json TEXT, "
                 "created_ns INTEGER NOT NULL, "
                 "state_ns INTEGER NOT NULL, "
+                "running_token TEXT, "
                 "PRIMARY KEY (scope_json, task_ref))"
             )
+            task_columns = {
+                row[1]
+                for row in self._db.execute("PRAGMA table_info(analysis_tasks)")
+            }
+            if "running_token" not in task_columns:
+                self._db.execute(
+                    "ALTER TABLE analysis_tasks ADD COLUMN running_token TEXT"
+                )
             # Fail closed on restart: a task claimed by a previous process may
             # have produced partial external effects, so it is never silently
             # re-executed.
             self._db.execute(
                 "UPDATE analysis_tasks SET state='failed', detail_code='TASK_INTERRUPTED', "
-                "state_ns=? WHERE state='running'",
+                "state_ns=?, running_token=NULL WHERE state='running'",
                 (opened_ns,),
             )
 
@@ -617,8 +653,38 @@ class AnalysisTaskStore:
     def max_concurrent_tasks(self) -> int:
         return self._max_concurrent_tasks
 
+    @property
+    def max_concurrent_workers(self) -> int:
+        """Global child-process cap, separate from each scope's submit quota."""
+
+        return self._max_concurrent_workers
+
+    @property
+    def execution_timeout_ns(self) -> int:
+        return self._execution_timeout_ns
+
+    def _bind_shutdown_callback(self, callback: Callable[[], None]) -> None:
+        """Bind the one task-service cleanup to the Host-owned store close."""
+
+        if self._closed:
+            raise AnalysisTaskError("ANALYSIS_STORE_CLOSED")
+        if not callable(callback):
+            raise AnalysisTaskError("INVALID_SHUTDOWN_CALLBACK")
+        if self._shutdown_callback is not None:
+            raise AnalysisTaskError("ANALYSIS_SERVICE_ALREADY_BOUND")
+        self._shutdown_callback = callback
+
     def close(self) -> None:
+        if self._closed:
+            return
+        callback = self._shutdown_callback
+        if callback is not None:
+            # A cleanup failure leaves both the callback and DB open so the
+            # owning Host can retry while it still retains the resource.
+            callback()
         self._db.close()
+        self._closed = True
+        self._shutdown_callback = None
 
     def now_ns(self) -> int:
         value = self._clock()
@@ -771,8 +837,26 @@ class AnalysisTaskStore:
             raise AnalysisTaskError("TASK_NOT_FOUND")
         return self._task_payload(row)
 
+    def _task_record(self, task_ref: str, *, scope_json: str) -> Mapping[str, object]:
+        """Return the private execution fields needed only by the adapter."""
+
+        task_ref = _task_reference(task_ref)
+        row = self._db.execute(
+            "SELECT * FROM analysis_tasks WHERE scope_json=? AND task_ref=?",
+            (scope_json, task_ref),
+        ).fetchone()
+        if row is None:
+            raise AnalysisTaskError("TASK_NOT_FOUND")
+        return {
+            "request_json": row["request_json"],
+            "running_token": row["running_token"],
+            "scope_json": row["scope_json"],
+            "state": row["state"],
+            "task_ref": row["task_ref"],
+        }
+
     def cancel_task(self, task_ref: str, *, scope_json: str) -> Mapping[str, object]:
-        """Cancel a pending/running task; cancelling a cancelled task is a no-op.
+        """Cancel a pending task; running work needs adapter cleanup first.
 
         Terminal states are fixed: a finished, failed, or expired task can
         never be turned into a cancelled one.
@@ -792,9 +876,12 @@ class AnalysisTaskStore:
                 return self._task_payload(row)
             if state in _TERMINAL_STATES:
                 raise AnalysisTaskError("TASK_TERMINAL")
+            if state == "running":
+                raise AnalysisTaskError("TASK_CLEANUP_REQUIRED")
             self._db.execute(
                 "UPDATE analysis_tasks SET state='cancelled', detail_code=NULL, "
-                "result_json=NULL, state_ns=? WHERE scope_json=? AND task_ref=?",
+                "result_json=NULL, state_ns=?, running_token=NULL "
+                "WHERE scope_json=? AND task_ref=? AND state='pending'",
                 (now_ns, scope_json, task_ref),
             )
         return {
@@ -808,6 +895,30 @@ class AnalysisTaskStore:
             "result": None,
         }
 
+    def _cancel_running_task(
+        self,
+        task_ref: str,
+        *,
+        scope_json: str,
+        running_token: str,
+    ) -> Mapping[str, object]:
+        """CAS-cancel one running row after the adapter has reaped its worker."""
+
+        task_ref = _task_reference(task_ref)
+        if type(running_token) is not str or re.fullmatch(r"[0-9a-f]{32}", running_token) is None:
+            raise AnalysisTaskError("TASK_STATE_INVALID")
+        now_ns = self.now_ns()
+        with self._db:
+            cursor = self._db.execute(
+                "UPDATE analysis_tasks SET state='cancelled', detail_code=NULL, "
+                "result_json=NULL, state_ns=?, running_token=NULL "
+                "WHERE scope_json=? AND task_ref=? AND state='running' AND running_token=?",
+                (now_ns, scope_json, task_ref, running_token),
+            )
+        if cursor.rowcount != 1:
+            raise AnalysisTaskError("TASK_STATE_INVALID")
+        return self.query_task(task_ref, scope_json=scope_json)
+
     def sweep_expired(self, now_ns: int) -> int:
         """Expire every pending task older than the TTL; returns the count."""
 
@@ -815,19 +926,30 @@ class AnalysisTaskStore:
         with self._db:
             cursor = self._db.execute(
                 "UPDATE analysis_tasks SET state='expired', detail_code='TASK_EXPIRED', "
-                "state_ns=? WHERE state='pending' AND created_ns <= ?",
+                "state_ns=?, running_token=NULL WHERE state='pending' AND created_ns <= ?",
                 (now_ns, threshold),
             )
         return cursor.rowcount
 
-    def next_executable_task(self) -> Mapping[str, object] | None:
+    def next_executable_task(
+        self,
+        *,
+        exclude: frozenset[tuple[str, str]] = frozenset(),
+    ) -> Mapping[str, object] | None:
         """Return the single oldest runnable task, preferring claimed work."""
 
-        row = self._db.execute(
+        cursor = self._db.execute(
             "SELECT * FROM analysis_tasks WHERE state IN ('pending','running') "
-            "ORDER BY CASE state WHEN 'running' THEN 0 ELSE 1 END, created_ns, rowid "
-            "LIMIT 1"
-        ).fetchone()
+            "ORDER BY CASE state WHEN 'running' THEN 0 ELSE 1 END, created_ns, rowid"
+        )
+        row = next(
+            (
+                candidate
+                for candidate in cursor
+                if (candidate["scope_json"], candidate["task_ref"]) not in exclude
+            ),
+            None,
+        )
         if row is None:
             return None
         return {
@@ -838,6 +960,7 @@ class AnalysisTaskStore:
             "input_sha256": row["input_sha256"],
             "owner_principal": row["owner_principal"],
             "request_json": row["request_json"],
+            "running_token": row["running_token"],
         }
 
     def load_input(self, scope_json: str, input_snapshot_id: str) -> Mapping[str, object]:
@@ -856,14 +979,24 @@ class AnalysisTaskStore:
             "facts_json": row["facts_json"],
         }
 
-    def mark_running(self, scope_json: str, task_ref: str, now_ns: int) -> None:
+    def mark_running(
+        self,
+        scope_json: str,
+        task_ref: str,
+        now_ns: int,
+        *,
+        running_token: str,
+    ) -> None:
         """Claim one pending task for execution."""
 
+        task_ref = _task_reference(task_ref)
+        if type(running_token) is not str or re.fullmatch(r"[0-9a-f]{32}", running_token) is None:
+            raise AnalysisTaskError("TASK_STATE_INVALID")
         with self._db:
             cursor = self._db.execute(
-                "UPDATE analysis_tasks SET state='running', state_ns=? "
+                "UPDATE analysis_tasks SET state='running', state_ns=?, running_token=? "
                 "WHERE scope_json=? AND task_ref=? AND state='pending'",
-                (now_ns, scope_json, task_ref),
+                (now_ns, running_token, scope_json, task_ref),
             )
         if cursor.rowcount != 1:
             raise AnalysisTaskError("TASK_STATE_INVALID")
@@ -877,16 +1010,21 @@ class AnalysisTaskStore:
         detail_code: str | None,
         result_json: str | None,
         now_ns: int,
+        running_token: str,
     ) -> None:
         """Store one claimed task's terminal outcome."""
 
         if state not in {"succeeded", "unavailable", "failed"}:
             raise AnalysisTaskError("TASK_STATE_INVALID")
+        task_ref = _task_reference(task_ref)
+        if type(running_token) is not str or re.fullmatch(r"[0-9a-f]{32}", running_token) is None:
+            raise AnalysisTaskError("TASK_STATE_INVALID")
         with self._db:
             cursor = self._db.execute(
-                "UPDATE analysis_tasks SET state=?, detail_code=?, result_json=?, state_ns=? "
-                "WHERE scope_json=? AND task_ref=? AND state='running'",
-                (state, detail_code, result_json, now_ns, scope_json, task_ref),
+                "UPDATE analysis_tasks SET state=?, detail_code=?, result_json=?, state_ns=?, "
+                "running_token=NULL WHERE scope_json=? AND task_ref=? "
+                "AND state='running' AND running_token=?",
+                (state, detail_code, result_json, now_ns, scope_json, task_ref, running_token),
             )
         if cursor.rowcount != 1:
             raise AnalysisTaskError("TASK_STATE_INVALID")
@@ -927,6 +1065,127 @@ class _StoredFactsSource:
         return self._facts
 
 
+@dataclass(slots=True)
+class _TaskWorker:
+    """One host-owned V2 worker and its bounded control/result channel."""
+
+    scope_json: str
+    task_ref: str
+    running_token: str
+    input_sha256: str
+    process: object | None
+    receive_connection: object
+    child_connection: object | None
+    process_started: bool
+    startup_deadline_ns: int
+    launched_monotonic_ns: int
+    started_monotonic_ns: int | None = None
+    execution_deadline_ns: int | None = None
+    result_envelope: dict[str, object] | None = None
+    frame_error: str | None = None
+    intent: tuple[str, str | None, str | None] | None = None
+    exit_code: int | None = None
+    process_closed: bool = False
+    cleanup_complete: bool = False
+
+
+def _portfolio_analytics_v2_worker_entry(
+    facts_json: str,
+    request_json: str,
+    input_sha256: str,
+    running_token: str,
+    send_connection: object,
+) -> None:
+    """Compute one V2 task from immutable strings; this process never writes DB."""
+
+    connection = send_connection
+    try:
+        started_ns = time.monotonic_ns()
+        connection.send_bytes(  # type: ignore[attr-defined]
+            _canonical_json(
+                {
+                    "kind": "started",
+                    "running_token": running_token,
+                    "started_monotonic_ns": started_ns,
+                }
+            )
+        )
+        state = "failed"
+        detail_code: str | None = "TASK_EXECUTION_FAILED"
+        result_json: str | None = None
+        try:
+            facts = _parse_facts_payload(json.loads(facts_json))
+            request = _parse_request_payload(json.loads(request_json))
+            if (
+                type(facts) is not PortfolioAnalyticsFactsV2
+                or type(request) is not PortfolioAnalyticsRequestV2
+            ):
+                raise AnalysisTaskError("SCHEMA_VERSION_MISMATCH")
+            report = PortfolioAnalyticsServiceV2().analyze_snapshot_v2(
+                facts,
+                request,
+                input_sha256=input_sha256,
+            )
+            payload = report.to_payload()
+            encoded_result = _canonical_json(payload)
+            if len(encoded_result) > _MAX_WORKER_FRAME_BYTES // 2:
+                raise AnalysisTaskError("TASK_RESULT_TOO_LARGE")
+            result_json = encoded_result.decode("ascii")
+            if report.status == "AVAILABLE":
+                state, detail_code = "succeeded", None
+            else:
+                state = "unavailable"
+                detail_code = next(
+                    (
+                        item.reason_code
+                        for item in (
+                            report.spot_exposure,
+                            report.max_drawdown,
+                            report.historical_var_es,
+                            report.stress_scenario,
+                        )
+                        if item.status == "unavailable"
+                    ),
+                    "UNAVAILABLE",
+                )
+        except AnalysisTaskError as error:
+            state, detail_code, result_json = "failed", error.code, None
+        except PortfolioAnalyticsError as error:
+            state, detail_code, result_json = "failed", error.code, None
+        except Exception:
+            state, detail_code, result_json = "failed", "TASK_EXECUTION_FAILED", None
+
+        envelope = {
+            "completed_monotonic_ns": time.monotonic_ns(),
+            "detail_code": detail_code,
+            "kind": "result",
+            "result_json": result_json,
+            "running_token": running_token,
+            "state": state,
+        }
+        encoded_envelope = _canonical_json(envelope)
+        if len(encoded_envelope) > _MAX_WORKER_FRAME_BYTES:
+            encoded_envelope = _canonical_json(
+                {
+                    "completed_monotonic_ns": time.monotonic_ns(),
+                    "detail_code": "TASK_RESULT_TOO_LARGE",
+                    "kind": "result",
+                    "result_json": None,
+                    "running_token": running_token,
+                    "state": "failed",
+                }
+            )
+        connection.send_bytes(encoded_envelope)  # type: ignore[attr-defined]
+    except BaseException:
+        # An untrusted/raw child traceback is never sent over the service API.
+        return
+    finally:
+        try:
+            connection.close()  # type: ignore[attr-defined]
+        except BaseException:
+            pass
+
+
 class PortfolioAnalyticsTaskService:
     """Serve exactly the four ``service.risk_analysis`` task actions.
 
@@ -949,21 +1208,57 @@ class PortfolioAnalyticsTaskService:
     )
     _TASK_ARGUMENTS: Final[frozenset[str]] = frozenset({"task_ref"})
 
-    def __init__(self, store: AnalysisTaskStore) -> None:
+    def __init__(
+        self,
+        store: AnalysisTaskStore,
+        *,
+        monotonic_ns: Callable[[], int] = time.monotonic_ns,
+    ) -> None:
         if type(store) is not AnalysisTaskStore:
             raise AnalysisTaskError("INVALID_ANALYSIS_TASK_STORE")
+        if not callable(monotonic_ns):
+            raise AnalysisTaskError("INVALID_MONOTONIC_CLOCK")
         self._store = store
+        self._monotonic_ns = monotonic_ns
         self._closed = False
         self._last_step_ns = 0
+        self._lock = threading.RLock()
+        self._workers: dict[tuple[str, str], _TaskWorker] = {}
+        self._store._bind_shutdown_callback(self._close_from_store)
 
     @property
     def supported_operations(self) -> frozenset[str]:
         return PortfolioAnalyticsTaskService.SUPPORTED_OPERATIONS
 
     def close(self) -> None:
-        self._closed = True
+        with self._lock:
+            if self._closed:
+                return
+            self._stop_all_workers()
+            self._closed = True
+
+    def _close_from_store(self) -> None:
+        """Run worker cleanup before the resource owner closes SQLite."""
+
+        self.close()
 
     def handle(
+        self,
+        operation: str,
+        *,
+        principal_ref: str,
+        scope: WireScope,
+        arguments: Mapping[str, object],
+    ) -> Mapping[str, object]:
+        with self._lock:
+            return self._handle_locked(
+                operation,
+                principal_ref=principal_ref,
+                scope=scope,
+                arguments=arguments,
+            )
+
+    def _handle_locked(
         self,
         operation: str,
         *,
@@ -1016,7 +1311,7 @@ class PortfolioAnalyticsTaskService:
             else:
                 if keys != self._TASK_ARGUMENTS:
                     raise AnalysisTaskError("INVALID_REQUEST")
-                result = self._store.cancel_task(
+                result = self._cancel_task(
                     arguments["task_ref"], scope_json=scope_json
                 )
         except AnalysisTaskError as error:
@@ -1034,32 +1329,71 @@ class PortfolioAnalyticsTaskService:
         clock, so a frozen test clock yields a deterministic progression.
         """
 
-        if self._closed:
-            return {"ok": False, "code": "CLOSED", "result": {}}
-        try:
-            now_ns = self._store.now_ns()
-            expired = self._store.sweep_expired(now_ns)
-            advanced = False
-            if now_ns - self._last_step_ns >= _EXECUTOR_GATE_NS:
-                task = self._store.next_executable_task()
-                if task is not None:
-                    self._last_step_ns = now_ns
-                    self._advance_task(task, now_ns)
-                    advanced = True
-        except AnalysisTaskError as error:
-            return {"ok": False, "code": error.code, "result": {}}
-        except sqlite3.Error:
-            return {"ok": False, "code": "ANALYSIS_STORAGE_UNAVAILABLE", "result": {}}
-        except Exception:
-            return {"ok": False, "code": "ANALYSIS_EXECUTION_FAULT", "result": {}}
-        return {"ok": True, "code": "OK", "result": {"expired": expired, "advanced": advanced}}
+        with self._lock:
+            if self._closed:
+                return {"ok": False, "code": "CLOSED", "result": {}}
+            try:
+                now_ns = self._store.now_ns()
+                expired = self._store.sweep_expired(now_ns)
+                advanced = self._poll_workers()
+                if not advanced and now_ns - self._last_step_ns >= _EXECUTOR_GATE_NS:
+                    excluded = set(self._workers)
+                    while True:
+                        task = self._store.next_executable_task(
+                            exclude=frozenset(excluded)
+                        )
+                        if task is None:
+                            break
+                        key = (task["scope_json"], task["task_ref"])
+                        request_version = self._request_version(task["request_json"])
+                        if task["state"] == "running" and request_version == 2:
+                            # No child may be silently reconstructed for a
+                            # running V2 token whose owner record is absent.
+                            excluded.add(key)
+                            continue
+                        if (
+                            task["state"] == "pending"
+                            and request_version == 2
+                            and len(self._workers) >= self._store.max_concurrent_workers
+                        ):
+                            # The per-scope submission quota continues to
+                            # count this queued task; it does not consume a
+                            # worker slot or acquire an execution deadline.
+                            excluded.add(key)
+                            continue
+                        self._last_step_ns = now_ns
+                        advanced = self._advance_task(task, now_ns)
+                        break
+            except AnalysisTaskError as error:
+                return {"ok": False, "code": error.code, "result": {}}
+            except sqlite3.Error:
+                return {"ok": False, "code": "ANALYSIS_STORAGE_UNAVAILABLE", "result": {}}
+            except Exception:
+                return {"ok": False, "code": "ANALYSIS_EXECUTION_FAULT", "result": {}}
+            return {
+                "ok": True,
+                "code": "OK",
+                "result": {"expired": expired, "advanced": advanced},
+            }
 
-    def _advance_task(self, task: Mapping[str, object], now_ns: int) -> None:
+    def _advance_task(self, task: Mapping[str, object], now_ns: int) -> bool:
         scope_json = task["scope_json"]
         task_ref = task["task_ref"]
         if task["state"] == "pending":
-            self._store.mark_running(scope_json, task_ref, now_ns)
-            return
+            running_token = uuid.uuid4().hex
+            self._store.mark_running(
+                scope_json, task_ref, now_ns, running_token=running_token
+            )
+            task = {**task, "running_token": running_token, "state": "running"}
+            if self._request_version(task["request_json"]) == 2:
+                self._start_v2_worker(task)
+            return True
+
+        if self._request_version(task["request_json"]) == 2:
+            # A V2 task that is running without a retained worker is never
+            # restarted or assigned a new generation. Leave its token-bound
+            # durable row untouched so cleanup uncertainty remains visible.
+            return False
 
         state = "failed"
         detail_code: str | None = "TASK_EXECUTION_FAILED"
@@ -1091,26 +1425,7 @@ class PortfolioAnalyticsTaskService:
                 type(facts) is PortfolioAnalyticsFactsV2
                 and type(request) is PortfolioAnalyticsRequestV2
             ):
-                report = PortfolioAnalyticsServiceV2().analyze_snapshot_v2(
-                    facts,
-                    request,
-                    input_sha256=stored["input_sha256"],
-                )
-                report_payload = report.to_payload()
-                report_status = report.status
-                unavailable_code = next(
-                    (
-                        item.reason_code
-                        for item in (
-                            report.spot_exposure,
-                            report.max_drawdown,
-                            report.historical_var_es,
-                            report.stress_scenario,
-                        )
-                        if item.status == "unavailable"
-                    ),
-                    "UNAVAILABLE",
-                )
+                raise AnalysisTaskError("TASK_WORKER_STATE_UNCERTAIN")
             else:
                 raise AnalysisTaskError("SCHEMA_VERSION_MISMATCH")
             result_json = _canonical_json(report_payload).decode("ascii")
@@ -1131,7 +1446,525 @@ class PortfolioAnalyticsTaskService:
             detail_code=detail_code,
             result_json=result_json,
             now_ns=now_ns,
+            running_token=task["running_token"],
         )
+        return True
+
+    @staticmethod
+    def _request_version(request_json: object) -> int | None:
+        if type(request_json) is not str:
+            return None
+        try:
+            value = json.loads(request_json)
+        except (TypeError, ValueError):
+            return None
+        if type(value) is not dict or type(value.get("version")) is not int:
+            return None
+        return value["version"]
+
+    def _start_v2_worker(self, task: Mapping[str, object]) -> None:
+        scope_json = task["scope_json"]
+        task_ref = task["task_ref"]
+        running_token = task["running_token"]
+        state = "failed"
+        detail_code = "TASK_EXECUTION_FAILED"
+        try:
+            stored = self._store.load_input(scope_json, task["input_snapshot_id"])
+            if stored["input_sha256"] != task["input_sha256"]:
+                raise AnalysisTaskError("INPUT_DIGEST_MISMATCH")
+            facts_json = stored["facts_json"]
+            if type(facts_json) is not str:
+                raise AnalysisTaskError("INVALID_INPUT")
+            request = _parse_request_payload(json.loads(task["request_json"]))
+            if type(request) is not PortfolioAnalyticsRequestV2:
+                raise AnalysisTaskError("SCHEMA_VERSION_MISMATCH")
+        except AnalysisTaskError as error:
+            detail_code = error.code
+            self._store.finish_task(
+                scope_json,
+                task_ref,
+                state=state,
+                detail_code=detail_code,
+                result_json=None,
+                now_ns=self._store.now_ns(),
+                running_token=running_token,
+            )
+            return
+        except PortfolioAnalyticsError as error:
+            detail_code = error.code
+            self._store.finish_task(
+                scope_json,
+                task_ref,
+                state=state,
+                detail_code=detail_code,
+                result_json=None,
+                now_ns=self._store.now_ns(),
+                running_token=running_token,
+            )
+            return
+        except Exception:
+            self._store.finish_task(
+                scope_json,
+                task_ref,
+                state=state,
+                detail_code=detail_code,
+                result_json=None,
+                now_ns=self._store.now_ns(),
+                running_token=running_token,
+            )
+            return
+
+        try:
+            context = multiprocessing.get_context("spawn")
+            launched_ns = self._monotonic_ns()
+            receive_connection, child_connection = context.Pipe(duplex=False)
+        except Exception:
+            self._store.finish_task(
+                scope_json,
+                task_ref,
+                state="failed",
+                detail_code="TASK_WORKER_START_FAILED",
+                result_json=None,
+                now_ns=self._store.now_ns(),
+                running_token=running_token,
+            )
+            return
+        key = (scope_json, task_ref)
+        worker = _TaskWorker(
+            scope_json=scope_json,
+            task_ref=task_ref,
+            running_token=running_token,
+            input_sha256=stored["input_sha256"],
+            process=None,
+            receive_connection=receive_connection,
+            child_connection=child_connection,
+            process_started=False,
+            startup_deadline_ns=launched_ns + _WORKER_STARTUP_TIMEOUT_NS,
+            launched_monotonic_ns=launched_ns,
+        )
+        self._workers[key] = worker
+        try:
+            process = context.Process(
+                target=_portfolio_analytics_v2_worker_entry,
+                args=(
+                    facts_json,
+                    task["request_json"],
+                    stored["input_sha256"],
+                    running_token,
+                    child_connection,
+                ),
+            )
+            worker.process = process
+            process.daemon = True
+            process.start()  # type: ignore[attr-defined]
+            worker.process_started = True
+            self._close_connection(worker, "child_connection")
+        except Exception:
+            # `start()` can fail after creating a child on some runtimes. Use
+            # the process object only to establish/reap that exact child.
+            process = worker.process
+            if process is not None and (
+                getattr(process, "pid", None) is not None
+                or getattr(process, "_popen", None) is not None
+            ):
+                worker.process_started = True
+            worker.intent = ("failed", "TASK_WORKER_START_FAILED", None)
+            self._cleanup_worker(worker, force=True)
+            if worker.cleanup_complete:
+                self._finalize_worker(worker)
+
+    def _poll_workers(self) -> bool:
+        """Poll every retained worker; commit at most one terminal row per tick."""
+
+        for worker in tuple(self._workers.values()):
+            if worker.intent is not None:
+                self._cleanup_worker(worker, force=True)
+            else:
+                self._read_worker_frames(worker)
+                now_mono_ns = self._monotonic_ns()
+                if worker.frame_error is not None:
+                    code = (
+                        "TASK_WORKER_START_TIMEOUT"
+                        if worker.frame_error == "START_TIMEOUT"
+                        else "TASK_WORKER_RESULT_INVALID"
+                    )
+                    worker.intent = ("failed", code, None)
+                    self._cleanup_worker(worker, force=True)
+                else:
+                    alive = self._worker_is_alive(worker)
+                    if alive:
+                        if (
+                            worker.execution_deadline_ns is None
+                            and now_mono_ns >= worker.startup_deadline_ns
+                        ):
+                            worker.intent = ("failed", "TASK_WORKER_START_TIMEOUT", None)
+                            self._cleanup_worker(worker, force=True)
+                        elif (
+                            worker.execution_deadline_ns is not None
+                            and now_mono_ns >= worker.execution_deadline_ns
+                        ):
+                            worker.intent = ("failed", "TASK_EXECUTION_TIMEOUT", None)
+                            self._cleanup_worker(worker, force=True)
+                    else:
+                        self._cleanup_worker(worker, force=False)
+                        if worker.cleanup_complete:
+                            self._set_result_intent(worker)
+
+            if worker.cleanup_complete:
+                if self._finalize_worker(worker):
+                    return True
+        return False
+
+    def _read_worker_frames(self, worker: _TaskWorker) -> None:
+        connection = worker.receive_connection
+        if getattr(connection, "closed", True):
+            return
+        try:
+            # Windows Connection.poll() can report ERROR_BROKEN_PIPE after a
+            # child has sent its final frame and closed its writer.  Use the
+            # public connection.wait readiness API; recv_bytes then provides
+            # the normal EOF signal while preserving malformed/truncated-frame
+            # errors as failures.
+            while wait_for_connections([connection], timeout=0):
+                raw = connection.recv_bytes(maxlength=_MAX_WORKER_FRAME_BYTES)  # type: ignore[attr-defined]
+                frame = json.loads(raw.decode("ascii", errors="strict"))
+                if type(frame) is not dict or _canonical_json(frame) != raw:
+                    raise ValueError
+                if frame.get("running_token") != worker.running_token:
+                    raise ValueError
+                if frame.get("kind") == "started":
+                    if (
+                        set(frame)
+                        != {"kind", "running_token", "started_monotonic_ns"}
+                        or worker.started_monotonic_ns is not None
+                    ):
+                        raise ValueError
+                    started_ns = frame["started_monotonic_ns"]
+                    if type(started_ns) is int and started_ns > worker.startup_deadline_ns:
+                        worker.frame_error = "START_TIMEOUT"
+                        return
+                    if (
+                        type(started_ns) is not int
+                        or started_ns < worker.launched_monotonic_ns
+                        or started_ns > time.monotonic_ns()
+                    ):
+                        raise ValueError
+                    worker.started_monotonic_ns = started_ns
+                    worker.execution_deadline_ns = (
+                        started_ns + self._store.execution_timeout_ns
+                    )
+                elif frame.get("kind") == "result":
+                    if (
+                        set(frame)
+                        != {
+                            "completed_monotonic_ns",
+                            "detail_code",
+                            "kind",
+                            "result_json",
+                            "running_token",
+                            "state",
+                        }
+                        or worker.started_monotonic_ns is None
+                        or worker.result_envelope is not None
+                    ):
+                        raise ValueError
+                    worker.result_envelope = frame
+                else:
+                    raise ValueError
+        except EOFError:
+            return
+        except (
+            OSError,
+            UnicodeError,
+            ValueError,
+            TypeError,
+            OverflowError,
+            RecursionError,
+        ):
+            worker.frame_error = "INVALID_FRAME"
+
+    def _set_result_intent(self, worker: _TaskWorker) -> None:
+        if worker.intent is not None:
+            return
+        if worker.frame_error is not None:
+            worker.intent = ("failed", "TASK_WORKER_RESULT_INVALID", None)
+            return
+        if worker.exit_code is None or worker.exit_code != 0:
+            worker.intent = ("failed", "TASK_WORKER_EXITED", None)
+            return
+        envelope = worker.result_envelope
+        if envelope is None or worker.execution_deadline_ns is None:
+            worker.intent = ("failed", "TASK_WORKER_RESULT_MISSING", None)
+            return
+        completed_ns = envelope.get("completed_monotonic_ns")
+        if (
+            type(completed_ns) is not int
+            or worker.started_monotonic_ns is None
+            or completed_ns < worker.started_monotonic_ns
+            or completed_ns > self._monotonic_ns()
+        ):
+            worker.intent = ("failed", "TASK_WORKER_RESULT_INVALID", None)
+            return
+        if completed_ns > worker.execution_deadline_ns:
+            worker.intent = ("failed", "TASK_EXECUTION_TIMEOUT", None)
+            return
+        try:
+            state, detail_code, result_json = self._validate_worker_result(worker, envelope)
+        except AnalysisTaskError as error:
+            worker.intent = ("failed", error.code, None)
+            return
+        worker.intent = (state, detail_code, result_json)
+
+    def _validate_worker_result(
+        self,
+        worker: _TaskWorker,
+        envelope: Mapping[str, object],
+    ) -> tuple[str, str | None, str | None]:
+        state = envelope.get("state")
+        detail_code = envelope.get("detail_code")
+        result_json = envelope.get("result_json")
+        if type(state) is not str:
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
+        if state == "failed":
+            if (
+                type(detail_code) is not str
+                or re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", detail_code) is None
+                or result_json is not None
+            ):
+                raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
+            return "failed", detail_code, None
+        if state not in {"succeeded", "unavailable"}:
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
+        if (
+            (state == "succeeded" and detail_code is not None)
+            or (
+                state == "unavailable"
+                and (
+                    type(detail_code) is not str
+                    or re.fullmatch(r"[A-Z][A-Z0-9_]{0,63}", detail_code) is None
+                )
+            )
+            or type(result_json) is not str
+        ):
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
+        try:
+            encoded = result_json.encode("ascii", errors="strict")
+        except UnicodeError:
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID") from None
+        if len(encoded) > _MAX_WORKER_FRAME_BYTES // 2:
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
+        try:
+            report = json.loads(result_json)
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID") from None
+        if type(report) is not dict:
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
+        try:
+            canonical_report = _canonical_json(report)
+        except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID") from None
+        if canonical_report != encoded:
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
+        expected_keys = {
+            "calculation_ref",
+            "decimal_serialization_ref",
+            "facts_snapshot_ref",
+            "input_sha256",
+            "metrics",
+            "portfolio_ref",
+            "provenance",
+            "report_sha256",
+            "reporting_currency",
+            "request_sha256",
+            "schema_ref",
+            "serialization_ref",
+            "status",
+            "version",
+        }
+        if (
+            set(report) != expected_keys
+            or report.get("schema_ref") != "portfolio_analytics_v2"
+            or report.get("version") != 2
+            or report.get("input_sha256") != worker.input_sha256
+            or report.get("status")
+            != ("AVAILABLE" if state == "succeeded" else "UNAVAILABLE")
+            or type(report.get("request_sha256")) is not str
+        ):
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
+        try:
+            request_json = self._store_request_json(worker.scope_json, worker.task_ref)
+            request_digest = hashlib.sha256(
+                request_json.encode("ascii", errors="strict")
+            ).hexdigest()
+            unsigned = dict(report)
+            del unsigned["report_sha256"]
+            report_digest = hashlib.sha256(_canonical_json(unsigned)).hexdigest()
+        except AnalysisTaskError:
+            raise
+        except (TypeError, ValueError, UnicodeError, OverflowError, RecursionError):
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID") from None
+        if request_digest != report.get("request_sha256"):
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
+        digest = report.get("report_sha256")
+        if type(digest) is not str or report_digest != digest:
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
+        return state, detail_code, result_json
+
+    def _store_request_json(self, scope_json: str, task_ref: str) -> str:
+        record = self._store._task_record(task_ref, scope_json=scope_json)
+        request_json = record["request_json"]
+        if type(request_json) is not str:
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
+        return request_json
+
+    def _worker_is_alive(self, worker: _TaskWorker) -> bool:
+        if not worker.process_started or worker.process_closed:
+            return False
+        try:
+            return bool(worker.process.is_alive())  # type: ignore[attr-defined]
+        except Exception:
+            raise AnalysisTaskError("TASK_CLEANUP_UNCERTAIN") from None
+
+    def _cleanup_worker(self, worker: _TaskWorker, *, force: bool) -> None:
+        if worker.cleanup_complete:
+            return
+        process = worker.process
+        if worker.process_started and not worker.process_closed:
+            if process is None:
+                raise AnalysisTaskError("TASK_CLEANUP_UNCERTAIN")
+            try:
+                alive = bool(process.is_alive())  # type: ignore[attr-defined]
+                if alive and force:
+                    try:
+                        process.terminate()  # type: ignore[attr-defined]
+                    except Exception:
+                        pass
+                    process.join(timeout=_WORKER_STOP_GRACE_SECONDS)  # type: ignore[attr-defined]
+                    alive = bool(process.is_alive())  # type: ignore[attr-defined]
+                    if alive:
+                        try:
+                            process.kill()  # type: ignore[attr-defined]
+                        except Exception:
+                            pass
+                        process.join(timeout=_WORKER_STOP_GRACE_SECONDS)  # type: ignore[attr-defined]
+                        alive = bool(process.is_alive())  # type: ignore[attr-defined]
+                if alive:
+                    raise AnalysisTaskError("TASK_CLEANUP_UNCERTAIN")
+                process.join(timeout=0)  # type: ignore[attr-defined]
+                worker.exit_code = process.exitcode  # type: ignore[attr-defined]
+            except AnalysisTaskError:
+                raise
+            except Exception:
+                raise AnalysisTaskError("TASK_CLEANUP_UNCERTAIN") from None
+
+        self._close_connection(worker, "receive_connection")
+        self._close_connection(worker, "child_connection")
+        if not worker.process_closed:
+            if process is not None:
+                try:
+                    process.close()  # type: ignore[attr-defined]
+                except Exception:
+                    if worker.process_started:
+                        raise AnalysisTaskError("TASK_CLEANUP_UNCERTAIN") from None
+                    # No child exists if start never assigned a process handle.
+                worker.process_closed = True
+            else:
+                worker.process_closed = True
+        worker.cleanup_complete = True
+
+    @staticmethod
+    def _close_connection(worker: _TaskWorker, field: str) -> None:
+        connection = getattr(worker, field)
+        if connection is None:
+            return
+        try:
+            if not connection.closed:
+                connection.close()
+            if not connection.closed:
+                raise OSError
+        except Exception:
+            raise AnalysisTaskError("TASK_CLEANUP_UNCERTAIN") from None
+        if field == "child_connection":
+            worker.child_connection = None
+
+    def _finalize_worker(self, worker: _TaskWorker) -> bool:
+        if not worker.cleanup_complete or worker.intent is None:
+            return False
+        state, detail_code, result_json = worker.intent
+        try:
+            if state == "cancelled":
+                self._store._cancel_running_task(
+                    worker.task_ref,
+                    scope_json=worker.scope_json,
+                    running_token=worker.running_token,
+                )
+            else:
+                self._store.finish_task(
+                    worker.scope_json,
+                    worker.task_ref,
+                    state=state,
+                    detail_code=detail_code,
+                    result_json=result_json,
+                    now_ns=self._store.now_ns(),
+                    running_token=worker.running_token,
+                )
+        except AnalysisTaskError as error:
+            if error.code != "TASK_STATE_INVALID":
+                raise
+            # A stale worker token can never overwrite a newer or terminal
+            # durable state. Once this exact child is reaped, discard it.
+            current = self._store._task_record(
+                worker.task_ref, scope_json=worker.scope_json
+            )
+            if (
+                current["state"] == "running"
+                and current["running_token"] == worker.running_token
+            ):
+                raise
+        self._workers.pop((worker.scope_json, worker.task_ref), None)
+        return True
+
+    def _cancel_task(self, task_ref: object, *, scope_json: str) -> Mapping[str, object]:
+        task_ref = _task_reference(task_ref)
+        record = self._store._task_record(task_ref, scope_json=scope_json)
+        if record["state"] != "running":
+            return self._store.cancel_task(task_ref, scope_json=scope_json)
+        running_token = record["running_token"]
+        if type(running_token) is not str:
+            raise AnalysisTaskError("TASK_CLEANUP_UNCERTAIN")
+        worker = self._workers.get((scope_json, task_ref))
+        if worker is None:
+            if self._request_version(record["request_json"]) != 2:
+                return self._store._cancel_running_task(
+                    task_ref,
+                    scope_json=scope_json,
+                    running_token=running_token,
+                )
+            raise AnalysisTaskError("TASK_CLEANUP_UNCERTAIN")
+        if worker.intent is None:
+            worker.intent = ("cancelled", None, None)
+        self._cleanup_worker(worker, force=True)
+        if worker.cleanup_complete:
+            intent_state = worker.intent[0] if worker.intent is not None else None
+            self._finalize_worker(worker)
+            if intent_state != "cancelled":
+                raise AnalysisTaskError("TASK_TERMINAL")
+            return self._store.query_task(task_ref, scope_json=scope_json)
+        raise AnalysisTaskError("TASK_CLEANUP_UNCERTAIN")
+
+    def _stop_all_workers(self) -> None:
+        cleanup_failed = False
+        for worker in tuple(self._workers.values()):
+            if worker.intent is None:
+                worker.intent = ("failed", "TASK_SERVICE_SHUTDOWN", None)
+            try:
+                self._cleanup_worker(worker, force=True)
+                if worker.cleanup_complete:
+                    self._finalize_worker(worker)
+            except Exception:
+                cleanup_failed = True
+        if cleanup_failed or self._workers:
+            raise AnalysisTaskError("TASK_CLEANUP_UNCERTAIN")
 
 
 SUPPORTED_OPERATIONS: Final[frozenset[str]] = PortfolioAnalyticsTaskService.SUPPORTED_OPERATIONS

@@ -1,0 +1,11 @@
+# Iteration 10: V2 analytics worker lifecycle
+
+V2 analytics run in spawned workers with immutable inputs, token-bound results, bounded canonical frames, worker limits, separate startup/execution deadlines, cancellation and cleanup-before-terminal-CAS. The Host owns durable task writes. Uncertain cleanup retains the worker slot for retry; late tokens cannot replace a terminal result. V1 remains on its existing execution path.
+
+The real-worker success case exposed INVALID_FRAME after a succeeded result. Windows post-frame Pipe.poll handling was the source-supported cause; the failed call did not capture a numeric OS error. The reader now uses multiprocessing.connection.wait followed by bounded recv_bytes and normal EOF, while malformed/duplicate frames still fail closed.
+
+Root final unit R5: 6 passed in 6.32s, no warnings, 163 source pins and four checkout HEADs unchanged. Root SDK-client/independent-Risk-Host/worker integration R3: 1 passed in 7.20s, no warnings, 345 pins and four HEADs unchanged. Both stderr files are empty. The common reader changed, so the six affected lifecycle checks were appropriately rerun after the fix. Runtime uses fixed accepted SDK f29/Risk dc30 sources plus this exact worker overlay; checkout HEAD guards separately bind the delivery baseline.
+
+Historical unit R2 was stopped by Root after a fixture Event teardown hang; normal shutdown was not established. R3 had 1 pass/1 failure, R4 had 3 passes/1 failure. The final failure diagnostic observed a succeeded envelope and INVALID_FRAME, not a recovered OS error code. All original outputs and the exact-stop receipt are retained in parent R218 evidence. Process R2 was rejected by a stale HEAD preflight before output creation or pytest; R3 corrects only those metadata guards.
+
+Evidence is OFFLINE_SPAWNED_V2_WORKER_LIFECYCLE_AND_SDK_HOST_INTEGRATION_ONLY. Synthetic offline facts, no provider/account login. The startup barrier wrapper does not proxy daemon assignment; actual spawn/deadline/reap is tested, daemon behavior is not. AFI application task API/UI and full AFI04 remain pending. Repository bt_api_risk/dev, parent 71be56e29f867a5a5aaac60331f9eca46c7e09f0; commit hash is recorded by the parent round and scoped postcommit receipt.
