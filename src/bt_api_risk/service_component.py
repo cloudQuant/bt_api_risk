@@ -14,6 +14,13 @@ an operator-supplied durable ``PolicyCatalogStore`` and serves only the five
 service. ``ConfirmedPolicyStore`` is the owner-side durable pin of the exact
 version/digest the catalog confirmed; it never re-reads a mutable latest and
 never contacts the catalog at resolution time.
+
+``GroupPolicyService`` is the internal-only admission gate for the fixed
+``group_policy`` role. It is never served on a public port: the trusted
+resource provider pins one immutable version in a ``GroupPolicyStore``,
+constructs the gate against that exact version, and hands the same object to
+the group coordinator. ``evaluate`` fails closed on version drift, scope, or
+document denial and returns constant rejection codes only.
 """
 
 from __future__ import annotations
@@ -23,6 +30,7 @@ import json
 import re
 import sqlite3
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from decimal import Decimal
 from types import MappingProxyType
@@ -884,8 +892,266 @@ class ConfirmedPolicyStore:
         )
 
 
+# ---------------------------------------------------------------------------
+# R group_policy control plane (fixed ``group_policy`` role, internal only).
+# ---------------------------------------------------------------------------
+
+
+class GroupPolicyError(ValueError):
+    """Finite group-policy/store error that does not include caller values."""
+
+    def __init__(self, code: str) -> None:
+        self.code = code
+        super().__init__(code)
+
+
+_GROUP_POLICY_DOCUMENT_FIELDS: Final[frozenset[str]] = frozenset(
+    {"admitted_portfolios", "denied_group_ids"}
+)
+
+
+def _group_policy_reference(value: object) -> str:
+    if type(value) is not str or _REF_PATTERN.fullmatch(value) is None:
+        raise GroupPolicyError("INVALID_REFERENCE")
+    if _VERSIONED_REF_PATTERN.fullmatch(value) is None:
+        # Version-keyed addressing only: a mutable ``latest`` alias is never
+        # a valid group-policy reference.
+        raise GroupPolicyError("VERSIONED_REFERENCE_REQUIRED")
+    return value
+
+
+def _group_policy_digest(value: object) -> str:
+    if type(value) is not str or _SHA256_PATTERN.fullmatch(value) is None:
+        raise GroupPolicyError("INVALID_POLICY_VERSION")
+    return value
+
+
+def _group_policy_document(value: object) -> dict[str, list[str]]:
+    """Validate one bounded plain group-policy document.
+
+    The document is a JSON object with exactly two string arrays:
+    ``admitted_portfolios`` (the only portfolio scopes this version admits)
+    and ``denied_group_ids`` (groups denied inside an admitted portfolio).
+    Unknown keys, duplicate or non-text entries, and wire-frozen tuples are
+    normalized away so a stored version can never silently widen its scope.
+    """
+
+    if not isinstance(value, Mapping) or set(value) != _GROUP_POLICY_DOCUMENT_FIELDS:
+        raise GroupPolicyError("INVALID_DOCUMENT")
+    normalized: dict[str, list[str]] = {}
+    for field_name in ("admitted_portfolios", "denied_group_ids"):
+        entries = value[field_name]
+        if (
+            type(entries) not in (list, tuple)
+            or any(not _valid_wire_text(entry) for entry in entries)
+            or len(set(entries)) != len(entries)
+        ):
+            raise GroupPolicyError("INVALID_DOCUMENT")
+        normalized[field_name] = list(entries)
+    return normalized
+
+
+def _group_policy_document_json(value: object) -> tuple[dict[str, list[str]], str]:
+    normalized = _group_policy_document(value)
+    try:
+        document_json = _canonical_json(normalized, path="$.document")
+    except PolicyCatalogError:
+        raise GroupPolicyError("INVALID_DOCUMENT") from None
+    return normalized, document_json
+
+
+class GroupPolicyStore:
+    """Durable immutable group-policy versions for the ``group_policy`` role.
+
+    The store is operator-owned: it is opened by the trusted resource provider
+    and borrowed by the service gate. A reference is a version-keyed policy
+    identifier (``...-vN``) and a version is the sha256 digest of the
+    canonical document, so an activated version is self-certifying. The first
+    pin for a reference is final; an identical re-pin is idempotent, and a
+    conflicting version or document is rejected with
+    ``GROUP_POLICY_VERSION_CONFLICT``. There is no mutable ``latest`` pointer.
+    """
+
+    def __init__(self, path: str) -> None:
+        if type(path) is not str or not path:
+            raise GroupPolicyError("INVALID_STORE_PATH")
+        self._db = sqlite3.connect(path, check_same_thread=False)
+        self._db.row_factory = sqlite3.Row
+        with self._db:
+            self._db.execute(
+                "CREATE TABLE IF NOT EXISTS group_policy_versions ("
+                "group_policy_ref TEXT PRIMARY KEY, "
+                "policy_version TEXT NOT NULL, "
+                "document_json TEXT NOT NULL, "
+                "pinned_utc TEXT NOT NULL)"
+            )
+
+    def close(self) -> None:
+        self._db.close()
+
+    def _row(self, reference: str) -> sqlite3.Row | None:
+        return self._db.execute(
+            "SELECT * FROM group_policy_versions WHERE group_policy_ref=?",
+            (reference,),
+        ).fetchone()
+
+    def pin(
+        self, group_policy_ref: str, policy_version: str, document: object
+    ) -> Mapping[str, object]:
+        reference = _group_policy_reference(group_policy_ref)
+        version = _group_policy_digest(policy_version)
+        _, document_json = _group_policy_document_json(document)
+        digest = hashlib.sha256(document_json.encode("utf-8")).hexdigest()
+        if digest != version:
+            raise GroupPolicyError("INVALID_POLICY_VERSION")
+        with self._db:
+            row = self._row(reference)
+            if row is not None:
+                if row["policy_version"] != version or row["document_json"] != document_json:
+                    # A new version never silently replaces the pinned one;
+                    # that would require an explicit migration.
+                    raise GroupPolicyError("GROUP_POLICY_VERSION_CONFLICT")
+                return self._record(row)
+            self._db.execute(
+                "INSERT INTO group_policy_versions "
+                "(group_policy_ref, policy_version, document_json, pinned_utc) "
+                "VALUES (?,?,?,?)",
+                (reference, version, document_json, _now_utc()),
+            )
+        row = self._row(reference)
+        if row is None:  # pragma: no cover - the insert above must win.
+            raise GroupPolicyError("GROUP_POLICY_NOT_FOUND")
+        return self._record(row)
+
+    def resolve(self, group_policy_ref: object) -> Mapping[str, object]:
+        reference = _group_policy_reference(group_policy_ref)
+        row = self._row(reference)
+        if row is None:
+            raise GroupPolicyError("GROUP_POLICY_NOT_FOUND")
+        return self._record(row)
+
+    @staticmethod
+    def _record(row: sqlite3.Row) -> Mapping[str, object]:
+        return MappingProxyType(
+            {
+                "group_policy_ref": row["group_policy_ref"],
+                "policy_version": row["policy_version"],
+                "document": json.loads(row["document_json"]),
+                "pinned_utc": row["pinned_utc"],
+            }
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class GroupAdmissionDecision:
+    """Finite decision of one group-admission evaluation.
+
+    ``admitted`` is the only success signal; every refusal carries a constant
+    rejection code and the exact ref/version the gate was activated with, so
+    a coordinator refusal stays attributable without caller values.
+    """
+
+    admitted: bool
+    code: str
+    group_policy_ref: str
+    policy_version: str
+
+
+class GroupPolicyService:
+    """Internal-only group admission gate handed in-process to the coordinator.
+
+    This adapter is never registered on a public port: the trusted resource
+    provider constructs it from a version pinned in a ``GroupPolicyStore`` and
+    passes the same object both as the risk ``group_policy`` component's
+    internal ``service.group_admission`` port and to the group coordinator.
+    ``evaluate`` resolves the exact activated version once per group
+    submission and fails closed on version drift, scope, or document denial.
+    It treats no caller value as authorization evidence.
+    """
+
+    SUPPORTED_OPERATIONS: Final[frozenset[str]] = frozenset({"group.admission.evaluate"})
+
+    def __init__(
+        self,
+        store: GroupPolicyStore,
+        group_policy_ref: str,
+        policy_version: str,
+    ) -> None:
+        if type(store) is not GroupPolicyStore:
+            raise GroupPolicyError("INVALID_GROUP_POLICY_STORE")
+        self._store = store
+        self._group_policy_ref = _group_policy_reference(group_policy_ref)
+        self._policy_version = _group_policy_digest(policy_version)
+        self._closed = False
+
+    @property
+    def group_policy_ref(self) -> str:
+        return self._group_policy_ref
+
+    @property
+    def policy_version(self) -> str:
+        return self._policy_version
+
+    @property
+    def ready(self) -> bool:
+        """True only while the store still serves the exact activated version."""
+
+        if self._closed:
+            return False
+        try:
+            row = self._store._row(self._group_policy_ref)
+        except sqlite3.Error:
+            return False
+        return row is not None and row["policy_version"] == self._policy_version
+
+    def close(self) -> None:
+        self._closed = True
+
+    def evaluate(self, *, portfolio_ref: str, group_id: str) -> GroupAdmissionDecision:
+        """Admit or refuse one group submission for the exact pinned version.
+
+        The group coordinator has already authenticated the principal and
+        authorized the registration before calling this gate; the gate adds
+        only the activated group-policy decision.
+        """
+
+        if self._closed:
+            raise GroupPolicyError("CLOSED")
+        if not _valid_wire_text(portfolio_ref) or not _valid_wire_text(group_id):
+            raise GroupPolicyError("INVALID_ADMISSION_CONTEXT")
+        try:
+            row = self._store._row(self._group_policy_ref)
+        except sqlite3.Error:
+            raise GroupPolicyError("GROUP_POLICY_STORAGE_UNAVAILABLE") from None
+        if row is None:
+            raise GroupPolicyError("GROUP_POLICY_NOT_FOUND")
+        if row["policy_version"] != self._policy_version:
+            # Version drift is checked before any scope decision so a stale
+            # activation can never admit under a policy it did not pin.
+            return self._decision(False, "GROUP_POLICY_VERSION_REJECTED")
+        try:
+            document = _group_policy_document(json.loads(row["document_json"]))
+        except (json.JSONDecodeError, GroupPolicyError):
+            raise GroupPolicyError("INVALID_DOCUMENT") from None
+        if portfolio_ref not in document["admitted_portfolios"]:
+            return self._decision(False, "GROUP_POLICY_SCOPE_DENIED")
+        if group_id in document["denied_group_ids"]:
+            return self._decision(False, "GROUP_POLICY_DENIED")
+        return self._decision(True, "OK")
+
+    def _decision(self, admitted: bool, code: str) -> GroupAdmissionDecision:
+        return GroupAdmissionDecision(admitted, code, self._group_policy_ref, self._policy_version)
+
+
+GROUP_POLICY_OPERATIONS: Final[frozenset[str]] = GroupPolicyService.SUPPORTED_OPERATIONS
+
+
 __all__ = [
     "ConfirmedPolicyStore",
+    "GroupAdmissionDecision",
+    "GroupPolicyError",
+    "GroupPolicyService",
+    "GroupPolicyStore",
     "PolicyCatalogError",
     "PolicyCatalogService",
     "PolicyCatalogStore",
