@@ -33,6 +33,8 @@ from fractions import Fraction
 from pathlib import Path
 from typing import Callable, Optional, Protocol, Union
 
+from bt_api_base.account_protocol import AccountResourceKey
+
 from .exposure import (
     ExposureAccountingMode,
     GrossExposureAuthority,
@@ -270,6 +272,7 @@ class RiskIntent:
     exposure_profile_fingerprint: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
     instrument_facts_observed_at_ns: Optional[int] = None  # noqa: UP045 -- Python 3.9 is supported.
     instrument_facts_valid_until_ns: Optional[int] = None  # noqa: UP045 -- Python 3.9 is supported.
+    resource: Optional[AccountResourceKey] = None  # noqa: UP045 -- Python 3.9 is supported.
 
     def __post_init__(self) -> None:
         if not self.intent_id.strip():
@@ -287,6 +290,8 @@ class RiskIntent:
             raise ValueError("notional_unit must be a canonical uppercase unit code")
         if self.exposure_profile_fingerprint is not None:
             _require_sha256(self.exposure_profile_fingerprint, "exposure_profile_fingerprint")
+        if self.resource is not None and not isinstance(self.resource, AccountResourceKey):
+            raise ValueError("resource must be an AccountResourceKey")
         if any(
             value is not None
             for value in (
@@ -366,6 +371,11 @@ class RiskIntent:
             payload["notional_unit"] = self.notional_unit
         if self.exposure_profile_fingerprint is not None:
             payload["exposure_profile_fingerprint"] = self.exposure_profile_fingerprint
+        if self.resource is not None:
+            payload["resource"] = {
+                "margin_pool": self.resource.margin_pool,
+                "product_type": self.resource.product_type,
+            }
         return _sha256(_canonical_json(payload))
 
 
@@ -2431,6 +2441,108 @@ class DurableRiskGate:
             reason=reason,
         )
 
+    def set_margin_pool_limit(
+        self,
+        scope: AccountScope,
+        product_type: str,
+        margin_pool: str,
+        allocation_version: str,
+        *,
+        max_notional: Decimal,
+    ) -> None:
+        """Install one local notional ceiling for an exact margin-pool resource.
+
+        The resource key is the Base package ``AccountResourceKey`` pair
+        ``(product_type, margin_pool)`` so two different contracts/products
+        can share one declared pool.  This is an administrative storage seam,
+        not an authenticated collateral authority: it never reads provider
+        collateral, never distributes one account's or pool's credit to
+        another key, and its ceiling is checked against the exact trusted
+        reservation notional inside each admission transaction.  Versions are
+        immutable and cannot be replayed once a later version replaced them.
+        A limit revision gates future reservations only; outstanding
+        reservations keep their face-value occupation.
+        """
+
+        if not isinstance(scope, AccountScope):
+            raise ValueError("scope must be an AccountScope")
+        try:
+            resource = AccountResourceKey(product_type=product_type, margin_pool=margin_pool)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid margin-pool resource key") from exc
+        if type(allocation_version) is not str or not _ALLOCATION_ID.fullmatch(allocation_version):
+            raise ValueError("invalid allocation_version")
+        try:
+            normalized_notional = _as_decimal(max_notional)
+        except (InvalidOperation, ValueError) as exc:
+            raise ValueError("max_notional must be a non-negative finite decimal") from exc
+        if normalized_notional < Decimal("0"):
+            raise ValueError("max_notional must be a non-negative finite decimal")
+        notional_unit = self._policy.notional_unit
+        if notional_unit is None:
+            raise ValueError("margin-pool limits require a fixed account policy notional_unit")
+
+        now = self._clock()
+        with self._transaction() as connection:
+            self._ensure_policy_binding(connection, scope.key)
+            current = connection.execute(
+                """SELECT * FROM risk_margin_pool_limits
+                   WHERE scope_key = ? AND product_type = ? AND margin_pool = ?""",
+                (scope.key, resource.product_type, resource.margin_pool),
+            ).fetchone()
+            if current is not None and current["allocation_version"] == allocation_version:
+                same_facts = (
+                    current["max_notional"] == _decimal_text(normalized_notional)
+                    and current["notional_unit"] == notional_unit
+                )
+                if same_facts:
+                    return
+                raise ValueError("pool limit version cannot be reused with changed limits")
+            prior_version = connection.execute(
+                """SELECT 1 FROM risk_margin_pool_limit_versions
+                   WHERE scope_key = ? AND product_type = ? AND margin_pool = ?
+                     AND allocation_version = ?""",
+                (scope.key, resource.product_type, resource.margin_pool, allocation_version),
+            ).fetchone()
+            if prior_version is not None:
+                raise ValueError("pool limit version cannot be reused")
+
+            connection.execute(
+                """INSERT INTO risk_margin_pool_limit_versions (
+                       scope_key, product_type, margin_pool, allocation_version,
+                       max_notional, notional_unit, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    scope.key,
+                    resource.product_type,
+                    resource.margin_pool,
+                    allocation_version,
+                    _decimal_text(normalized_notional),
+                    notional_unit,
+                    now,
+                ),
+            )
+            connection.execute(
+                """INSERT INTO risk_margin_pool_limits (
+                       scope_key, product_type, margin_pool, allocation_version,
+                       max_notional, notional_unit, updated_at
+                   ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(scope_key, product_type, margin_pool) DO UPDATE SET
+                       allocation_version = excluded.allocation_version,
+                       max_notional = excluded.max_notional,
+                       notional_unit = excluded.notional_unit,
+                       updated_at = excluded.updated_at""",
+                (
+                    scope.key,
+                    resource.product_type,
+                    resource.margin_pool,
+                    allocation_version,
+                    _decimal_text(normalized_notional),
+                    notional_unit,
+                    now,
+                ),
+            )
+
     def reserve(self, intent: RiskIntent) -> RiskPermit:
         """Atomically reserve an account-scoped permit for ``intent``.
 
@@ -2483,6 +2595,7 @@ class DurableRiskGate:
                 self._assert_intent_notional_unit(intent)
                 self._assert_increase_limit(connection, intent)
                 self._assert_strategy_allocation_limit(connection, intent)
+                self._assert_margin_pool_limit(connection, intent)
                 if live_gross:
                     self._assert_live_gross_limits(connection, intent)
 
@@ -2513,9 +2626,9 @@ class DurableRiskGate:
                     strategy_id, allocation_version, instrument, quantity, quantity_unit,
                     notional_unit, group_id, group_fingerprint, group_leg_id,
                     group_deadline_ns, group_expires_at_ns, group_leg_count,
-                    group_exposure_profile_fingerprint
+                    group_exposure_profile_fingerprint, resource_product_type, resource_margin_pool
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?,
-                    NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+                    NULL, NULL, NULL, NULL, NULL, NULL, NULL, ?, ?)
                 """,
                 (
                     permit.permit_id,
@@ -2538,6 +2651,8 @@ class DurableRiskGate:
                     None if permit.quantity is None else _decimal_text(permit.quantity),
                     permit.quantity_unit,
                     permit.notional_unit,
+                    None if intent.resource is None else intent.resource.product_type,
+                    None if intent.resource is None else intent.resource.margin_pool,
                 ),
             )
             if live_gross and intent.action is IntentAction.INCREASE:
@@ -2707,6 +2822,7 @@ class DurableRiskGate:
                 self._assert_intent_notional_unit(intent)
                 self._assert_increase_limit(connection, intent)
                 self._assert_strategy_allocation_limit(connection, intent)
+                self._assert_margin_pool_limit(connection, intent)
                 if live_gross:
                     self._assert_live_gross_limits(connection, intent)
                 generation = self._next_generation(connection, scope.key)
@@ -2735,9 +2851,10 @@ class DurableRiskGate:
                            instrument, quantity, quantity_unit, notional_unit, group_id,
                            group_fingerprint, group_leg_id, group_deadline_ns,
                            group_expires_at_ns, group_leg_count,
-                           group_exposure_profile_fingerprint
+                           group_exposure_profile_fingerprint,
+                           resource_product_type, resource_margin_pool
                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?,
-                                 ?, ?, ?, ?, ?, ?, ?)""",
+                                 ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         permit.permit_id,
                         permit.intent_id,
@@ -2766,6 +2883,8 @@ class DurableRiskGate:
                         expires_at_ns,
                         len(ordered_legs),
                         intent.exposure_profile_fingerprint,
+                        None if intent.resource is None else intent.resource.product_type,
+                        None if intent.resource is None else intent.resource.margin_pool,
                     ),
                 )
             commit_now_ns = self._now_ns()
@@ -7791,6 +7910,66 @@ class DurableRiskGate:
                 "intent notional unit does not match the account policy",
             )
 
+    def _assert_margin_pool_limit(self, connection: sqlite3.Connection, intent: RiskIntent) -> None:
+        """Enforce one declared margin-pool ceiling inside the write transaction.
+
+        Only intents that carry a trusted ``AccountResourceKey`` participate;
+        keyless intents (and every legacy row) keep their established behavior
+        untouched.  Usage counts every live INCREASE reservation in the same
+        account and pool at its exact reserved notional, which is the trusted
+        mapper's already-valued (FX-converted) maximum, so this path never
+        re-derives FX arithmetic.  The check shares the caller's
+        ``BEGIN IMMEDIATE`` transaction, so legs of one vector and contenders
+        from other writers are accounted atomically before any insert commits.
+        """
+
+        resource = intent.resource
+        if resource is None or intent.action is not IntentAction.INCREASE:
+            return
+        limit = connection.execute(
+            """SELECT max_notional, notional_unit FROM risk_margin_pool_limits
+               WHERE scope_key = ? AND product_type = ? AND margin_pool = ?""",
+            (intent.scope.key, resource.product_type, resource.margin_pool),
+        ).fetchone()
+        if limit is None:
+            raise RiskDeniedError(
+                "MARGIN_POOL_UNCONFIGURED",
+                "intent declares a margin-pool resource without an installed limit",
+            )
+        if intent.notional_unit != limit["notional_unit"]:
+            raise RiskDeniedError(
+                "NOTIONAL_UNIT_MISMATCH",
+                "intent notional unit does not match the installed pool limit",
+            )
+        rows = connection.execute(
+            """SELECT notional, notional_unit FROM risk_reservations
+               WHERE scope_key = ? AND resource_product_type = ? AND resource_margin_pool = ?
+                 AND action = ? AND status IN (?, ?)""",
+            (
+                intent.scope.key,
+                resource.product_type,
+                resource.margin_pool,
+                IntentAction.INCREASE.value,
+                self._ACTIVE,
+                self._SETTLED,
+            ),
+        ).fetchall()
+        if any(row["notional_unit"] != limit["notional_unit"] for row in rows):
+            raise RiskDeniedError(
+                "MARGIN_POOL_UNIT_USAGE_UNAVAILABLE",
+                "existing pool reservations do not share the installed pool notional unit",
+            )
+        reserved_notional = sum(
+            (Fraction(_as_decimal(row["notional"])) for row in rows), Fraction(0)
+        )
+        if reserved_notional + Fraction(intent.notional) > Fraction(
+            _as_decimal(limit["max_notional"])
+        ):
+            raise RiskDeniedError(
+                "MARGIN_POOL_LIMIT_EXHAUSTED",
+                "margin-pool increase notional limit exceeded",
+            )
+
     def _assert_strategy_allocation_limit(
         self, connection: sqlite3.Connection, intent: RiskIntent
     ) -> None:
@@ -8314,7 +8493,9 @@ class DurableRiskGate:
                     group_deadline_ns INTEGER,
                     group_expires_at_ns INTEGER,
                     group_leg_count INTEGER,
-                    group_exposure_profile_fingerprint TEXT
+                    group_exposure_profile_fingerprint TEXT,
+                    resource_product_type TEXT,
+                    resource_margin_pool TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_risk_reservations_scope_status
                     ON risk_reservations(scope_key, status, action);
@@ -8500,6 +8681,26 @@ class DurableRiskGate:
                     max_gross_occupancy_intent_count INTEGER,
                     created_at REAL NOT NULL,
                     PRIMARY KEY(scope_key, strategy_id, allocation_version)
+                );
+                CREATE TABLE IF NOT EXISTS risk_margin_pool_limits (
+                    scope_key TEXT NOT NULL,
+                    product_type TEXT NOT NULL,
+                    margin_pool TEXT NOT NULL,
+                    allocation_version TEXT NOT NULL,
+                    max_notional TEXT NOT NULL,
+                    notional_unit TEXT NOT NULL,
+                    updated_at REAL NOT NULL,
+                    PRIMARY KEY(scope_key, product_type, margin_pool)
+                );
+                CREATE TABLE IF NOT EXISTS risk_margin_pool_limit_versions (
+                    scope_key TEXT NOT NULL,
+                    product_type TEXT NOT NULL,
+                    margin_pool TEXT NOT NULL,
+                    allocation_version TEXT NOT NULL,
+                    max_notional TEXT NOT NULL,
+                    notional_unit TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    PRIMARY KEY(scope_key, product_type, margin_pool, allocation_version)
                 );
                 CREATE TABLE IF NOT EXISTS risk_gross_exposure_baselines (
                     scope_key TEXT PRIMARY KEY,
@@ -8728,6 +8929,8 @@ class DurableRiskGate:
                 ("group_expires_at_ns", "INTEGER"),
                 ("group_leg_count", "INTEGER"),
                 ("group_exposure_profile_fingerprint", "TEXT"),
+                ("resource_product_type", "TEXT"),
+                ("resource_margin_pool", "TEXT"),
             ):
                 if name not in reservation_columns:
                     connection.execute(
@@ -8835,6 +9038,12 @@ class DurableRiskGate:
                    ON risk_reservations(scope_key, group_id)"""
             )
             connection.execute(
+                """CREATE INDEX IF NOT EXISTS idx_risk_reservations_margin_pool
+                   ON risk_reservations(
+                       scope_key, resource_product_type, resource_margin_pool, action, status
+                   )"""
+            )
+            connection.execute(
                 """CREATE TRIGGER IF NOT EXISTS risk_group_reservation_identity_immutable
                    BEFORE UPDATE OF group_id, group_fingerprint, group_leg_id,
                        group_deadline_ns, group_expires_at_ns, group_leg_count,
@@ -8894,28 +9103,34 @@ def _as_decimal(value: object) -> Decimal:
 def _risk_intent_json(intent: RiskIntent) -> str:
     """Canonical storage for the exact mapped child RiskIntent of a group claim."""
 
-    return _canonical_json(
-        {
-            "action": intent.action.value,
-            "allocation_version": intent.allocation_version,
-            "exposure_profile_fingerprint": intent.exposure_profile_fingerprint,
-            "instrument_facts_observed_at_ns": intent.instrument_facts_observed_at_ns,
-            "instrument_facts_valid_until_ns": intent.instrument_facts_valid_until_ns,
-            "instrument": intent.instrument,
-            "intent_id": intent.intent_id,
-            "notional": _decimal_text(intent.notional),
-            "notional_unit": intent.notional_unit,
-            "payload_fingerprint": intent.payload_fingerprint,
-            "quantity": None if intent.quantity is None else _decimal_text(intent.quantity),
-            "quantity_unit": intent.quantity_unit,
-            "scope": {
-                "account_id": intent.scope.account_id,
-                "environment": intent.scope.environment,
-                "provider": intent.scope.provider,
-            },
-            "strategy_id": intent.strategy_id,
+    payload: dict[str, object] = {
+        "action": intent.action.value,
+        "allocation_version": intent.allocation_version,
+        "exposure_profile_fingerprint": intent.exposure_profile_fingerprint,
+        "instrument_facts_observed_at_ns": intent.instrument_facts_observed_at_ns,
+        "instrument_facts_valid_until_ns": intent.instrument_facts_valid_until_ns,
+        "instrument": intent.instrument,
+        "intent_id": intent.intent_id,
+        "notional": _decimal_text(intent.notional),
+        "notional_unit": intent.notional_unit,
+        "payload_fingerprint": intent.payload_fingerprint,
+        "quantity": None if intent.quantity is None else _decimal_text(intent.quantity),
+        "quantity_unit": intent.quantity_unit,
+        "scope": {
+            "account_id": intent.scope.account_id,
+            "environment": intent.scope.environment,
+            "provider": intent.scope.provider,
+        },
+        "strategy_id": intent.strategy_id,
+    }
+    if intent.resource is not None:
+        # Older stored documents never carry this key; keep them canonical by
+        # adding the resource section only for intents that declare one.
+        payload["resource"] = {
+            "margin_pool": intent.resource.margin_pool,
+            "product_type": intent.resource.product_type,
         }
-    )
+    return _canonical_json(payload)
 
 
 def _risk_intent_from_json(raw: str) -> RiskIntent:
@@ -8938,7 +9153,10 @@ def _risk_intent_from_json(raw: str) -> RiskIntent:
         "scope",
         "strategy_id",
     }
-    if type(parsed) is not dict or set(parsed) != expected_keys:
+    if type(parsed) is not dict or set(parsed) not in (
+        expected_keys,
+        expected_keys | {"resource"},
+    ):
         raise ValueError("invalid stored child intent shape")
     scope_raw = parsed["scope"]
     if type(scope_raw) is not dict or set(scope_raw) != {
@@ -8947,6 +9165,12 @@ def _risk_intent_from_json(raw: str) -> RiskIntent:
         "provider",
     }:
         raise ValueError("invalid stored child scope shape")
+    resource = None
+    if "resource" in parsed:
+        try:
+            resource = AccountResourceKey.from_dict(parsed["resource"])
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid stored child intent resource") from exc
     intent = RiskIntent(
         intent_id=parsed["intent_id"],
         scope=AccountScope(
@@ -8966,6 +9190,7 @@ def _risk_intent_from_json(raw: str) -> RiskIntent:
         exposure_profile_fingerprint=parsed["exposure_profile_fingerprint"],
         instrument_facts_observed_at_ns=parsed["instrument_facts_observed_at_ns"],
         instrument_facts_valid_until_ns=parsed["instrument_facts_valid_until_ns"],
+        resource=resource,
     )
     if _risk_intent_json(intent) != raw:
         raise ValueError("stored child intent is not canonical")
