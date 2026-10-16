@@ -20,6 +20,7 @@ from bt_api_risk import (
     InstrumentRiskMetadata,
     InstrumentRiskRegistry,
     OrderExposureState,
+    PositionSnapshotCoverage,
     RiskDeniedError,
     RiskExposureKind,
     RiskExposureLimit,
@@ -133,7 +134,7 @@ def _mapper(
     )
 
 
-def _policy(limits: tuple[RiskExposureLimit, ...], *, live_gross: bool = False) -> RiskPolicy:
+def _policy(limits: tuple[RiskExposureLimit, ...], *, live_gross: bool = True) -> RiskPolicy:
     return RiskPolicy(
         "dimension-policy",
         Decimal("10000"),
@@ -154,14 +155,7 @@ def _policy(limits: tuple[RiskExposureLimit, ...], *, live_gross: bool = False) 
 
 
 def _open_simple_gate(path, limits):
-    gate = DurableRiskGate(path, _policy(limits), clock=lambda: _NOW)
-    gate.set_strategy_allocation(
-        _SCOPE,
-        "strategy-a",
-        "allocation-v1",
-        max_notional=Decimal("10000"),
-        notional_unit="USD",
-    )
+    _, gate = _open_live_gate(path, limits)
     return gate
 
 
@@ -207,6 +201,20 @@ def _open_live_gate(path, limits):
                 writer_owner_id="synthetic-writer",
                 writer_fencing_token=1,
                 writer_fence_sha256=_sha("fence"),
+                position_coverage=PositionSnapshotCoverage(
+                    scope=_SCOPE,
+                    account_revision=1,
+                    source_schema_version="fixture-baseline-v1",
+                    query_scope="ALL_ACCOUNT_POSITIONS",
+                    filters=(),
+                    permission_scope="ACCOUNT_FULL",
+                    permission_revision="permission-v1",
+                    pagination_exhausted=True,
+                    page_count=1,
+                    snapshot_version="snapshot-v1",
+                    observed_at_ns=_NOW_NS,
+                    valid_until_ns=_NOW_NS + 3_600_000_000_000,
+                ),
             )
         )
         return gate
@@ -331,6 +339,51 @@ def test_legacy_active_reservation_without_dimension_rows_fails_closed_after_upg
         assert str(original["permit_id"]) == permit.permit_id
         assert original["status"] == DurableRiskGate._ACTIVE
         assert dimensions == 0
+    finally:
+        reopened.close()
+
+
+def test_legacy_baseline_without_position_coverage_fails_closed_after_upgrade(tmp_path) -> None:
+    limits = (
+        _limit(RiskExposureKind.UNDERLYING_NOTIONAL, "BTC", "USD", "150"),
+    )
+    database = tmp_path / "legacy-baseline-without-position-coverage.sqlite3"
+    _, gate = _open_live_gate(database, limits)
+    gate.close()
+
+    # Recreate the pre-position-dimensions shape. Migration must add the new
+    # column/table without inferring coverage or dimension values for this row.
+    with sqlite3.connect(database) as connection:
+        connection.execute("DROP TABLE risk_gross_baseline_dimensions")
+        connection.execute(
+            "ALTER TABLE risk_gross_exposure_baselines DROP COLUMN position_coverage_sha256"
+        )
+        connection.commit()
+
+    reopened = DurableRiskGate(database, _policy(limits), clock=lambda: _NOW)
+    try:
+        with reopened._connection() as connection:
+            legacy = connection.execute(
+                "SELECT position_coverage_sha256 FROM risk_gross_exposure_baselines"
+            ).fetchone()
+            dimensions = connection.execute(
+                "SELECT COUNT(*) FROM risk_gross_baseline_dimensions"
+            ).fetchone()[0]
+        assert legacy is not None
+        assert legacy["position_coverage_sha256"] is None
+        assert dimensions == 0
+
+        metadata = _metadata("BTC-USDT")
+        candidate = _mapper(reopened, (metadata,), limits)(
+            _execution(metadata, "candidate-after-baseline-upgrade", quantity="1")
+        )
+        with pytest.raises(RiskDeniedError) as denied:
+            reopened.reserve(candidate)
+        assert denied.value.code == "GROSS_EXPOSURE_POSITION_COVERAGE_UNAVAILABLE"
+        with reopened._connection() as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM risk_reservations"
+            ).fetchone()[0] == 0
     finally:
         reopened.close()
 

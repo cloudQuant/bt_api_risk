@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional, Protocol
 
 if TYPE_CHECKING:
     from .admission import AccountScope, DispatchClaimBinding, DispatchTrackedOrderProof
+    from .instrument import AccountPositionRiskFact
 
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
 _UNIT = re.compile(r"^[A-Z][A-Z0-9]{2,11}$")
@@ -190,6 +191,82 @@ class StrategyGrossBaseline:
 
 
 @dataclass(frozen=True)
+class PositionSnapshotCoverage:
+    """Source-side scope receipt for a complete account-position snapshot.
+
+    The values are only useful when the owning journal persists this exact
+    object under its current account-writer fence.  A caller-provided
+    ``complete_positions`` boolean alone is deliberately insufficient for
+    policies that cap instrument or Greek dimensions.
+    """
+
+    scope: AccountScope
+    account_revision: int
+    source_schema_version: str
+    query_scope: str
+    filters: tuple[str, ...]
+    permission_scope: str
+    permission_revision: str
+    pagination_exhausted: bool
+    page_count: int
+    snapshot_version: str
+    observed_at_ns: int
+    valid_until_ns: int
+
+    def __post_init__(self) -> None:
+        from .admission import AccountScope
+
+        if type(self.scope) is not AccountScope:
+            raise ValueError("invalid position snapshot scope")
+        if type(self.account_revision) is not int or self.account_revision <= 0:
+            raise ValueError("invalid position snapshot revision")
+        for name in (
+            "source_schema_version",
+            "permission_revision",
+            "snapshot_version",
+        ):
+            _require_text(getattr(self, name), name)
+        if self.query_scope != "ALL_ACCOUNT_POSITIONS":
+            raise ValueError("position snapshot query must cover all account positions")
+        if type(self.filters) is not tuple or self.filters:
+            raise ValueError("a full account position snapshot cannot be filtered")
+        if self.permission_scope != "ACCOUNT_FULL":
+            raise ValueError("position snapshot requires full-account visibility")
+        if self.pagination_exhausted is not True:
+            raise ValueError("position snapshot pagination must be exhausted")
+        if type(self.page_count) is not int or self.page_count <= 0:
+            raise ValueError("position snapshot requires a completed page")
+        _validate_interval(self.observed_at_ns, self.valid_until_ns, "position snapshot")
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "account_revision": self.account_revision,
+            "account_scope": {
+                "account_id": self.scope.account_id,
+                "environment": self.scope.environment,
+                "provider": self.scope.provider,
+            },
+            "filters": list(self.filters),
+            "observed_at_ns": self.observed_at_ns,
+            "page_count": self.page_count,
+            "pagination_exhausted": self.pagination_exhausted,
+            "permission_revision": self.permission_revision,
+            "permission_scope": self.permission_scope,
+            "query_scope": self.query_scope,
+            "schema": "bt_api_risk.position-snapshot-coverage.v1",
+            "snapshot_version": self.snapshot_version,
+            "source_schema_version": self.source_schema_version,
+            "valid_until_ns": self.valid_until_ns,
+        }
+
+    @property
+    def digest(self) -> str:
+        """Return the digest of the exact full-query coverage declaration."""
+
+        return _proof_hash(self.to_payload())
+
+
+@dataclass(frozen=True)
 class GrossExposureBaselineProof:
     """Claimed complete account-position baseline for one clean Risk generation.
 
@@ -219,6 +296,8 @@ class GrossExposureBaselineProof:
     writer_owner_id: str
     writer_fencing_token: int
     writer_fence_sha256: str
+    position_coverage: Optional[PositionSnapshotCoverage] = None
+    position_risk_facts: tuple["AccountPositionRiskFact", ...] = ()
 
     def __post_init__(self) -> None:
         from .admission import AccountScope
@@ -259,6 +338,43 @@ class GrossExposureBaselineProof:
             raise ValueError("baseline requires zero unmanaged open orders")
         if self.complete_positions is not True or self.complete_open_orders is not True:
             raise ValueError("baseline must prove complete positions and open orders")
+        if self.position_coverage is not None:
+            if type(self.position_coverage) is not PositionSnapshotCoverage:
+                raise ValueError("position_coverage must be a typed full-account receipt")
+            if (
+                self.position_coverage.scope != self.scope
+                or self.position_coverage.account_revision != self.account_revision
+                or self.position_coverage.source_schema_version != self.source_schema_version
+                or self.position_coverage.observed_at_ns != self.observed_at_ns
+                or self.position_coverage.valid_until_ns > self.valid_until_ns
+            ):
+                raise ValueError("position coverage does not match the account baseline")
+        if type(self.position_risk_facts) is not tuple:
+            raise ValueError("position_risk_facts must be an immutable tuple")
+        if self.position_risk_facts:
+            from .instrument import AccountPositionRiskFact
+
+            if any(type(item) is not AccountPositionRiskFact for item in self.position_risk_facts):
+                raise ValueError("position_risk_facts must contain typed source facts")
+            position_ids = [item.position_id for item in self.position_risk_facts]
+            if len(position_ids) != len(set(position_ids)):
+                raise ValueError("position risk fact identities must be unique")
+            if self.position_coverage is None:
+                raise ValueError("position risk facts require a full-account coverage receipt")
+            if any(
+                fact.metadata.as_of_ns > self.position_coverage.observed_at_ns
+                or fact.mark_observed_at_ns > self.position_coverage.observed_at_ns
+                or (
+                    fact.fx_rate is not None
+                    and fact.fx_rate.observed_at_ns > self.position_coverage.observed_at_ns
+                )
+                or (
+                    fact.greeks is not None
+                    and fact.greeks.observed_at_ns > self.position_coverage.observed_at_ns
+                )
+                for fact in self.position_risk_facts
+            ):
+                raise ValueError("position risk facts are newer than the covered snapshot")
         for name in (
             "source_snapshot_sha256",
             "positions_sha256",
@@ -303,6 +419,12 @@ class GrossExposureBaselineProof:
                 "writer_owner_id": self.writer_owner_id,
                 "writer_fencing_token": self.writer_fencing_token,
                 "writer_fence_sha256": self.writer_fence_sha256,
+                "position_coverage": (
+                    None if self.position_coverage is None else self.position_coverage.to_payload()
+                ),
+                "position_risk_facts": [
+                    item.to_payload() for item in self.position_risk_facts
+                ],
             }
         )
 

@@ -90,6 +90,7 @@ from .core.exposure import (
     OrderExposureSnapshot,
     OrderExposureState,
     OrderFillFact,
+    PositionSnapshotCoverage,
     StrategyGrossBaseline,
     VerifiedGrossExposureBaseline,
     VerifiedOrderExposureObservation,
@@ -97,6 +98,7 @@ from .core.exposure import (
 )
 from .core.instrument import (
     INSTRUMENT_METADATA_DIGEST_TAG,
+    AccountPositionRiskFact,
     InstrumentRiskAdmissionMapper,
     InstrumentRiskAssessment,
     InstrumentRiskFxRate,
@@ -193,6 +195,7 @@ __all__ = [
     "ExposureAccountingMode",
     "GrossExposureAuthority",
     "GrossExposureBaselineProof",
+    "PositionSnapshotCoverage",
     "OrderExposureObservationProof",
     "OrderExposureSnapshot",
     "OrderExposureState",
@@ -227,6 +230,7 @@ __all__ = [
     "VerifiedExecutionJournalAuthority",
     "VerifiedRecoveredExecutionJournalAuthority",
     "INSTRUMENT_METADATA_DIGEST_TAG",
+    "AccountPositionRiskFact",
     "InstrumentRiskAdmissionMapper",
     "InstrumentRiskAssessment",
     "InstrumentRiskFxRate",

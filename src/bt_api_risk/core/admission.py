@@ -339,6 +339,14 @@ class RiskPolicy:
                 key=lambda item: (item.kind.value, item.dimension_key, item.unit),
             )
         )
+        if dimension_limits:
+            if self.exposure_accounting_mode is not ExposureAccountingMode.LIVE_GROSS:
+                raise ValueError("risk dimensions require a source-verified LIVE_GROSS baseline")
+            if any(
+                limit.kind.is_gross and limit.unit != self.notional_unit
+                for limit in dimension_limits
+            ):
+                raise ValueError("gross risk-dimension units must match the account notional unit")
         object.__setattr__(self, "max_increase_notional", limit)
         if gross_cap is not None:
             object.__setattr__(self, "max_gross_occupancy_notional", gross_cap)
@@ -4071,6 +4079,127 @@ class DurableRiskGate:
                 claim=binding,
             )
 
+    def _build_position_baseline_dimensions(
+        self,
+        proof: GrossExposureBaselineProof,
+        *,
+        now_ns: int,
+    ) -> tuple[tuple[RiskExposureLimit, Decimal, str, int, int], ...]:
+        """Revalue every covered holding and prepare one immutable row per limit."""
+
+        limits = self._policy.exposure_dimension_limits
+        if not limits:
+            return ()
+        coverage = proof.position_coverage
+        if coverage is None:
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_POSITION_COVERAGE_REQUIRED",
+                "dimension limits require a full-account position coverage receipt",
+            )
+        if not self._gross_facts_are_fresh(
+            coverage.observed_at_ns, coverage.valid_until_ns, now_ns
+        ):
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_POSITION_SNAPSHOT_STALE",
+                "full-account position coverage is stale or not yet observed",
+            )
+
+        max_age_ns = int(self._active_gross_age_seconds * 1_000_000_000)
+        dimension_totals: dict[tuple[RiskExposureKind, str, str], Fraction] = {
+            (item.kind, item.dimension_key, item.unit): Fraction(0) for item in limits
+        }
+        dimension_sources: dict[
+            tuple[RiskExposureKind, str, str], list[tuple[str, str]]
+        ] = {key: [] for key in dimension_totals}
+        dimension_observed_at = {key: coverage.observed_at_ns for key in dimension_totals}
+        dimension_valid_until = {key: coverage.valid_until_ns for key in dimension_totals}
+        strategy_gross: dict[str, Fraction] = {}
+
+        for fact in proof.position_risk_facts:
+            if fact.metadata.valuation_unit != self._policy.notional_unit:
+                raise RiskDeniedError(
+                    "GROSS_EXPOSURE_POSITION_UNIT_MISMATCH",
+                    "every current position must revalue into the fixed account notional unit",
+                )
+            try:
+                gross_notional, dimensions = fact.exposure_dimensions(
+                    limits, now_ns=now_ns, max_age_ns=max_age_ns
+                )
+            except (TypeError, ValueError, InvalidOperation) as error:
+                raise RiskDeniedError(
+                    "GROSS_EXPOSURE_POSITION_FACT_INVALID",
+                    "a current position lacks fresh, source-bound valuation dimensions",
+                ) from error
+            strategy_gross[fact.strategy_id] = strategy_gross.get(
+                fact.strategy_id, Fraction(0)
+            ) + Fraction(gross_notional)
+            for dimension in dimensions:
+                identity = (dimension.kind, dimension.dimension_key, dimension.unit)
+                if identity not in dimension_totals:
+                    raise RiskDeniedError(
+                        "GROSS_EXPOSURE_POSITION_DIMENSION_INVALID",
+                        "a position dimension does not match the immutable account policy",
+                    )
+                dimension_totals[identity] += Fraction(dimension.exposure)
+                dimension_sources[identity].append(
+                    (fact.position_id, dimension.source_sha256)
+                )
+                dimension_observed_at[identity] = min(
+                    dimension_observed_at[identity], dimension.observed_at_ns
+                )
+                dimension_valid_until[identity] = min(
+                    dimension_valid_until[identity], dimension.valid_until_ns
+                )
+
+        proof_strategy_gross = {
+            item.strategy_id: Fraction(item.gross_notional)
+            for item in proof.strategy_baselines
+        }
+        all_strategy_ids = set(strategy_gross) | set(proof_strategy_gross)
+        if any(
+            strategy_gross.get(strategy_id, Fraction(0))
+            != proof_strategy_gross.get(strategy_id, Fraction(0))
+            for strategy_id in all_strategy_ids
+        ) or sum(strategy_gross.values(), Fraction(0)) != Fraction(
+            proof.account_gross_notional
+        ):
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_POSITION_REVALUATION_MISMATCH",
+                "source position facts do not reproduce the attributed account baseline",
+            )
+
+        rows: list[tuple[RiskExposureLimit, Decimal, str, int, int]] = []
+        coverage_sha256 = coverage.digest
+        for limit in limits:
+            identity = (limit.kind, limit.dimension_key, limit.unit)
+            observed_at_ns = dimension_observed_at[identity]
+            valid_until_ns = dimension_valid_until[identity]
+            exposure = _decimal_from_fraction(dimension_totals[identity])
+            if (
+                observed_at_ns > now_ns
+                or now_ns >= valid_until_ns
+                or now_ns - observed_at_ns > max_age_ns
+                or (limit.kind.is_gross and exposure < 0)
+            ):
+                raise RiskDeniedError(
+                    "GROSS_EXPOSURE_POSITION_DIMENSION_STALE",
+                    "a current-position dimension is stale or invalid",
+                )
+            source_sha256 = _sha256(
+                _canonical_json(
+                    {
+                        "coverage_sha256": coverage_sha256,
+                        "dimension": limit.to_payload(),
+                        "position_sources": sorted(dimension_sources[identity]),
+                        "schema": "bt_api_risk.position-baseline-dimension.v1",
+                    }
+                )
+            )
+            rows.append(
+                (limit, exposure, source_sha256, observed_at_ns, valid_until_ns)
+            )
+        return tuple(rows)
+
     def install_gross_exposure_baseline(
         self, proof: GrossExposureBaselineProof
     ) -> VerifiedGrossExposureBaseline:
@@ -4096,6 +4225,11 @@ class DurableRiskGate:
         if proof.notional_unit != self._policy.notional_unit:
             raise RiskDeniedError(
                 "GROSS_EXPOSURE_UNIT_MISMATCH", "baseline does not use the fixed policy unit"
+            )
+        if self._policy.exposure_dimension_limits and proof.position_coverage is None:
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_POSITION_COVERAGE_REQUIRED",
+                "dimension limits require a source-shaped full-account position snapshot",
             )
         now_ns = self._now_ns()
         if not self._gross_facts_are_fresh(proof.observed_at_ns, proof.valid_until_ns, now_ns):
@@ -4125,6 +4259,9 @@ class DurableRiskGate:
                             "GROSS_EXPOSURE_BASELINE_STALE",
                             "account baseline expired while acquiring the writer fence",
                         )
+                    baseline_dimensions = self._build_position_baseline_dimensions(
+                        proof, now_ns=committed_at_ns
+                    )
                     self._ensure_policy_binding(connection, proof.scope.key)
                     existing = connection.execute(
                         "SELECT * FROM risk_gross_exposure_baselines WHERE scope_key = ?",
@@ -4138,6 +4275,10 @@ class DurableRiskGate:
                             raise RiskDeniedError(
                                 "GROSS_EXPOSURE_BASELINE_STALE",
                                 "account baseline expired before idempotent replay completed",
+                            )
+                        if self._policy.exposure_dimension_limits:
+                            self._live_baseline_dimensions(
+                                connection, proof.scope, now_ns=replay_at_ns
                             )
                         return receipt
                     latest = connection.execute(
@@ -4225,15 +4366,22 @@ class DurableRiskGate:
                                 "GROSS_EXPOSURE_STRATEGY_COUNT_EXCEEDED",
                                 "strategy baseline exceeds its occupied-intent cap",
                             )
+                    for limit, exposure, _, _, _ in baseline_dimensions:
+                        if abs(Fraction(exposure)) > Fraction(limit.max_abs_exposure):
+                            raise RiskDeniedError(
+                                "GROSS_EXPOSURE_BASELINE_DIMENSION_LIMIT_EXCEEDED",
+                                "current account positions already exceed a configured risk dimension",
+                            )
                     connection.execute(
                         """INSERT INTO risk_gross_exposure_baselines (
                                scope_key, policy_hash, proof_sha256, account_revision,
                                notional_unit, account_gross_notional,
                                account_active_increase_intent_count, source_snapshot_sha256,
                                positions_sha256, open_orders_sha256, valuation_facts_sha256,
-                               source_schema_version, observed_at_ns, valid_until_ns,
+                               source_schema_version, position_coverage_sha256,
+                               observed_at_ns, valid_until_ns,
                                writer_owner_id, writer_fencing_token, writer_fence_sha256
-                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             proof.scope.key,
                             self._policy.fingerprint,
@@ -4247,6 +4395,11 @@ class DurableRiskGate:
                             proof.open_orders_sha256,
                             proof.valuation_facts_sha256,
                             proof.source_schema_version,
+                            (
+                                None
+                                if proof.position_coverage is None
+                                else proof.position_coverage.digest
+                            ),
                             proof.observed_at_ns,
                             proof.valid_until_ns,
                             proof.writer_owner_id,
@@ -4267,6 +4420,27 @@ class DurableRiskGate:
                                 item.active_increase_intent_count,
                             )
                             for item in proof.strategy_baselines
+                        ],
+                    )
+                    connection.executemany(
+                        """INSERT INTO risk_gross_baseline_dimensions (
+                               scope_key, account_revision, dimension_kind, dimension_key,
+                               unit, exposure, source_sha256, observed_at_ns, valid_until_ns
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        [
+                            (
+                                proof.scope.key,
+                                proof.account_revision,
+                                limit.kind.value,
+                                limit.dimension_key,
+                                limit.unit,
+                                _decimal_text(exposure),
+                                source_sha256,
+                                observed_at_ns,
+                                valid_until_ns,
+                            )
+                            for limit, exposure, source_sha256, observed_at_ns, valid_until_ns
+                            in baseline_dimensions
                         ],
                     )
                     connection.execute(
@@ -7451,6 +7625,11 @@ class DurableRiskGate:
             raise RiskDeniedError(
                 "GROSS_EXPOSURE_BASELINE_UNBOUND", "LIVE_GROSS account baseline is not bound"
             )
+        if self._policy.exposure_dimension_limits and not baseline["position_coverage_sha256"]:
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_POSITION_COVERAGE_UNAVAILABLE",
+                "the stored baseline predates a full-account position coverage receipt",
+            )
         unproven_strategy = connection.execute(
             "SELECT 1 FROM risk_gross_baseline_strategies "
             "WHERE scope_key = ? AND active_increase_intent_count IS NULL LIMIT 1",
@@ -7462,6 +7641,70 @@ class DurableRiskGate:
                 "a strategy baseline has no source-proven occupied intent count",
             )
         return baseline
+
+    def _live_baseline_dimensions(
+        self,
+        connection: sqlite3.Connection,
+        scope: AccountScope,
+        *,
+        now_ns: int,
+    ) -> dict[tuple[RiskExposureKind, str, str], Fraction]:
+        """Read one complete current-baseline row for every configured dimension."""
+
+        if not self._policy.exposure_dimension_limits:
+            return {}
+        baseline = self._assert_live_baseline_bound(connection, scope)
+        rows = connection.execute(
+            """SELECT dimension_kind, dimension_key, unit, exposure, source_sha256,
+                      observed_at_ns, valid_until_ns
+               FROM risk_gross_baseline_dimensions
+               WHERE scope_key = ? AND account_revision = ?""",
+            (scope.key, int(baseline["account_revision"])),
+        ).fetchall()
+        expected = {
+            (limit.kind, limit.dimension_key, limit.unit): limit
+            for limit in self._policy.exposure_dimension_limits
+        }
+        if len(rows) != len(expected):
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_POSITION_DIMENSIONS_UNAVAILABLE",
+                "the current full-account baseline has missing dimension rows",
+            )
+        result: dict[tuple[RiskExposureKind, str, str], Fraction] = {}
+        max_age_ns = int(self._active_gross_age_seconds * 1_000_000_000)
+        for row in rows:
+            try:
+                kind = RiskExposureKind(str(row["dimension_kind"]))
+                dimension_key = str(row["dimension_key"])
+                unit = str(row["unit"])
+                identity = (kind, dimension_key, unit)
+                if identity not in expected or identity in result:
+                    raise ValueError("baseline dimension is outside the configured policy")
+                exposure = _as_decimal(row["exposure"])
+                _require_sha256(row["source_sha256"], "baseline dimension source_sha256")
+                observed_at_ns = int(row["observed_at_ns"])
+                valid_until_ns = int(row["valid_until_ns"])
+                if (
+                    observed_at_ns <= 0
+                    or valid_until_ns <= observed_at_ns
+                    or observed_at_ns > now_ns
+                    or now_ns >= valid_until_ns
+                    or now_ns - observed_at_ns > max_age_ns
+                    or (kind.is_gross and exposure < 0)
+                ):
+                    raise ValueError("baseline dimension is stale or invalid")
+                result[identity] = Fraction(exposure)
+            except (KeyError, TypeError, ValueError, InvalidOperation) as error:
+                raise RiskDeniedError(
+                    "GROSS_EXPOSURE_POSITION_DIMENSION_HISTORY_INVALID",
+                    "stored current-position dimensions are invalid or stale",
+                ) from error
+        if set(result) != set(expected):
+            raise RiskDeniedError(
+                "GROSS_EXPOSURE_POSITION_DIMENSIONS_UNAVAILABLE",
+                "the current full-account baseline does not cover every policy dimension",
+            )
+        return result
 
     def _live_gross_usage(
         self, connection: sqlite3.Connection, scope: AccountScope
@@ -8940,6 +9183,12 @@ class DurableRiskGate:
                 )
             return
 
+        baseline_now_ns = self._now_ns()
+        self._assert_live_baseline_fresh(connection, intent.scope, baseline_now_ns)
+        baseline_dimensions = self._live_baseline_dimensions(
+            connection, intent.scope, now_ns=baseline_now_ns
+        )
+
         required_kinds = {item.kind for item in limits}
         dimensions_by_kind: dict[RiskExposureKind, list[RiskExposureDimension]] = {}
         for dimension in intent.exposure_dimensions:
@@ -9078,7 +9327,8 @@ class DurableRiskGate:
                     OrderExposureState.UNKNOWN.value,
                 ),
             ).fetchall()
-            total = sum(
+            total = baseline_dimensions[(dimension.kind, dimension.dimension_key, dimension.unit)]
+            total += sum(
                 (
                     abs(Fraction(_as_decimal(row["exposure"])))
                     if dimension.kind.is_gross
@@ -10196,6 +10446,7 @@ class DurableRiskGate:
                     open_orders_sha256 TEXT NOT NULL,
                     valuation_facts_sha256 TEXT NOT NULL,
                     source_schema_version TEXT NOT NULL,
+                    position_coverage_sha256 TEXT,
                     observed_at_ns INTEGER NOT NULL,
                     valid_until_ns INTEGER NOT NULL,
                     writer_owner_id TEXT NOT NULL,
@@ -10210,6 +10461,38 @@ class DurableRiskGate:
                     PRIMARY KEY(scope_key, strategy_id),
                     FOREIGN KEY(scope_key) REFERENCES risk_gross_exposure_baselines(scope_key)
                 );
+                CREATE TABLE IF NOT EXISTS risk_gross_baseline_dimensions (
+                    scope_key TEXT NOT NULL,
+                    account_revision INTEGER NOT NULL CHECK(account_revision > 0),
+                    dimension_kind TEXT NOT NULL,
+                    dimension_key TEXT NOT NULL,
+                    unit TEXT NOT NULL,
+                    exposure TEXT NOT NULL,
+                    source_sha256 TEXT NOT NULL,
+                    observed_at_ns INTEGER NOT NULL,
+                    valid_until_ns INTEGER NOT NULL,
+                    PRIMARY KEY(scope_key, account_revision, dimension_kind, dimension_key)
+                );
+                CREATE TRIGGER IF NOT EXISTS risk_gross_baseline_dimensions_parent_insert
+                BEFORE INSERT ON risk_gross_baseline_dimensions
+                WHEN NOT EXISTS (
+                    SELECT 1 FROM risk_gross_exposure_baselines AS baseline
+                    WHERE baseline.scope_key = NEW.scope_key
+                      AND baseline.account_revision = NEW.account_revision
+                )
+                BEGIN
+                    SELECT RAISE(ABORT, 'baseline dimension lacks its parent revision');
+                END;
+                CREATE TRIGGER IF NOT EXISTS risk_gross_baseline_dimensions_immutable_update
+                BEFORE UPDATE ON risk_gross_baseline_dimensions
+                BEGIN
+                    SELECT RAISE(ABORT, 'gross baseline dimensions are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS risk_gross_baseline_dimensions_immutable_delete
+                BEFORE DELETE ON risk_gross_baseline_dimensions
+                BEGIN
+                    SELECT RAISE(ABORT, 'gross baseline dimensions are immutable');
+                END;
                 CREATE TABLE IF NOT EXISTS risk_gross_scope_revisions (
                     scope_key TEXT PRIMARY KEY,
                     journal_revision INTEGER NOT NULL CHECK(journal_revision > 0)
@@ -10474,6 +10757,18 @@ class DurableRiskGate:
                     # Existing rows receive NULL and are deliberately unusable
                     # for LIVE_GROSS until replaced by a new attributed baseline.
                     connection.execute("ALTER TABLE " + table + " ADD COLUMN " + name + " INTEGER")
+            gross_baseline_columns = {
+                str(row["name"])
+                for row in connection.execute(
+                    "PRAGMA table_info(risk_gross_exposure_baselines)"
+                ).fetchall()
+            }
+            if "position_coverage_sha256" not in gross_baseline_columns:
+                # Old snapshots recorded only a completeness boolean; do not
+                # infer full-position query coverage for existing rows.
+                connection.execute(
+                    "ALTER TABLE risk_gross_exposure_baselines ADD COLUMN position_coverage_sha256 TEXT"
+                )
             exposure_columns = {
                 str(row["name"])
                 for row in connection.execute("PRAGMA table_info(risk_order_exposures)").fetchall()

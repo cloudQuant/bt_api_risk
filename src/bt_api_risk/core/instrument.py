@@ -481,6 +481,265 @@ class InstrumentRiskGreeks:
 
 
 @dataclass(frozen=True)
+class AccountPositionRiskFact:
+    """One source-bound current position used to rebuild baseline exposure."""
+
+    position_id: str
+    strategy_id: str
+    instrument: str
+    position_side: str
+    quantity: Decimal
+    quantity_unit: str
+    mark_price: Decimal
+    mark_observed_at_ns: int
+    mark_valid_until_ns: int
+    mark_source_ref: str
+    mark_source_revision: str
+    mark_source_record_sha256: str
+    position_source_record_sha256: str
+    metadata: InstrumentRiskMetadata
+    fx_rate: Optional[InstrumentRiskFxRate] = None  # noqa: UP045 -- Python 3.9.
+    greeks: Optional[InstrumentRiskGreeks] = None  # noqa: UP045 -- Python 3.9.
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "position_id", _identifier(self.position_id, "position_id"))
+        object.__setattr__(self, "strategy_id", _identifier(self.strategy_id, "strategy_id"))
+        object.__setattr__(self, "instrument", _identifier(self.instrument, "instrument", instrument=True))
+        if self.position_side not in {"LONG", "SHORT"}:
+            raise ValueError("position_side must be LONG or SHORT")
+        object.__setattr__(self, "quantity", _decimal(self.quantity, "position quantity", positive=True))
+        object.__setattr__(self, "mark_price", _decimal(self.mark_price, "mark price", positive=True))
+        if type(self.metadata) is not InstrumentRiskMetadata:
+            raise ValueError("position metadata must be a typed instrument fact")
+        if self.metadata.instrument != self.instrument:
+            raise ValueError("position instrument does not match trusted metadata")
+        if (
+            type(self.quantity_unit) is not str
+            or self.metadata.quantity_unit is None
+            or self.quantity_unit != self.metadata.quantity_unit
+        ):
+            raise ValueError("position quantity unit does not match trusted metadata")
+        quote_currency = self.metadata.quote_currency or self.metadata.valuation_unit
+        if self.metadata.valuation_unit is None or quote_currency is None:
+            raise ValueError("position metadata lacks a mark denomination")
+        if type(self.mark_observed_at_ns) is not int or self.mark_observed_at_ns <= 0:
+            raise ValueError("invalid mark observation time")
+        if (
+            type(self.mark_valid_until_ns) is not int
+            or self.mark_valid_until_ns <= self.mark_observed_at_ns
+        ):
+            raise ValueError("invalid mark validity interval")
+        object.__setattr__(self, "mark_source_ref", _identifier(self.mark_source_ref, "mark_source_ref"))
+        object.__setattr__(self, "mark_source_revision", _identifier(self.mark_source_revision, "mark_source_revision"))
+        _digest(self.mark_source_record_sha256, "mark_source_record_sha256")
+        _digest(self.position_source_record_sha256, "position_source_record_sha256")
+        if quote_currency != self.metadata.valuation_unit:
+            if (
+                type(self.fx_rate) is not InstrumentRiskFxRate
+                or self.fx_rate.instrument != self.instrument
+                or self.fx_rate.quote_currency != quote_currency
+                or self.fx_rate.valuation_unit != self.metadata.valuation_unit
+                or self.fx_rate.source_ref != self.metadata.fx_source_ref
+            ):
+                raise ValueError("cross-currency position lacks matching source-bound FX")
+        elif self.fx_rate is not None:
+            raise ValueError("same-currency position cannot carry an unrelated FX fact")
+        if self.greeks is not None and (
+            type(self.greeks) is not InstrumentRiskGreeks
+            or self.greeks.instrument != self.instrument
+            or self.metadata.underlying_ref is None
+            or self.greeks.underlying_ref != self.metadata.underlying_ref
+        ):
+            raise ValueError("position Greeks do not match trusted instrument metadata")
+
+    def to_payload(self) -> dict[str, object]:
+        return {
+            "fx_rate": None if self.fx_rate is None else self.fx_rate.to_payload(),
+            "greeks": None if self.greeks is None else self.greeks.to_payload(),
+            "instrument": self.instrument,
+            "mark_observed_at_ns": self.mark_observed_at_ns,
+            "mark_price": _decimal_text(self.mark_price),
+            "mark_source_record_sha256": self.mark_source_record_sha256,
+            "mark_source_ref": self.mark_source_ref,
+            "mark_source_revision": self.mark_source_revision,
+            "mark_valid_until_ns": self.mark_valid_until_ns,
+            "metadata": self.metadata.to_payload(),
+            "position_id": self.position_id,
+            "position_side": self.position_side,
+            "position_source_record_sha256": self.position_source_record_sha256,
+            "quantity": _decimal_text(self.quantity),
+            "quantity_unit": self.quantity_unit,
+            "schema": "bt_api_risk.account-position-risk-fact.v1",
+            "strategy_id": self.strategy_id,
+        }
+
+    def exposure_dimensions(
+        self,
+        limits: tuple[RiskExposureLimit, ...],
+        *,
+        now_ns: int,
+        max_age_ns: int,
+    ) -> tuple[Decimal, tuple[RiskExposureDimension, ...]]:
+        """Revalue this position from source facts and project policy dimensions."""
+
+        if type(now_ns) is not int or now_ns <= 0:
+            raise ValueError("invalid position valuation time")
+        if type(max_age_ns) is not int or max_age_ns <= 0:
+            raise ValueError("invalid position freshness bound")
+        metadata = self.metadata
+        observed_at_ns = min(metadata.as_of_ns, self.mark_observed_at_ns)
+        valid_until_ns = min(metadata.expires_at_ns, self.mark_valid_until_ns)
+        fx_multiplier = Decimal(1)
+        if self.fx_rate is not None:
+            observed_at_ns = min(observed_at_ns, self.fx_rate.observed_at_ns)
+            valid_until_ns = min(valid_until_ns, self.fx_rate.valid_until_ns)
+            fx_multiplier = self.fx_rate.rate
+        source_intervals = [
+            (metadata.as_of_ns, metadata.expires_at_ns),
+            (self.mark_observed_at_ns, self.mark_valid_until_ns),
+        ]
+        if self.fx_rate is not None:
+            source_intervals.append(
+                (self.fx_rate.observed_at_ns, self.fx_rate.valid_until_ns)
+            )
+        if any(
+            source_observed_at_ns > now_ns
+            or now_ns >= source_valid_until_ns
+            or now_ns - source_observed_at_ns > max_age_ns
+            for source_observed_at_ns, source_valid_until_ns in source_intervals
+        ):
+            raise ValueError("position mark, metadata, or FX facts are stale")
+        with localcontext() as context:
+            context.prec = _precision(
+                self.quantity,
+                metadata.contract_multiplier,
+                self.mark_price,
+                fx_multiplier,
+            )
+            gross_notional = (
+                self.quantity * metadata.contract_multiplier * self.mark_price * fx_multiplier
+            )
+        if not gross_notional.is_finite() or gross_notional <= 0:
+            raise ValueError("position revaluation is invalid")
+        if not limits:
+            return gross_notional, ()
+
+        if type(limits) is not tuple or any(type(item) is not RiskExposureLimit for item in limits):
+            raise ValueError("limits must be an immutable tuple of typed dimensions")
+        required_kinds = {item.kind for item in limits}
+        greek_kinds = {
+            RiskExposureKind.DELTA,
+            RiskExposureKind.GAMMA,
+            RiskExposureKind.VEGA,
+        }
+        greeks = self.greeks
+        if (
+            RiskExposureKind.UNDERLYING_NOTIONAL in required_kinds
+            and self.metadata.underlying_ref is None
+        ):
+            raise ValueError("position metadata lacks an underlying reference")
+        matched_greek_limits = tuple(
+            limit
+            for limit in limits
+            if limit.kind in greek_kinds
+            and limit.dimension_key == self.metadata.underlying_ref
+        )
+        if matched_greek_limits:
+            if greeks is None:
+                raise ValueError("current position has no source-bound Greeks")
+            if not (
+                greeks.observed_at_ns <= now_ns < greeks.valid_until_ns
+                and now_ns - greeks.observed_at_ns <= max_age_ns
+            ):
+                raise ValueError("position Greeks are stale")
+            observed_at_ns = min(observed_at_ns, greeks.observed_at_ns)
+            valid_until_ns = min(valid_until_ns, greeks.valid_until_ns)
+        if not observed_at_ns <= now_ns < valid_until_ns:
+            raise ValueError("position exposure facts are not jointly current")
+
+        source_sha256 = _sha256(
+            _canonical_json(
+                {
+                    "position_fact": self.to_payload(),
+                    "schema": "bt_api_risk.account-position-exposure-source.v1",
+                }
+            )
+        )
+        side_sign = Decimal(1) if self.position_side == "LONG" else Decimal(-1)
+        greek_values = {
+            RiskExposureKind.DELTA: (
+                None if greeks is None else greeks.delta_per_contract,
+                None if greeks is None else greeks.delta_unit,
+            ),
+            RiskExposureKind.GAMMA: (
+                None if greeks is None else greeks.gamma_per_contract,
+                None if greeks is None else greeks.gamma_unit,
+            ),
+            RiskExposureKind.VEGA: (
+                None if greeks is None else greeks.vega_per_contract,
+                None if greeks is None else greeks.vega_unit,
+            ),
+        }
+        dimensions: list[RiskExposureDimension] = []
+        for kind in sorted(required_kinds, key=lambda item: item.value):
+            if kind is RiskExposureKind.CONTRACT_NOTIONAL:
+                dimension_key = metadata.instrument
+                unit = metadata.valuation_unit
+                exposure = gross_notional
+            elif kind is RiskExposureKind.UNDERLYING_NOTIONAL:
+                dimension_key = metadata.underlying_ref
+                unit = metadata.valuation_unit
+                exposure = gross_notional
+                if dimension_key is None:
+                    raise ValueError("position metadata lacks an underlying reference")
+            else:
+                if metadata.underlying_ref is None:
+                    raise ValueError("position Greeks lack an underlying reference")
+                matching_limits = tuple(
+                    limit
+                    for limit in limits
+                    if limit.kind is kind
+                    and limit.dimension_key == metadata.underlying_ref
+                )
+                if not matching_limits:
+                    continue
+                if greeks is None:
+                    raise ValueError("current position has no source-bound Greeks")
+                dimension_key = metadata.underlying_ref
+                greek_value, unit = greek_values[kind]
+                if greek_value is None or unit is None:
+                    raise ValueError("position Greeks omit a configured dimension")
+                with localcontext() as context:
+                    context.prec = _precision(
+                        self.quantity, metadata.contract_multiplier, greek_value
+                    )
+                    exposure = self.quantity * metadata.contract_multiplier * greek_value * side_sign
+            if dimension_key is None or unit is None:
+                raise ValueError("position facts lack a configured dimension key or unit")
+            matching_limits = tuple(
+                limit
+                for limit in limits
+                if limit.kind is kind and limit.dimension_key == dimension_key
+            )
+            if not matching_limits:
+                continue
+            if len(matching_limits) != 1 or matching_limits[0].unit != unit:
+                raise ValueError("position facts do not match one exact configured dimension limit")
+            dimensions.append(
+                RiskExposureDimension(
+                    kind=kind,
+                    dimension_key=dimension_key,
+                    unit=unit,
+                    exposure=exposure,
+                    source_sha256=source_sha256,
+                    observed_at_ns=observed_at_ns,
+                    valid_until_ns=valid_until_ns,
+                )
+            )
+        return gross_notional, tuple(dimensions)
+
+
+@dataclass(frozen=True)
 class InstrumentRiskOrder:
     """The instrument-relevant subset of one immutable execution request."""
 
