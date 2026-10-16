@@ -306,9 +306,11 @@ def _validate_account_wire_scope(scope: WireScope, account_ref: str) -> None:
         or scope.account_refs != ()
         or scope.strategy_ref is not None
         or scope.run_id is not None
-        or scope.manual_book_ref is not None
         or scope.group_id is not None
         or scope.leg_id is not None
+        or (
+            scope.manual_book_ref is not None and scope.portfolio_ref is not None
+        )
     ):
         raise PolicyAdmissionResolutionError("ACCOUNT_POLICY_SCOPE_REQUIRED")
 
