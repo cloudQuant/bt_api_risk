@@ -4,11 +4,10 @@ This module is the serving adapter for the fixed ``portfolio_analytics`` role.
 It owns exactly the ``service.risk_analysis`` operations
 (``analysis.submit``, ``analysis.query``, ``analysis.cancel``,
 ``analysis.input_upload``) and is deliberately not an order, account, or
-provider interface: inputs are offline ``research``/``imported``/``paper``
-fact payloads validated against the same strict contract as
-:mod:`bt_api_risk.portfolio_analytics`, and computation reuses that package's
-deterministic cash+spot snapshot primitive. No optional analytics or ML
-dependency (``numpy``/``sklearn`` and friends) is imported here.
+provider interface: V1 inputs use :mod:`bt_api_risk.portfolio_analytics`; V2
+inputs carry explicit offline spot, NAV, loss, and scenario datasets for the
+accepted deterministic metrics. No optional analytics or ML dependency
+(``numpy``/``sklearn`` and friends) is imported here.
 
 Execution model (minimal vertical slice)
 ----------------------------------------
@@ -55,6 +54,13 @@ from bt_api_risk.portfolio_analytics import (
     SpotPositionV1,
     _canonical_json,
     _facts_payload,
+)
+from bt_api_risk.portfolio_analytics_v2 import (
+    PortfolioAnalyticsFactsV2,
+    PortfolioAnalyticsRequestV2,
+    PortfolioAnalyticsServiceV2,
+    parse_facts_v2,
+    parse_request_v2,
 )
 from bt_api_risk.service_component import _valid_wire_text
 
@@ -387,19 +393,25 @@ def _parse_fx_observation(value: object) -> FxObservationV1:
     )
 
 
-def _parse_facts_payload(value: object) -> PortfolioAnalyticsFactsV1:
+def _parse_facts_payload(
+    value: object,
+) -> PortfolioAnalyticsFactsV1 | PortfolioAnalyticsFactsV2:
     """Strictly reconstruct one facts cut from its canonical wire payload.
 
-    The accepted shape is exactly the ``PortfolioAnalyticsFactsV1`` projection
-    produced by :func:`bt_api_risk.portfolio_analytics._facts_payload`. Every
-    object key set, container kind, and strictly typed leaf is re-validated by
-    the primitive's own dataclasses; any deviation is a single finite
+    V1 retains the existing facts projection. V2 dispatches to its own exact
+    codec. Every object key set, container kind, and strictly typed leaf is
+    re-validated by the schema's dataclasses; deviations map to one finite
     ``INVALID_INPUT`` code.
     """
 
     try:
-        obj = _exact_object(_plain(value), _FACTS_KEYS)
-        if type(obj["version"]) is not int or obj["version"] != 1:
+        plain = _plain(value)
+        if type(plain) is not dict or type(plain.get("version")) is not int:
+            _invalid_input()
+        if plain["version"] == 2:
+            return parse_facts_v2(plain)
+        obj = _exact_object(plain, _FACTS_KEYS)
+        if obj["version"] != 1:
             _invalid_input()
         return PortfolioAnalyticsFactsV1(
             portfolio_ref=obj["portfolio_ref"],
@@ -428,12 +440,19 @@ def _parse_facts_payload(value: object) -> PortfolioAnalyticsFactsV1:
         _invalid_input()
 
 
-def _parse_request_payload(value: object) -> PortfolioAnalyticsRequestV1:
+def _parse_request_payload(
+    value: object,
+) -> PortfolioAnalyticsRequestV1 | PortfolioAnalyticsRequestV2:
     """Strictly reconstruct one analysis request from its canonical payload."""
 
     try:
-        obj = _exact_object(_plain(value), _REQUEST_KEYS)
-        if type(obj["version"]) is not int or obj["version"] != 1:
+        plain = _plain(value)
+        if type(plain) is not dict or type(plain.get("version")) is not int:
+            _invalid_input()
+        if plain["version"] == 2:
+            return parse_request_v2(plain)
+        obj = _exact_object(plain, _REQUEST_KEYS)
+        if obj["version"] != 1:
             _invalid_input()
         return PortfolioAnalyticsRequestV1(
             portfolio_ref=obj["portfolio_ref"],
@@ -611,20 +630,24 @@ class AnalysisTaskStore:
         self,
         input_snapshot_id: str,
         *,
-        facts: PortfolioAnalyticsFactsV1,
+        facts: PortfolioAnalyticsFactsV1 | PortfolioAnalyticsFactsV2,
         scope_json: str,
     ) -> Mapping[str, object]:
         """Persist one immutable, validated offline fact cut for a scope."""
 
         input_snapshot_id = _task_reference(input_snapshot_id)
-        if type(facts) is not PortfolioAnalyticsFactsV1:
+        if type(facts) is PortfolioAnalyticsFactsV1:
+            facts_payload = _facts_payload(facts)
+        elif type(facts) is PortfolioAnalyticsFactsV2:
+            facts_payload = facts.to_payload()
+        else:
             raise AnalysisTaskError("INVALID_INPUT")
         if facts.source_mode not in self._allowed_source_modes:
             # Offline research/imported/paper inputs only: the role setting
             # decides which of those modes are acceptable, and anything else
             # (including any live or account-bound feed) is rejected.
             raise AnalysisTaskError("SOURCE_MODE_NOT_ALLOWED")
-        payload_json = _canonical_json(_facts_payload(facts)).decode("ascii")
+        payload_json = _canonical_json(facts_payload).decode("ascii")
         if len(payload_json.encode("ascii")) > self._model_profile.max_input_bytes:
             raise AnalysisTaskError("INPUT_LIMIT_EXCEEDED")
         digest = hashlib.sha256(payload_json.encode("ascii")).hexdigest()
@@ -655,7 +678,7 @@ class AnalysisTaskStore:
         task_ref: str,
         input_snapshot_id: str,
         *,
-        request: PortfolioAnalyticsRequestV1,
+        request: PortfolioAnalyticsRequestV1 | PortfolioAnalyticsRequestV2,
         scope_json: str,
         principal_ref: str,
     ) -> Mapping[str, object]:
@@ -668,12 +691,8 @@ class AnalysisTaskStore:
 
         task_ref = _task_reference(task_ref)
         input_snapshot_id = _task_reference(input_snapshot_id)
-        if type(request) is not PortfolioAnalyticsRequestV1:
-            raise AnalysisTaskError("INVALID_REQUEST")
-        if not _valid_wire_text(principal_ref):
-            raise AnalysisTaskError("INVALID_REQUEST")
-        request_json = _canonical_json(
-            {
+        if type(request) is PortfolioAnalyticsRequestV1:
+            request_payload: dict[str, object] = {
                 "membership_version": request.membership_version,
                 "period_end_date_utc": request.period_end_date_utc.isoformat(),
                 "period_start_date_utc": request.period_start_date_utc.isoformat(),
@@ -681,7 +700,13 @@ class AnalysisTaskStore:
                 "reporting_currency": request.reporting_currency,
                 "version": 1,
             }
-        ).decode("ascii")
+        elif type(request) is PortfolioAnalyticsRequestV2:
+            request_payload = request.to_payload()
+        else:
+            raise AnalysisTaskError("INVALID_REQUEST")
+        if not _valid_wire_text(principal_ref):
+            raise AnalysisTaskError("INVALID_REQUEST")
+        request_json = _canonical_json(request_payload).decode("ascii")
         now_ns = self.now_ns()
         with self._db:
             row = self._db.execute(
@@ -1045,23 +1070,54 @@ class PortfolioAnalyticsTaskService:
                 raise AnalysisTaskError("INPUT_DIGEST_MISMATCH")
             facts = _parse_facts_payload(json.loads(stored["facts_json"]))
             request = _parse_request_payload(json.loads(task["request_json"]))
-            service = PortfolioAnalyticsService(
-                _StoredFactsSource(facts),
-                self._store.model_profile,
-                allowed_source_modes=self._store.allowed_source_modes,
-            )
-            report = service.analyze_snapshot_v1(
-                request, principal_ref=task["owner_principal"]
-            )
-            result_json = _canonical_json(report.to_payload()).decode("ascii")
-            if report.status == "AVAILABLE":
-                state = "succeeded"
-                detail_code = None
-            else:
-                state = "unavailable"
-                detail_code = (
+            if (
+                type(facts) is PortfolioAnalyticsFactsV1
+                and type(request) is PortfolioAnalyticsRequestV1
+            ):
+                service = PortfolioAnalyticsService(
+                    _StoredFactsSource(facts),
+                    self._store.model_profile,
+                    allowed_source_modes=self._store.allowed_source_modes,
+                )
+                report = service.analyze_snapshot_v1(
+                    request, principal_ref=task["owner_principal"]
+                )
+                report_payload = report.to_payload()
+                report_status = report.status
+                unavailable_code = (
                     report.reason_codes[0] if report.reason_codes else "UNAVAILABLE"
                 )
+            elif (
+                type(facts) is PortfolioAnalyticsFactsV2
+                and type(request) is PortfolioAnalyticsRequestV2
+            ):
+                report = PortfolioAnalyticsServiceV2().analyze_snapshot_v2(
+                    facts,
+                    request,
+                    input_sha256=stored["input_sha256"],
+                )
+                report_payload = report.to_payload()
+                report_status = report.status
+                unavailable_code = next(
+                    (
+                        item.reason_code
+                        for item in (
+                            report.spot_exposure,
+                            report.max_drawdown,
+                            report.historical_var_es,
+                            report.stress_scenario,
+                        )
+                        if item.status == "unavailable"
+                    ),
+                    "UNAVAILABLE",
+                )
+            else:
+                raise AnalysisTaskError("SCHEMA_VERSION_MISMATCH")
+            result_json = _canonical_json(report_payload).decode("ascii")
+            if report_status == "AVAILABLE":
+                state, detail_code = "succeeded", None
+            else:
+                state, detail_code = "unavailable", unavailable_code
         except AnalysisTaskError as error:
             state, detail_code, result_json = "failed", error.code, None
         except PortfolioAnalyticsError as error:
