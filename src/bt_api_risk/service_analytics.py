@@ -14,13 +14,13 @@ Execution model
 ``AnalysisTaskStore`` is durable (SQLite) and shared by exactly one
 ``PortfolioAnalyticsTaskService``. The host drives ``maintain`` on its owner
 thread; each invocation sweeps expired pending tasks and advances at most one
-new task claim per elapsed second of the injected store clock. V1 calculation
-retains its synchronous one-transition-per-tick behavior. V2 is dispatched to
-a bounded spawned process and polled asynchronously. ``max_concurrent_tasks``
+new task claim per elapsed second of the injected store clock. V1 and V2 are
+dispatched to bounded spawned processes and polled asynchronously.
+``max_concurrent_tasks``
 limits non-terminal submissions per scope; ``max_concurrent_workers`` is a
-separate host-wide cap on active V2 child processes. Its monotonic execution
+separate host-wide cap on active child processes. A monotonic execution
 deadline starts only when the child enters its worker function, after any queue
-delay. A cancelled, timed out, or shutting-down V2 worker is not made terminal
+delay. A cancelled, timed out, or shutting-down worker is not made terminal
 until its process has been reaped and its pipes closed. ``running`` rows found
 when the store is opened are failed closed as ``TASK_INTERRUPTED`` instead of
 being silently re-executed.
@@ -63,6 +63,7 @@ from bt_api_risk.portfolio_analytics import (
     SpotPositionV1,
     _canonical_json,
     _facts_payload,
+    _request_payload,
 )
 from bt_api_risk.portfolio_analytics_v2 import (
     PortfolioAnalyticsFactsV2,
@@ -1065,9 +1066,35 @@ class _StoredFactsSource:
         return self._facts
 
 
+def _v1_report_input_sha256(
+    facts: PortfolioAnalyticsFactsV1,
+    request: PortfolioAnalyticsRequestV1,
+    *,
+    principal_ref: str,
+    model_profile: PortfolioAnalyticsModelProfileV1,
+    allowed_source_modes: tuple[str, ...],
+) -> str:
+    """Bind the V1 report digest to every trusted analysis input."""
+
+    service = PortfolioAnalyticsService(
+        _StoredFactsSource(facts),
+        model_profile,
+        allowed_source_modes=allowed_source_modes,
+    )
+    canonical_input = _canonical_json(
+        {
+            "facts": _facts_payload(facts),
+            "model_profile": service._profile_payload(),
+            "principal_ref": principal_ref,
+            "request": _request_payload(request),
+        }
+    )
+    return hashlib.sha256(canonical_input).hexdigest()
+
+
 @dataclass(slots=True)
 class _TaskWorker:
-    """One host-owned V2 worker and its bounded control/result channel."""
+    """One host-owned analytics worker and its bounded control/result channel."""
 
     scope_json: str
     task_ref: str
@@ -1087,16 +1114,21 @@ class _TaskWorker:
     exit_code: int | None = None
     process_closed: bool = False
     cleanup_complete: bool = False
+    report_input_sha256: str | None = None
+    period_too_long: bool = False
 
 
-def _portfolio_analytics_v2_worker_entry(
+def _portfolio_analytics_worker_entry(
     facts_json: str,
     request_json: str,
     input_sha256: str,
     running_token: str,
     send_connection: object,
+    model_profile_json: str,
+    allowed_source_modes_json: str,
+    principal_ref: str,
 ) -> None:
-    """Compute one V2 task from immutable strings; this process never writes DB."""
+    """Compute one V1/V2 task from immutable strings; this process never writes DB."""
 
     connection = send_connection
     try:
@@ -1116,38 +1148,67 @@ def _portfolio_analytics_v2_worker_entry(
         try:
             facts = _parse_facts_payload(json.loads(facts_json))
             request = _parse_request_payload(json.loads(request_json))
-            if (
-                type(facts) is not PortfolioAnalyticsFactsV2
-                or type(request) is not PortfolioAnalyticsRequestV2
-            ):
+            if type(facts) is PortfolioAnalyticsFactsV1 and type(request) is PortfolioAnalyticsRequestV1:
+                profile_payload = json.loads(model_profile_json)
+                modes_payload = json.loads(allowed_source_modes_json)
+                if (
+                    type(profile_payload) is not dict
+                    or set(profile_payload)
+                    != {
+                        "max_fx_age_ns",
+                        "max_input_bytes",
+                        "max_mark_age_ns",
+                        "max_period_days",
+                        "model_profile_ref",
+                    }
+                    or type(modes_payload) is not list
+                    or not modes_payload
+                    or any(type(mode) is not str for mode in modes_payload)
+                    or not _valid_wire_text(principal_ref)
+                ):
+                    raise AnalysisTaskError("SCHEMA_VERSION_MISMATCH")
+                profile = PortfolioAnalyticsModelProfileV1(**profile_payload)
+                report = PortfolioAnalyticsService(
+                    _StoredFactsSource(facts),
+                    profile,
+                    allowed_source_modes=tuple(modes_payload),
+                ).analyze_snapshot_v1(request, principal_ref=principal_ref)
+                payload = report.to_payload()
+                if report.status == "AVAILABLE":
+                    state, detail_code = "succeeded", None
+                else:
+                    state = "unavailable"
+                    detail_code = report.reason_codes[0] if report.reason_codes else "UNAVAILABLE"
+            elif type(facts) is PortfolioAnalyticsFactsV2 and type(request) is PortfolioAnalyticsRequestV2:
+                report = PortfolioAnalyticsServiceV2().analyze_snapshot_v2(
+                    facts,
+                    request,
+                    input_sha256=input_sha256,
+                )
+                payload = report.to_payload()
+                if report.status == "AVAILABLE":
+                    state, detail_code = "succeeded", None
+                else:
+                    state = "unavailable"
+                    detail_code = next(
+                        (
+                            item.reason_code
+                            for item in (
+                                report.spot_exposure,
+                                report.max_drawdown,
+                                report.historical_var_es,
+                                report.stress_scenario,
+                            )
+                            if item.status == "unavailable"
+                        ),
+                        "UNAVAILABLE",
+                    )
+            else:
                 raise AnalysisTaskError("SCHEMA_VERSION_MISMATCH")
-            report = PortfolioAnalyticsServiceV2().analyze_snapshot_v2(
-                facts,
-                request,
-                input_sha256=input_sha256,
-            )
-            payload = report.to_payload()
             encoded_result = _canonical_json(payload)
             if len(encoded_result) > _MAX_WORKER_FRAME_BYTES // 2:
                 raise AnalysisTaskError("TASK_RESULT_TOO_LARGE")
             result_json = encoded_result.decode("ascii")
-            if report.status == "AVAILABLE":
-                state, detail_code = "succeeded", None
-            else:
-                state = "unavailable"
-                detail_code = next(
-                    (
-                        item.reason_code
-                        for item in (
-                            report.spot_exposure,
-                            report.max_drawdown,
-                            report.historical_var_es,
-                            report.stress_scenario,
-                        )
-                        if item.status == "unavailable"
-                    ),
-                    "UNAVAILABLE",
-                )
         except AnalysisTaskError as error:
             state, detail_code, result_json = "failed", error.code, None
         except PortfolioAnalyticsError as error:
@@ -1346,14 +1407,14 @@ class PortfolioAnalyticsTaskService:
                             break
                         key = (task["scope_json"], task["task_ref"])
                         request_version = self._request_version(task["request_json"])
-                        if task["state"] == "running" and request_version == 2:
+                        if task["state"] == "running" and request_version in {1, 2}:
                             # No child may be silently reconstructed for a
-                            # running V2 token whose owner record is absent.
+                            # running token whose owner record is absent.
                             excluded.add(key)
                             continue
                         if (
                             task["state"] == "pending"
-                            and request_version == 2
+                            and request_version in {1, 2}
                             and len(self._workers) >= self._store.max_concurrent_workers
                         ):
                             # The per-scope submission quota continues to
@@ -1385,70 +1446,26 @@ class PortfolioAnalyticsTaskService:
                 scope_json, task_ref, now_ns, running_token=running_token
             )
             task = {**task, "running_token": running_token, "state": "running"}
-            if self._request_version(task["request_json"]) == 2:
-                self._start_v2_worker(task)
+            if self._request_version(task["request_json"]) in {1, 2}:
+                self._start_worker(task)
+            else:
+                self._store.finish_task(
+                    scope_json,
+                    task_ref,
+                    state="failed",
+                    detail_code="SCHEMA_VERSION_MISMATCH",
+                    result_json=None,
+                    now_ns=now_ns,
+                    running_token=running_token,
+                )
             return True
 
-        if self._request_version(task["request_json"]) == 2:
-            # A V2 task that is running without a retained worker is never
+        if self._request_version(task["request_json"]) in {1, 2}:
+            # A task that is running without a retained worker is never
             # restarted or assigned a new generation. Leave its token-bound
             # durable row untouched so cleanup uncertainty remains visible.
             return False
-
-        state = "failed"
-        detail_code: str | None = "TASK_EXECUTION_FAILED"
-        result_json: str | None = None
-        try:
-            stored = self._store.load_input(scope_json, task["input_snapshot_id"])
-            if stored["input_sha256"] != task["input_sha256"]:
-                raise AnalysisTaskError("INPUT_DIGEST_MISMATCH")
-            facts = _parse_facts_payload(json.loads(stored["facts_json"]))
-            request = _parse_request_payload(json.loads(task["request_json"]))
-            if (
-                type(facts) is PortfolioAnalyticsFactsV1
-                and type(request) is PortfolioAnalyticsRequestV1
-            ):
-                service = PortfolioAnalyticsService(
-                    _StoredFactsSource(facts),
-                    self._store.model_profile,
-                    allowed_source_modes=self._store.allowed_source_modes,
-                )
-                report = service.analyze_snapshot_v1(
-                    request, principal_ref=task["owner_principal"]
-                )
-                report_payload = report.to_payload()
-                report_status = report.status
-                unavailable_code = (
-                    report.reason_codes[0] if report.reason_codes else "UNAVAILABLE"
-                )
-            elif (
-                type(facts) is PortfolioAnalyticsFactsV2
-                and type(request) is PortfolioAnalyticsRequestV2
-            ):
-                raise AnalysisTaskError("TASK_WORKER_STATE_UNCERTAIN")
-            else:
-                raise AnalysisTaskError("SCHEMA_VERSION_MISMATCH")
-            result_json = _canonical_json(report_payload).decode("ascii")
-            if report_status == "AVAILABLE":
-                state, detail_code = "succeeded", None
-            else:
-                state, detail_code = "unavailable", unavailable_code
-        except AnalysisTaskError as error:
-            state, detail_code, result_json = "failed", error.code, None
-        except PortfolioAnalyticsError as error:
-            state, detail_code, result_json = "failed", error.code, None
-        except Exception:
-            state, detail_code, result_json = "failed", "TASK_EXECUTION_FAILED", None
-        self._store.finish_task(
-            scope_json,
-            task_ref,
-            state=state,
-            detail_code=detail_code,
-            result_json=result_json,
-            now_ns=now_ns,
-            running_token=task["running_token"],
-        )
-        return True
+        return False
 
     @staticmethod
     def _request_version(request_json: object) -> int | None:
@@ -1462,12 +1479,14 @@ class PortfolioAnalyticsTaskService:
             return None
         return value["version"]
 
-    def _start_v2_worker(self, task: Mapping[str, object]) -> None:
+    def _start_worker(self, task: Mapping[str, object]) -> None:
         scope_json = task["scope_json"]
         task_ref = task["task_ref"]
         running_token = task["running_token"]
         state = "failed"
         detail_code = "TASK_EXECUTION_FAILED"
+        report_input_sha256: str | None = None
+        period_too_long = False
         try:
             stored = self._store.load_input(scope_json, task["input_snapshot_id"])
             if stored["input_sha256"] != task["input_sha256"]:
@@ -1476,8 +1495,25 @@ class PortfolioAnalyticsTaskService:
             if type(facts_json) is not str:
                 raise AnalysisTaskError("INVALID_INPUT")
             request = _parse_request_payload(json.loads(task["request_json"]))
-            if type(request) is not PortfolioAnalyticsRequestV2:
+            facts = _parse_facts_payload(json.loads(facts_json))
+            if type(request) is PortfolioAnalyticsRequestV1 and type(facts) is not PortfolioAnalyticsFactsV1:
                 raise AnalysisTaskError("SCHEMA_VERSION_MISMATCH")
+            if type(request) is PortfolioAnalyticsRequestV2 and type(facts) is not PortfolioAnalyticsFactsV2:
+                raise AnalysisTaskError("SCHEMA_VERSION_MISMATCH")
+            if type(request) not in (PortfolioAnalyticsRequestV1, PortfolioAnalyticsRequestV2):
+                raise AnalysisTaskError("SCHEMA_VERSION_MISMATCH")
+            if type(request) is PortfolioAnalyticsRequestV1:
+                period_too_long = (
+                    request.period_end_date_utc - request.period_start_date_utc
+                ).days > self._store.model_profile.max_period_days
+                if not period_too_long:
+                    report_input_sha256 = _v1_report_input_sha256(
+                        facts,
+                        request,
+                        principal_ref=task["owner_principal"],
+                        model_profile=self._store.model_profile,
+                        allowed_source_modes=self._store.allowed_source_modes,
+                    )
         except AnalysisTaskError as error:
             detail_code = error.code
             self._store.finish_task(
@@ -1535,6 +1571,8 @@ class PortfolioAnalyticsTaskService:
             task_ref=task_ref,
             running_token=running_token,
             input_sha256=stored["input_sha256"],
+            report_input_sha256=report_input_sha256,
+            period_too_long=period_too_long,
             process=None,
             receive_connection=receive_connection,
             child_connection=child_connection,
@@ -1545,13 +1583,24 @@ class PortfolioAnalyticsTaskService:
         self._workers[key] = worker
         try:
             process = context.Process(
-                target=_portfolio_analytics_v2_worker_entry,
+                target=_portfolio_analytics_worker_entry,
                 args=(
                     facts_json,
                     task["request_json"],
                     stored["input_sha256"],
                     running_token,
                     child_connection,
+                    _canonical_json(
+                        {
+                            "max_fx_age_ns": self._store.model_profile.max_fx_age_ns,
+                            "max_input_bytes": self._store.model_profile.max_input_bytes,
+                            "max_mark_age_ns": self._store.model_profile.max_mark_age_ns,
+                            "max_period_days": self._store.model_profile.max_period_days,
+                            "model_profile_ref": self._store.model_profile.model_profile_ref,
+                        }
+                    ).decode("ascii"),
+                    _canonical_json(list(self._store.allowed_source_modes)).decode("ascii"),
+                    task["owner_principal"],
                 ),
             )
             worker.process = process
@@ -1765,6 +1814,164 @@ class PortfolioAnalyticsTaskService:
             raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID") from None
         if canonical_report != encoded:
             raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
+        request_json = self._store_request_json(worker.scope_json, worker.task_ref)
+        try:
+            request = _parse_request_payload(json.loads(request_json))
+        except (AnalysisTaskError, PortfolioAnalyticsError):
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID") from None
+        if type(request) is PortfolioAnalyticsRequestV1:
+            expected_keys = {
+                "beginning",
+                "calculation_ref",
+                "decimal_policy",
+                "ending",
+                "external_cashflow_net",
+                "facts_snapshot_ref",
+                "flow_source",
+                "flow_weight_policy",
+                "fx_policy",
+                "input_sha256",
+                "membership",
+                "model_profile_ref",
+                "portfolio_ref",
+                "reason_codes",
+                "reporting_currency",
+                "return_method",
+                "return_ratio",
+                "source",
+                "status",
+                "version",
+            }
+            beginning = report.get("beginning")
+            ending = report.get("ending")
+            membership = report.get("membership")
+            flow_source = report.get("flow_source")
+            source = report.get("source")
+            reason_codes = report.get("reason_codes")
+            report_input_sha256 = report.get("input_sha256")
+            if (
+                type(beginning) is not dict
+                or type(ending) is not dict
+                or type(membership) is not dict
+                or type(flow_source) is not dict
+                or type(source) is not dict
+                or type(reason_codes) is not list
+                or any(type(item) is not str for item in reason_codes)
+            ):
+                raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
+            early_period_unavailable = worker.period_too_long
+            if early_period_unavailable:
+                report_input_valid = (
+                    state == "unavailable"
+                    and detail_code == "PERIOD_TOO_LONG"
+                    and reason_codes == ["PERIOD_TOO_LONG"]
+                    and report_input_sha256 is None
+                    and membership.get("content_sha256") is None
+                    and flow_source
+                    == {
+                        "end_cursor": None,
+                        "source_ref": None,
+                        "source_version": None,
+                        "start_cursor": None,
+                    }
+                    and source
+                    == {
+                        "generation": None,
+                        "mode": None,
+                        "source_ref": None,
+                        "source_version": None,
+                    }
+                    and report.get("facts_snapshot_ref") is None
+                    and all(
+                        beginning.get(name) is None
+                        for name in ("as_of_ns", "nav", "snapshot_ref", "source_cursor")
+                    )
+                    and all(
+                        ending.get(name) is None
+                        for name in ("as_of_ns", "nav", "snapshot_ref", "source_cursor")
+                    )
+                    and beginning.get("native_values") == []
+                    and ending.get("native_values") == []
+                    and report.get("external_cashflow_net") is None
+                    and report.get("return_ratio") is None
+                )
+            else:
+                report_input_valid = (
+                    type(report_input_sha256) is str
+                    and re.fullmatch(r"[0-9a-f]{64}", report_input_sha256) is not None
+                    and report_input_sha256 == worker.report_input_sha256
+                    and (
+                        (state == "succeeded" and reason_codes == [] and detail_code is None)
+                        or (
+                            state == "unavailable"
+                            and bool(reason_codes)
+                            and reason_codes == sorted(set(reason_codes))
+                            and detail_code == reason_codes[0]
+                        )
+                    )
+                    and type(membership.get("content_sha256")) is str
+                    and re.fullmatch(
+                        r"[0-9a-f]{64}", membership.get("content_sha256", "")
+                    )
+                    is not None
+                    and all(
+                        type(flow_source.get(name)) is str
+                        for name in ("end_cursor", "source_ref", "source_version", "start_cursor")
+                    )
+                    and all(
+                        type(source.get(name)) is str
+                        for name in ("generation", "mode", "source_ref", "source_version")
+                    )
+                    and report.get("facts_snapshot_ref") is not None
+                )
+            valid_v1_shape = (
+                type(beginning) is dict
+                and set(beginning)
+                == {"as_of_ns", "date_utc", "nav", "native_values", "snapshot_ref", "source_cursor"}
+                and type(ending) is dict
+                and set(ending)
+                == {"as_of_ns", "date_utc", "nav", "native_values", "snapshot_ref", "source_cursor"}
+                and type(membership) is dict
+                and set(membership) == {"content_sha256", "version"}
+                and type(flow_source) is dict
+                and set(flow_source) == {"end_cursor", "source_ref", "source_version", "start_cursor"}
+                and type(source) is dict
+                and set(source) == {"generation", "mode", "source_ref", "source_version"}
+                and type(report.get("reason_codes")) is list
+                and all(type(item) is str for item in report["reason_codes"])
+                and type(report.get("version")) is int
+                and report.get("version") == 1
+                and report_input_valid
+                and report.get("calculation_ref") == "spot_nav_modified_dietz_v1"
+                and report.get("decimal_policy")
+                == (
+                    "PRECISION_50_EMIN_NEG999999_EMAX_999999_HALF_EVEN_TRAPS_INVALID_"
+                    "DIVISION_OVERFLOW_QUANTIZE_18_CANONICAL_STRING_V1"
+                )
+                and report.get("flow_weight_policy") == "UTC_CALENDAR_DAY_END_V1"
+                and report.get("fx_policy") == "IDENTITY_OR_DIRECT_BASE_TO_REPORTING_V1"
+                and report.get("model_profile_ref") == self._store.model_profile_ref
+                and report.get("status")
+                == ("AVAILABLE" if state == "succeeded" else "UNAVAILABLE")
+                and report.get("portfolio_ref") == request.portfolio_ref
+                and report.get("reporting_currency") == request.reporting_currency
+                and report.get("return_method") == "MODIFIED_DIETZ_ESTIMATE_V1"
+                and beginning.get("date_utc") == request.period_start_date_utc.isoformat()
+                and ending.get("date_utc") == request.period_end_date_utc.isoformat()
+                and type(membership.get("version")) is int
+                and membership.get("version") == request.membership_version
+                and (
+                    source.get("mode") in self._store.allowed_source_modes
+                    if not early_period_unavailable
+                    else source.get("mode") is None
+                )
+            )
+            if set(report) != expected_keys or not valid_v1_shape:
+                raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
+            return state, detail_code, result_json
+
+        if type(request) is not PortfolioAnalyticsRequestV2:
+            raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
         expected_keys = {
             "calculation_ref",
             "decimal_serialization_ref",
@@ -1792,7 +1999,6 @@ class PortfolioAnalyticsTaskService:
         ):
             raise AnalysisTaskError("TASK_WORKER_RESULT_INVALID")
         try:
-            request_json = self._store_request_json(worker.scope_json, worker.task_ref)
             request_digest = hashlib.sha256(
                 request_json.encode("ascii", errors="strict")
             ).hexdigest()
@@ -1934,7 +2140,7 @@ class PortfolioAnalyticsTaskService:
             raise AnalysisTaskError("TASK_CLEANUP_UNCERTAIN")
         worker = self._workers.get((scope_json, task_ref))
         if worker is None:
-            if self._request_version(record["request_json"]) != 2:
+            if self._request_version(record["request_json"]) not in {1, 2}:
                 return self._store._cancel_running_task(
                     task_ref,
                     scope_json=scope_json,
