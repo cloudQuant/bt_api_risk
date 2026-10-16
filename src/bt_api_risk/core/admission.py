@@ -674,7 +674,7 @@ def _validate_dispatch_evidence_class(
 ) -> None:
     if type(evidence_class) is not DispatchEvidenceClass:
         raise ValueError("invalid dispatch evidence class")
-    simulation_providers = {"fake", "fixture"}
+    simulation_providers = {"fake", "fixture", "paper"}
     if evidence_class is DispatchEvidenceClass.SIMULATION_JOURNAL:
         if scope.provider not in simulation_providers:
             raise ValueError("simulation evidence cannot bind a non-simulation provider scope")

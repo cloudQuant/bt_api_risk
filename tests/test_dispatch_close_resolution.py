@@ -225,3 +225,22 @@ def test_terminal_close_receipt_is_immutable_and_exact_replay_is_idempotent(tmp_
             "SELECT COUNT(*) FROM risk_order_exposures WHERE permit_id = ?",
             (proof.permit_id,),
         ).fetchone()[0] == 0
+
+
+def test_close_evidence_class_accepts_paper_but_rejects_unknown_and_native_fake():
+    from bt_api_risk.core.admission import _validate_dispatch_evidence_class
+
+    _validate_dispatch_evidence_class(
+        AccountScope("paper", "paper-account", "sandbox"),
+        DispatchEvidenceClass.SIMULATION_JOURNAL,
+    )
+    with pytest.raises(ValueError, match="simulation evidence cannot bind"):
+        _validate_dispatch_evidence_class(
+            AccountScope("unrecognized", "account", "sandbox"),
+            DispatchEvidenceClass.SIMULATION_JOURNAL,
+        )
+    with pytest.raises(ValueError, match="native evidence cannot bind"):
+        _validate_dispatch_evidence_class(
+            AccountScope("fake", "account", "sandbox"),
+            DispatchEvidenceClass.NATIVE_PROVIDER_JOURNAL,
+        )
