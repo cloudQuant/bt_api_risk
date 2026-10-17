@@ -170,6 +170,35 @@ def test_adapter_policy_binding_preserves_policy_ids_accepted_by_gate(tmp_path):
     gate.close()
 
 
+@pytest.mark.unit
+def test_adapter_binding_is_exact_gate_used_for_dispatch(tmp_path):
+    execution = _execution_contracts()
+    metadata = _metadata()
+    account_scope = AccountScope("fake", "account-1", "sandbox")
+    policy = RiskPolicy("exact-gate-binding", Decimal("100"), 3, notional_unit="USD")
+    gate = DurableRiskGate(
+        tmp_path / "bound-risk.sqlite3", policy, clock=lambda: 1_700_000_000.0
+    )
+    other_gate = DurableRiskGate(
+        tmp_path / "other-risk.sqlite3", policy, clock=lambda: 1_700_000_000.0
+    )
+    adapter = DurableRiskAdmissionAdapter(gate, _mapper(account_scope, metadata))
+    order = _order(execution, metadata)
+
+    try:
+        assert adapter.is_bound_to(gate)
+        assert not adapter.is_bound_to(other_gate)
+        assert not adapter.is_bound_to(object())
+
+        permit = adapter.reserve(order)
+        assert adapter.claim_for_dispatch(permit.permit_id, order) == permit
+        assert adapter.is_bound_to(gate)
+        assert not adapter.is_bound_to(other_gate)
+    finally:
+        other_gate.close()
+        gate.close()
+
+
 def test_actual_order_contract_maps_to_durable_permit_and_recovers_settlement(tmp_path):
     execution = _execution_contracts()
     metadata = _metadata()

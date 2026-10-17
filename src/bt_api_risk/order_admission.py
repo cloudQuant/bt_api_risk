@@ -126,6 +126,11 @@ class DurableRiskAdmissionAdapter:
             exposure_accounting_mode=policy.exposure_accounting_mode,
         )
 
+    def is_bound_to(self, gate: object) -> bool:
+        """Check owner composition uses this exact ledger, without exposing it."""
+
+        return gate is self._gate
+
     def reserve(self, intent: Any) -> RiskPermit:
         """Durably reserve capacity for one immutable account order."""
 
