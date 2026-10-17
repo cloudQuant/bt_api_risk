@@ -1301,6 +1301,23 @@ class PolicyCatalogStore:
             raise PolicyCatalogError("SCOPE_NOT_OWNER")
         return self._receipt_payload(reference, row, row["published_utc"])
 
+    def inspect(self, reference: str, *, scope: object) -> Mapping[str, object]:
+        """Read an exact policy draft or publication within its owner scope."""
+
+        reference = _policy_reference(reference)
+        _, scope_json = _management_scope(scope)
+        row = self._row(reference)
+        if row is None:
+            raise PolicyCatalogError("POLICY_NOT_FOUND")
+        if row["owner_scope_json"] != scope_json:
+            raise PolicyCatalogError("SCOPE_NOT_OWNER")
+        return {
+            "policy_ref": reference,
+            "policy_version": row["digest"],
+            "state": row["state"],
+            "content": json.loads(row["content_json"]),
+        }
+
     def configure_budget_pool(
         self,
         pool_ref: str,
@@ -2709,6 +2726,8 @@ class PolicyCatalogService:
             "policy.approve",
             "policy.publish",
             "policy.receipt",
+            "policy.inspect",
+            "policy.confirmation.read",
             "policy.budget.propose",
             "policy.budget.approve",
             "policy.budget.publish_member",
@@ -2796,6 +2815,18 @@ class PolicyCatalogService:
                 if keys != self._READ_ARGUMENTS:
                     raise PolicyCatalogError("INVALID_REQUEST")
                 result = self._store.receipt(arguments["policy_ref"], scope=scope)
+            elif operation == "policy.inspect":
+                if keys != self._READ_ARGUMENTS:
+                    raise PolicyCatalogError("INVALID_REQUEST")
+                result = self._store.inspect(arguments["policy_ref"], scope=scope)
+            elif operation == "policy.confirmation.read":
+                if keys != self._READ_ARGUMENTS:
+                    raise PolicyCatalogError("INVALID_REQUEST")
+                if self._confirmation_store is None:
+                    raise PolicyCatalogError("CONFIRMATION_STORE_UNAVAILABLE")
+                result = self._confirmation_store.read_status(
+                    arguments["policy_ref"], scope=scope
+                )
             elif operation == "policy.budget.propose":
                 result = self._store.propose_budget_generation(
                     arguments, principal_ref=principal_ref, scope=scope
@@ -3072,6 +3103,41 @@ class ConfirmedPolicyStore:
         ):
             raise PolicyCatalogError("POLICY_DOCUMENT_CORRUPT")
         return self._document_record(row, document=document)
+
+    def read_status(self, reference: object, *, scope: object) -> Mapping[str, object]:
+        """Return exact owner-confirmation facts without exposing the document."""
+
+        reference = _policy_reference(reference)
+        _, scope_json = _management_scope(scope)
+        row = self._db.execute(
+            "SELECT * FROM confirmed_policies WHERE reference=?", (reference,)
+        ).fetchone()
+        if row is None:
+            return MappingProxyType(
+                {
+                    "policy_ref": reference,
+                    "owner_confirmed": False,
+                    "policy_version": None,
+                    "confirmed_utc": None,
+                    "document_available": False,
+                }
+            )
+        if row["owner_scope_json"] != scope_json:
+            raise PolicyCatalogError("SCOPE_NOT_OWNER")
+        document_available = row["content_json"] is not None
+        if document_available:
+            # Reuse the exact digest/canonical validation used by offline
+            # startup resolution before reporting the row as executable.
+            self.resolve_document(reference)
+        return MappingProxyType(
+            {
+                "policy_ref": reference,
+                "owner_confirmed": True,
+                "policy_version": row["policy_version"],
+                "confirmed_utc": row["confirmed_utc"],
+                "document_available": document_available,
+            }
+        )
 
     @staticmethod
     def _record(row: sqlite3.Row) -> Mapping[str, object]:
