@@ -1228,8 +1228,11 @@ class PolicyCatalogStore:
                 raise PolicyCatalogError("POLICY_NOT_FOUND")
             if "afi_budget" in json.loads(row["content_json"]):
                 raise PolicyCatalogError("BUDGET_GENERATION_REQUIRED")
+            self._require_approver(principal_ref)
             if row["owner_scope_json"] != scope_json:
                 raise PolicyCatalogError("SCOPE_NOT_OWNER")
+            if row["owner_principal"] == principal_ref:
+                raise PolicyCatalogError("APPROVER_MUST_DIFFER_FROM_OWNER")
             self._approve_policy_row(
                 row, principal_ref=principal_ref, scope_json=scope_json
             )
@@ -1266,10 +1269,18 @@ class PolicyCatalogStore:
                 raise PolicyCatalogError("POLICY_NOT_FOUND")
             if "afi_budget" in json.loads(row["content_json"]):
                 raise PolicyCatalogError("BUDGET_GENERATION_REQUIRED")
-            if row["approved_by"] != principal_ref:
-                raise PolicyCatalogError("APPROVER_MISMATCH")
             if row["approved_scope_json"] != scope_json:
                 raise PolicyCatalogError("SCOPE_NOT_OWNER")
+            approver = row["approved_by"]
+            owner = row["owner_principal"]
+            if (
+                not _valid_wire_text(approver)
+                or approver == owner
+                or approver not in self._trusted_approver_principals
+            ):
+                raise PolicyCatalogError("APPROVAL_NOT_AUTHORIZED")
+            if principal_ref not in {approver, owner}:
+                raise PolicyCatalogError("POLICY_PUBLISH_NOT_AUTHORIZED")
             return self._publish_policy_row(row)
 
     def read(self, reference: str) -> Mapping[str, object]:
