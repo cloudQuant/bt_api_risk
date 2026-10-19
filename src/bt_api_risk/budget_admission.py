@@ -94,6 +94,7 @@ class ResolvedBudgetAdmission:
 
     pool_ref: str
     generation_ref: str
+    portfolio_ref: str
     account_ref: str
     policy_ref: str
     policy_version: str
@@ -288,6 +289,7 @@ class PolicyCatalogBudgetAdmissionResolver:
         return ResolvedBudgetAdmission(
             pool_ref=snapshot["pool_ref"],
             generation_ref=snapshot["generation_ref"],
+            portfolio_ref=snapshot["portfolio_ref"],
             account_ref=snapshot["account_ref"],
             policy_ref=snapshot["policy_ref"],
             policy_version=snapshot["policy_version"],

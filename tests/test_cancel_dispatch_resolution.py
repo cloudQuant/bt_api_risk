@@ -301,6 +301,7 @@ def test_cancel_dispatch_resolution_receipt_reads_exact_persisted_terminal_proof
     assert gate.snapshot(scope)["increase_count"] == 1
     assert gate.snapshot(scope)["increase_notional"] == Decimal("40")
 
+
 def test_rejected_cancel_action_resolution_preserves_open_target_fact(tmp_path, scope, policy):
     authority = FakeCancelJournalAuthority()
     gate, _intent, _permit, binding, execution_scope_key, cancel_id, fingerprint = _claimed_cancel(

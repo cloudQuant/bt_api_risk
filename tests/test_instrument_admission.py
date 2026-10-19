@@ -570,6 +570,28 @@ def test_mapper_still_rejects_a_close_with_an_invalid_quantity_lattice() -> None
     assert caught.value.code == "INSTRUMENT_QUANTITY_LATTICE"
 
 
+@pytest.mark.parametrize("position_effect", ("CLOSE_TODAY", "CLOSE_YESTERDAY"))
+def test_mapper_fails_closed_for_dated_close_without_bucket_allocation(
+    position_effect: str,
+) -> None:
+    metadata = _metadata()
+    scope = AccountScope("fixture", "account", "sandbox")
+    mapper = InstrumentRiskAdmissionMapper(
+        scope,
+        InstrumentRiskRegistry((metadata,)),
+        clock_ns=lambda: 1_500,
+    )
+    dated_close = _execution_shape(
+        metadata,
+        position_effect=SimpleNamespace(value=position_effect),
+    )
+
+    with pytest.raises(RiskDeniedError) as caught:
+        mapper(dated_close)
+
+    assert caught.value.code == "INSTRUMENT_POSITION_BUCKET_UNPROVEN"
+
+
 @pytest.mark.parametrize(
     "overrides",
     (
