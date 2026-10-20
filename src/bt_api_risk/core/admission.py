@@ -245,9 +245,10 @@ class RiskPolicy:
     Once the baseline expires, new increases remain blocked.  Fresh order
     observations may still reconcile or release verified open leaves, but a
     baseline cannot be refreshed while any filled or open Risk-owned exposure
-    remains.  This version has no position-absorption or reduction-proof API;
-    an account with persistent filled exposure can therefore remain read-only
-    until a future trusted exposure-reconciliation path is added.
+    remains.  A narrow recovery-reduction path can allocate a source-proved
+    close against an exact tracked increase without absorbing the parent's
+    filled exposure or releasing its reservation. Broader position reconciliation
+    still requires its separate trusted allocation workflow.
     """
 
     policy_id: str
@@ -603,6 +604,409 @@ class RiskPermit:
     notional_unit: Optional[str] = None  # noqa: UP045 -- Python 3.9 is supported.
     position_side: str = "NET"
     position_bucket: str = "ALL"
+
+
+@dataclass(frozen=True)
+class RecoveryCloseSourceProof:
+    """Immutable source claim for a bounded recovery reduction.
+
+    The Risk gate does not treat this DTO as source authority.  The configured
+    execution-journal authority must hold its source fence and return an exact
+    :class:`VerifiedRecoveryCloseSource` before the allocation transaction can
+    commit.  This keeps the Risk API provider-neutral while letting an adapter
+    bind native trade/position windows to the original increase permit.
+
+    ``book_id`` is an opaque canonical identifier in that source domain. The
+    authority, not the caller, must map it to the parent and child records in
+    the exact account scope while its source fence is held. In the CTP Store
+    adapter, it is the parent execution record's persisted ``scope_key`` and
+    is checked against both stored intents inside that same fence.
+    """
+
+    scope: AccountScope
+    book_id: str
+    parent_permit_id: str
+    parent_intent_id: str
+    parent_intent_hash: str
+    recovery_intent_id: str
+    recovery_intent_hash: str
+    source_evidence_sha256: str
+    source_revision: int
+    parent_filled_quantity: Decimal
+    attributable_position_quantity: Decimal
+    instrument: str
+    strategy_id: str
+    allocation_version: str
+    quantity_unit: str
+    parent_order_side: str
+    recovery_order_side: str
+    parent_position_side: str
+    parent_position_bucket: str
+    position_side: str = "NET"
+    position_bucket: str = "ALL"
+    observed_at_ns: int = 0
+    valid_until_ns: int = 0
+
+    def __post_init__(self) -> None:
+        if type(self.scope) is not AccountScope:
+            raise ValueError("invalid recovery source scope")
+        for name in (
+            "book_id",
+            "parent_permit_id",
+            "parent_intent_id",
+            "recovery_intent_id",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError("invalid recovery source " + name)
+        for name in (
+            "parent_intent_hash",
+            "recovery_intent_hash",
+            "source_evidence_sha256",
+        ):
+            _require_sha256(getattr(self, name), name)
+        for name in ("instrument", "strategy_id", "allocation_version", "quantity_unit"):
+            value = getattr(self, name)
+            pattern = _ALLOCATION_INSTRUMENT if name == "instrument" else _ALLOCATION_ID
+            if type(value) is not str or not pattern.fullmatch(value):
+                raise ValueError("invalid recovery source " + name)
+        for label, side, bucket in (
+            ("parent", self.parent_position_side, self.parent_position_bucket),
+            ("position", self.position_side, self.position_bucket),
+        ):
+            if side not in {"NET", "LONG", "SHORT"}:
+                raise ValueError("invalid recovery source " + label + " position_side")
+            if bucket not in {"ALL", "TODAY", "YESTERDAY"}:
+                raise ValueError("invalid recovery source " + label + " position_bucket")
+            if side == "NET" and bucket != "ALL":
+                raise ValueError("dated recovery position buckets require LONG or SHORT")
+        if self.parent_order_side not in {"BUY", "SELL"}:
+            raise ValueError("invalid recovery source parent_order_side")
+        if self.recovery_order_side not in {"BUY", "SELL"}:
+            raise ValueError("invalid recovery source recovery_order_side")
+        if self.parent_order_side == self.recovery_order_side:
+            raise ValueError("recovery close order side must oppose its parent")
+        if type(self.source_revision) is not int or self.source_revision <= 0:
+            raise ValueError("invalid recovery source revision")
+        try:
+            parent_filled = _as_decimal(self.parent_filled_quantity)
+            attributable = _as_decimal(self.attributable_position_quantity)
+        except (InvalidOperation, TypeError, ValueError) as error:
+            raise ValueError("recovery source quantities must be finite decimals") from error
+        if parent_filled <= 0 or attributable <= 0 or attributable > parent_filled:
+            raise ValueError("recovery source quantities are outside the attributable fill")
+        object.__setattr__(self, "parent_filled_quantity", parent_filled)
+        object.__setattr__(self, "attributable_position_quantity", attributable)
+        if (
+            type(self.observed_at_ns) is not int
+            or type(self.valid_until_ns) is not int
+            or self.observed_at_ns <= 0
+            or self.valid_until_ns <= self.observed_at_ns
+        ):
+            raise ValueError("invalid recovery source freshness interval")
+
+    @property
+    def fingerprint(self) -> str:
+        payload = {
+            "allocation_version": self.allocation_version,
+            "attributable_position_quantity": _decimal_text(
+                self.attributable_position_quantity
+            ),
+            "book_id": self.book_id,
+            "instrument": self.instrument,
+            "observed_at_ns": self.observed_at_ns,
+            "parent_intent_hash": self.parent_intent_hash,
+            "parent_filled_quantity": _decimal_text(self.parent_filled_quantity),
+            "parent_intent_id": self.parent_intent_id,
+            "parent_order_side": self.parent_order_side,
+            "parent_position_bucket": self.parent_position_bucket,
+            "parent_position_side": self.parent_position_side,
+            "parent_permit_id": self.parent_permit_id,
+            "position_bucket": self.position_bucket,
+            "position_side": self.position_side,
+            "quantity_unit": self.quantity_unit,
+            "recovery_intent_hash": self.recovery_intent_hash,
+            "recovery_intent_id": self.recovery_intent_id,
+            "recovery_order_side": self.recovery_order_side,
+            "scope": self.scope.key,
+            "source_evidence_sha256": self.source_evidence_sha256,
+            "source_revision": self.source_revision,
+            "strategy_id": self.strategy_id,
+            "valid_until_ns": self.valid_until_ns,
+        }
+        return _sha256(_canonical_json(payload))
+
+
+@dataclass(frozen=True)
+class VerifiedRecoveryCloseSource:
+    """Authority receipt binding one recovery source claim to its source fence."""
+
+    scope: AccountScope
+    book_id: str
+    parent_permit_id: str
+    parent_intent_id: str
+    parent_intent_hash: str
+    recovery_intent_id: str
+    recovery_intent_hash: str
+    source_proof_sha256: str
+    source_evidence_sha256: str
+    source_revision: int
+    parent_filled_quantity: Decimal
+    attributable_position_quantity: Decimal
+    instrument: str
+    strategy_id: str
+    allocation_version: str
+    quantity_unit: str
+    parent_order_side: str
+    recovery_order_side: str
+    parent_position_side: str
+    parent_position_bucket: str
+    position_side: str
+    position_bucket: str
+    observed_at_ns: int
+    valid_until_ns: int
+    writer_fence_sha256: str
+    attribution_complete: bool
+
+    def __post_init__(self) -> None:
+        if type(self.scope) is not AccountScope:
+            raise ValueError("invalid verified recovery source scope")
+        for name in (
+            "book_id",
+            "parent_permit_id",
+            "parent_intent_id",
+            "recovery_intent_id",
+            "instrument",
+            "strategy_id",
+            "allocation_version",
+            "quantity_unit",
+        ):
+            value = getattr(self, name)
+            if type(value) is not str or not value or value != value.strip():
+                raise ValueError("invalid verified recovery source " + name)
+        for name in (
+            "parent_intent_hash",
+            "recovery_intent_hash",
+            "source_proof_sha256",
+            "source_evidence_sha256",
+            "writer_fence_sha256",
+        ):
+            _require_sha256(getattr(self, name), name)
+        for name in ("parent_filled_quantity", "attributable_position_quantity"):
+            try:
+                value = _as_decimal(getattr(self, name))
+            except (InvalidOperation, TypeError, ValueError) as error:
+                raise ValueError("invalid verified recovery source " + name) from error
+            if value <= 0:
+                raise ValueError("verified recovery source quantities must be positive")
+            object.__setattr__(self, name, value)
+        if self.attributable_position_quantity > self.parent_filled_quantity:
+            raise ValueError("verified recovery source exceeds its parent fill")
+        for label, side, bucket in (
+            ("parent", self.parent_position_side, self.parent_position_bucket),
+            ("position", self.position_side, self.position_bucket),
+        ):
+            if side not in {"NET", "LONG", "SHORT"}:
+                raise ValueError("invalid verified recovery " + label + " position_side")
+            if bucket not in {"ALL", "TODAY", "YESTERDAY"}:
+                raise ValueError("invalid verified recovery " + label + " position_bucket")
+            if side == "NET" and bucket != "ALL":
+                raise ValueError("dated verified recovery buckets require LONG or SHORT")
+        if self.parent_order_side not in {"BUY", "SELL"}:
+            raise ValueError("invalid verified recovery parent_order_side")
+        if self.recovery_order_side not in {"BUY", "SELL"}:
+            raise ValueError("invalid verified recovery recovery_order_side")
+        if self.parent_order_side == self.recovery_order_side:
+            raise ValueError("verified recovery close order side must oppose its parent")
+        if type(self.source_revision) is not int or self.source_revision <= 0:
+            raise ValueError("invalid verified recovery source revision")
+        if type(self.attribution_complete) is not bool or not self.attribution_complete:
+            raise ValueError("verified recovery source requires complete owner attribution")
+        if (
+            type(self.observed_at_ns) is not int
+            or type(self.valid_until_ns) is not int
+            or self.observed_at_ns <= 0
+            or self.valid_until_ns <= self.observed_at_ns
+        ):
+            raise ValueError("invalid verified recovery freshness interval")
+
+
+class VerifiedRecoveryCloseJournalAuthority(Protocol):
+    """Execution authority that holds a complete, fresh source fence.
+
+    ``attribution_complete`` is true only when the current trade/position
+    window accounts for the entire owner slice and no unresolved order or
+    unknown position owner could contribute to it. Fee economics remain a
+    separate fact and are not inferred by this recovery-close receipt.
+    """
+
+    def recovery_close_source_guard(
+        self,
+        proof: RecoveryCloseSourceProof,
+        *,
+        parent_permit: RiskPermit,
+        recovery_intent: RiskIntent,
+    ) -> AbstractContextManager[Optional[VerifiedRecoveryCloseSource]]: ...
+
+
+def _verified_recovery_close_source_matches(
+    verified: object,
+    *,
+    proof: RecoveryCloseSourceProof,
+    parent_permit: RiskPermit,
+    recovery_intent: RiskIntent,
+) -> bool:
+    return bool(
+        type(verified) is VerifiedRecoveryCloseSource
+        and verified.scope == proof.scope == parent_permit.scope == recovery_intent.scope
+        and verified.book_id == proof.book_id
+        and verified.parent_permit_id == proof.parent_permit_id == parent_permit.permit_id
+        and verified.parent_intent_id == proof.parent_intent_id == parent_permit.intent_id
+        and verified.parent_intent_hash == proof.parent_intent_hash
+        and verified.recovery_intent_id == proof.recovery_intent_id == recovery_intent.intent_id
+        and verified.recovery_intent_hash == proof.recovery_intent_hash
+        == recovery_intent.fingerprint
+        and verified.source_proof_sha256 == proof.fingerprint
+        and verified.source_evidence_sha256 == proof.source_evidence_sha256
+        and verified.source_revision == proof.source_revision
+        and verified.parent_filled_quantity == proof.parent_filled_quantity
+        and verified.attributable_position_quantity == proof.attributable_position_quantity
+        and verified.instrument == proof.instrument == parent_permit.instrument
+        == recovery_intent.instrument
+        and verified.strategy_id == proof.strategy_id == parent_permit.strategy_id
+        == recovery_intent.strategy_id
+        and verified.allocation_version == proof.allocation_version
+        == parent_permit.allocation_version == recovery_intent.allocation_version
+        and verified.quantity_unit == proof.quantity_unit == parent_permit.quantity_unit
+        == recovery_intent.quantity_unit
+        and verified.parent_order_side == proof.parent_order_side
+        and verified.recovery_order_side == proof.recovery_order_side
+        and verified.parent_position_side
+        == proof.parent_position_side
+        == parent_permit.position_side
+        and verified.parent_position_bucket
+        == proof.parent_position_bucket
+        == parent_permit.position_bucket
+        and verified.position_side == proof.position_side == recovery_intent.position_side
+        and verified.position_bucket == proof.position_bucket == recovery_intent.position_bucket
+        and _recovery_position_slice_matches_parent(
+            parent_position_side=proof.parent_position_side,
+            parent_position_bucket=proof.parent_position_bucket,
+            parent_order_side=proof.parent_order_side,
+            position_side=proof.position_side,
+            position_bucket=proof.position_bucket,
+        )
+        and verified.observed_at_ns == proof.observed_at_ns
+        and verified.valid_until_ns == proof.valid_until_ns
+        and verified.attribution_complete is True
+    )
+
+
+def _recovery_position_slice_matches_parent(
+    *,
+    parent_position_side: str,
+    parent_position_bucket: str,
+    parent_order_side: str,
+    position_side: str,
+    position_bucket: str,
+) -> bool:
+    if parent_position_bucket != "ALL" and position_bucket != parent_position_bucket:
+        return False
+    if parent_position_side in {"LONG", "SHORT"}:
+        return position_side == parent_position_side
+    if position_side == "NET":
+        return position_bucket == "ALL"
+    expected_side = "LONG" if parent_order_side == "BUY" else "SHORT"
+    return position_side == expected_side
+
+
+def _recovery_close_position_version(source_revision: int, source_evidence_sha256: str) -> str:
+    return "recovery-" + str(source_revision) + "-" + source_evidence_sha256
+
+
+@dataclass(frozen=True)
+class RecoveryReductionAllocation:
+    """Risk-ledger receipt for one source-proved recovery reduction allocation.
+
+    The value is a durable identity projection, not authority by itself. A
+    downstream dispatcher must ask the live Risk gate to verify it against
+    the immutable ledger row before consuming it.
+    """
+
+    permit: RiskPermit
+    parent_permit_id: str
+    parent_intent_id: str
+    parent_intent_hash: str
+    recovery_intent_id: str
+    recovery_intent_hash: str
+    book_id: str
+    instrument: str
+    strategy_id: str
+    allocation_version: str
+    parent_order_side: str
+    parent_position_side: str
+    parent_position_bucket: str
+    position_side: str
+    position_bucket: str
+    order_side: str
+    quantity: Decimal
+    quantity_unit: str
+    parent_filled_quantity: Decimal
+    attributable_position_quantity: Decimal
+    source_revision: int
+    source_evidence_sha256: str
+    source_proof_sha256: str
+    writer_fence_sha256: str
+    observed_at_ns: int
+    valid_until_ns: int
+
+    @property
+    def permit_id(self) -> str:
+        return self.permit.permit_id
+
+    @property
+    def close_position_version(self) -> str:
+        return _recovery_close_position_version(
+            self.source_revision, self.source_evidence_sha256
+        )
+
+    @property
+    def fingerprint(self) -> str:
+        return _sha256(
+            _canonical_json(
+                {
+                    "allocation_version": self.allocation_version,
+                    "attributable_position_quantity": _decimal_text(
+                        self.attributable_position_quantity
+                    ),
+                    "book_id": self.book_id,
+                    "instrument": self.instrument,
+                    "observed_at_ns": self.observed_at_ns,
+                    "order_side": self.order_side,
+                    "parent_filled_quantity": _decimal_text(self.parent_filled_quantity),
+                    "parent_intent_hash": self.parent_intent_hash,
+                    "parent_intent_id": self.parent_intent_id,
+                    "parent_order_side": self.parent_order_side,
+                    "parent_position_bucket": self.parent_position_bucket,
+                    "parent_position_side": self.parent_position_side,
+                    "parent_permit_id": self.parent_permit_id,
+                    "permit_id": self.permit_id,
+                    "position_bucket": self.position_bucket,
+                    "position_side": self.position_side,
+                    "quantity": _decimal_text(self.quantity),
+                    "quantity_unit": self.quantity_unit,
+                    "recovery_intent_hash": self.recovery_intent_hash,
+                    "recovery_intent_id": self.recovery_intent_id,
+                    "scope": self.permit.scope.key,
+                    "source_evidence_sha256": self.source_evidence_sha256,
+                    "source_proof_sha256": self.source_proof_sha256,
+                    "source_revision": self.source_revision,
+                    "strategy_id": self.strategy_id,
+                    "valid_until_ns": self.valid_until_ns,
+                    "writer_fence_sha256": self.writer_fence_sha256,
+                }
+            )
+        )
 
 
 @dataclass(frozen=True)
@@ -2291,6 +2695,9 @@ class DurableRiskGate:
         execution_journal_authority: Optional[  # noqa: UP045 -- Python 3.9 is supported.
             VerifiedExecutionJournalAuthority
         ] = None,
+        recovery_close_source_authority: Optional[  # noqa: UP045 -- Python 3.9 is supported.
+            VerifiedRecoveryCloseJournalAuthority
+        ] = None,
         gross_exposure_authority: Optional[  # noqa: UP045 -- Python 3.9 is supported.
             GrossExposureAuthority
         ] = None,
@@ -2314,6 +2721,11 @@ class DurableRiskGate:
             self._clock_ns = lambda: int(float(clock()) * 1_000_000_000)
         self._timeout_seconds = timeout_seconds
         self._execution_journal_authority = execution_journal_authority
+        self._recovery_close_source_authority = (
+            execution_journal_authority
+            if recovery_close_source_authority is None
+            else recovery_close_source_authority
+        )
         self._gross_exposure_authority = gross_exposure_authority
         self._database_path.parent.mkdir(parents=True, exist_ok=True)
         self._initialize_schema()
@@ -4346,6 +4758,16 @@ class DurableRiskGate:
                 (intent.intent_id,),
             ).fetchone()
             if existing is not None:
+                recovery_allocation = connection.execute(
+                    "SELECT child_permit_id FROM risk_recovery_reduction_allocations "
+                    "WHERE child_permit_id = ?",
+                    (existing["permit_id"],),
+                ).fetchone()
+                if recovery_allocation is not None:
+                    raise PermitInvalidError(
+                        "RECOVERY_REDUCTION_AUTHORITY_REQUIRED",
+                        "source-allocated recovery permits must use their typed allocation",
+                    )
                 if existing["group_id"] is not None:
                     raise RiskDeniedError(
                         "GROUP_PERMIT_REQUIRED",
@@ -4464,6 +4886,764 @@ class DurableRiskGate:
                 self._assert_live_gross_limits(connection, intent, include_intent=False)
             self._assert_current_instrument_facts(intent)
             return permit
+
+    def reserve_recovery_reduction(
+        self,
+        intent: RiskIntent,
+        *,
+        parent_permit_id: str,
+        source_proof: RecoveryCloseSourceProof,
+    ) -> RecoveryReductionAllocation:
+        """Reserve one source-proved close against an exact tracked increase.
+
+        The execution journal authority holds its source read fence while this
+        method rechecks the original permit and allocates quantity in one
+        ``BEGIN IMMEDIATE`` transaction. Allocation history is keyed by the
+        original permit, so a newer source revision cannot reset consumed or
+        uncertain child quantity. This method leaves the parent reservation,
+        dispatch resolution, freezes, and any external fee-review state alone.
+        """
+
+        if type(intent) is not RiskIntent or intent.action is not IntentAction.REDUCE:
+            raise RiskDeniedError(
+                "RECOVERY_REDUCTION_INTENT_REQUIRED",
+                "a typed REDUCE intent is required for recovery allocation",
+            )
+        if type(source_proof) is not RecoveryCloseSourceProof:
+            raise RiskDeniedError(
+                "RECOVERY_SOURCE_PROOF_REQUIRED",
+                "a typed execution-source proof is required",
+            )
+        if (
+            type(parent_permit_id) is not str
+            or not parent_permit_id
+            or parent_permit_id != parent_permit_id.strip()
+        ):
+            raise PermitInvalidError("PERMIT_UNKNOWN", "the original permit reference is invalid")
+        if not (
+            intent.scope == source_proof.scope
+            and intent.intent_id == source_proof.recovery_intent_id
+            and intent.fingerprint == source_proof.recovery_intent_hash
+            and intent.notional == Decimal("0")
+            and intent.quantity is not None
+            and intent.quantity_unit is not None
+            and intent.instrument is not None
+            and intent.strategy_id is not None
+            and intent.allocation_version is not None
+            and source_proof.parent_permit_id == parent_permit_id
+            and source_proof.instrument == intent.instrument
+            and source_proof.strategy_id == intent.strategy_id
+            and source_proof.allocation_version == intent.allocation_version
+            and source_proof.quantity_unit == intent.quantity_unit
+            and source_proof.position_side == intent.position_side
+            and source_proof.position_bucket == intent.position_bucket
+            and intent.quantity <= source_proof.attributable_position_quantity
+            and _recovery_position_slice_matches_parent(
+                parent_position_side=source_proof.parent_position_side,
+                parent_position_bucket=source_proof.parent_position_bucket,
+                parent_order_side=source_proof.parent_order_side,
+                position_side=source_proof.position_side,
+                position_bucket=source_proof.position_bucket,
+            )
+        ):
+            raise RiskDeniedError(
+                "RECOVERY_SOURCE_SCOPE_MISMATCH",
+                "the source proof does not bind this exact account, parent, and close intent",
+            )
+
+        authority = self._recovery_close_source_authority
+        guard_factory = getattr(authority, "recovery_close_source_guard", None)
+        if not callable(guard_factory):
+            raise PermitInvalidError(
+                "RECOVERY_SOURCE_AUTHORITY_REQUIRED",
+                "a trusted execution journal source guard is required",
+            )
+
+        # Resolve the parent before asking the source authority to hold its
+        # fence. The exact row and all mutable Risk conditions are checked
+        # again while the writer transaction is held below.
+        with self._connection() as connection:
+            connection.execute("PRAGMA query_only = ON")
+            parent_row = connection.execute(
+                "SELECT * FROM risk_reservations WHERE permit_id = ?",
+                (parent_permit_id,),
+            ).fetchone()
+            if parent_row is None:
+                raise PermitInvalidError("PERMIT_UNKNOWN", "the original permit does not exist")
+            parent_permit = self._permit_from_row(parent_row)
+
+        try:
+            guard = guard_factory(
+                source_proof,
+                parent_permit=parent_permit,
+                recovery_intent=intent,
+            )
+            with guard as verified:
+                if not _verified_recovery_close_source_matches(
+                    verified,
+                    proof=source_proof,
+                    parent_permit=parent_permit,
+                    recovery_intent=intent,
+                ):
+                    raise PermitInvalidError(
+                        "RECOVERY_SOURCE_PROOF_REJECTED",
+                        "the journal authority did not verify the exact source window",
+                    )
+                with self._transaction() as connection:
+                    now = self._clock()
+                    now_ns = self._now_ns()
+                    self._ensure_policy_binding(connection, intent.scope.key)
+                    self._expire_active(connection, now)
+                    if not (
+                        source_proof.observed_at_ns <= now_ns
+                        and now_ns < source_proof.valid_until_ns
+                    ):
+                        raise RiskDeniedError(
+                            "RECOVERY_SOURCE_STALE",
+                            "the attributable position source proof is stale",
+                        )
+                    self._assert_current_instrument_facts(intent)
+                    shared_domain = self._assert_shared_collateral_admission(
+                        connection, intent.scope, intent.action, intent.resource
+                    )
+                    parent = connection.execute(
+                        "SELECT * FROM risk_reservations WHERE permit_id = ?",
+                        (parent_permit_id,),
+                    ).fetchone()
+                    if parent is None:
+                        raise PermitInvalidError(
+                            "PERMIT_UNKNOWN", "the original permit does not exist"
+                        )
+                    if (
+                        parent["action"] != IntentAction.INCREASE.value
+                        or parent["status"] != self._SETTLED
+                        or parent["group_id"] is not None
+                        or parent["intent_id"] != source_proof.parent_intent_id
+                        or parent["intent_hash"] != source_proof.parent_intent_hash
+                        or parent["scope_key"] != intent.scope.key
+                        or parent["instrument"] != source_proof.instrument
+                        or parent["strategy_id"] != source_proof.strategy_id
+                        or parent["allocation_version"] != source_proof.allocation_version
+                        or parent["quantity_unit"] != source_proof.quantity_unit
+                        or parent["position_side"] != source_proof.parent_position_side
+                        or parent["position_bucket"] != source_proof.parent_position_bucket
+                        or parent["quantity"] is None
+                        or parent["notional_unit"] != intent.notional_unit
+                        or parent["resource_product_type"]
+                        != (None if intent.resource is None else intent.resource.product_type)
+                        or parent["resource_margin_pool"]
+                        != (None if intent.resource is None else intent.resource.margin_pool)
+                        or source_proof.parent_filled_quantity
+                        > _as_decimal(parent["quantity"])
+                    ):
+                        raise PermitInvalidError(
+                            "RECOVERY_PARENT_STATE_CONFLICT",
+                            "the original settled increase does not match the source proof",
+                        )
+                    self._assert_reservation_allocation_current(connection, parent, invalid=True)
+                    parent_receipt = self._dispatch_resolution_receipt_in_transaction(
+                        connection, parent_permit_id
+                    )
+                    if (
+                        parent_receipt.status
+                        is not DispatchResolutionReceiptStatus.ACKED_TRACKED_RESOLVED
+                        or parent_receipt.claim.intent_id != source_proof.parent_intent_id
+                        or parent_receipt.claim.intent_hash != source_proof.parent_intent_hash
+                    ):
+                        raise PermitInvalidError(
+                            "RECOVERY_PARENT_NOT_TRACKED",
+                            "the original increase lacks exact ACKED_TRACKED evidence",
+                        )
+                    if (
+                        intent.scope.key != parent["scope_key"]
+                        or intent.instrument != parent["instrument"]
+                        or intent.strategy_id != parent["strategy_id"]
+                        or intent.allocation_version != parent["allocation_version"]
+                        or intent.quantity_unit != parent["quantity_unit"]
+                        or intent.notional_unit != parent["notional_unit"]
+                    ):
+                        raise RiskDeniedError(
+                            "RECOVERY_REDUCTION_SCOPE_MISMATCH",
+                            "recovery reduction must use the parent account, strategy, and units",
+                        )
+                    child_resource = (
+                        None
+                        if intent.resource is None
+                        else (intent.resource.product_type, intent.resource.margin_pool)
+                    )
+                    parent_resource = (
+                        None
+                        if parent["resource_product_type"] is None
+                        and parent["resource_margin_pool"] is None
+                        else (
+                            parent["resource_product_type"],
+                            parent["resource_margin_pool"],
+                        )
+                    )
+                    if parent_resource != child_resource:
+                        raise RiskDeniedError(
+                            "RECOVERY_REDUCTION_RESOURCE_MISMATCH",
+                            "recovery reduction must preserve the parent's risk resource",
+                        )
+                    self._assert_self_trade_absent(connection, intent)
+
+                    existing = connection.execute(
+                        "SELECT * FROM risk_reservations WHERE intent_id = ?",
+                        (intent.intent_id,),
+                    ).fetchone()
+                    if existing is not None:
+                        allocation_row = connection.execute(
+                            "SELECT * FROM risk_recovery_reduction_allocations "
+                            "WHERE child_permit_id = ?",
+                            (existing["permit_id"],),
+                        ).fetchone()
+                        if (
+                            existing["status"] != self._ACTIVE
+                            or existing["intent_hash"] != intent.fingerprint
+                            or allocation_row is None
+                            or allocation_row["parent_permit_id"] != parent_permit_id
+                            or allocation_row["source_proof_sha256"] != source_proof.fingerprint
+                        ):
+                            raise PermitInvalidError(
+                                "RECOVERY_REDUCTION_REPLAY_CONFLICT",
+                                "the recovery intent was already used with different evidence",
+                            )
+                        return self._recovery_allocation_from_row(
+                            connection, allocation_row, existing
+                        )
+
+                    lifetime_used = Fraction(0)
+                    pending_used = Fraction(0)
+                    prior_allocations = connection.execute(
+                        """SELECT * FROM risk_recovery_reduction_allocations
+                           WHERE parent_permit_id = ? ORDER BY child_permit_id""",
+                        (parent_permit_id,),
+                    ).fetchall()
+                    for allocation_row in prior_allocations:
+                        child = connection.execute(
+                            "SELECT * FROM risk_reservations WHERE permit_id = ?",
+                            (allocation_row["child_permit_id"],),
+                        ).fetchone()
+                        if child is None:
+                            raise PermitInvalidError(
+                                "RECOVERY_ALLOCATION_STATE_CONFLICT",
+                                "a previously allocated recovery permit is missing",
+                            )
+                        self._recovery_allocation_from_row(connection, allocation_row, child)
+                        child_quantity = Fraction(_as_decimal(allocation_row["quantity"]))
+                        no_fill = False
+                        fully_closed = False
+                        if child["status"] == self._NO_FILL:
+                            terminal = self._dispatch_terminal_resolution_receipt_in_transaction(
+                                connection, str(child["permit_id"])
+                            )
+                            no_fill = bool(
+                                terminal.status
+                                is DispatchTerminalResolutionReceiptStatus.NO_FILL_TERMINAL_RESOLVED
+                                and terminal.proof is not None
+                                and terminal.proof.filled_quantity == 0
+                                and terminal.proof.trade_count == 0
+                                and terminal.fee_record_count == 0
+                                and terminal.fee_history_complete is True
+                            )
+                            if not no_fill:
+                                raise PermitInvalidError(
+                                    "RECOVERY_ALLOCATION_STATE_CONFLICT",
+                                    "a no-fill child lacks exact complete zero-fee resolution",
+                                )
+                        elif child["status"] == self._SETTLED:
+                            resolution = connection.execute(
+                                "SELECT proof_kind FROM risk_dispatch_resolutions "
+                                "WHERE permit_id = ?",
+                                (child["permit_id"],),
+                            ).fetchone()
+                            if resolution is not None and resolution["proof_kind"] == "TERMINAL_CLOSE":
+                                close = self._dispatch_close_resolution_receipt_in_transaction(
+                                    connection, str(child["permit_id"])
+                                )
+                                fully_closed = bool(
+                                    close.status
+                                    is DispatchExposureResolutionReceiptStatus.TERMINAL_CLOSE_RESOLVED
+                                    and close.position_effect == "CLOSE"
+                                    and close.requested_quantity == _as_decimal(
+                                        allocation_row["quantity"]
+                                    )
+                                    and close.filled_quantity == close.requested_quantity
+                                )
+                                if not fully_closed:
+                                    raise PermitInvalidError(
+                                        "RECOVERY_ALLOCATION_STATE_CONFLICT",
+                                        "a terminal close child lacks exact full-fill resolution",
+                                    )
+                        if no_fill:
+                            continue
+                        lifetime_used += child_quantity
+                        if (
+                            not fully_closed
+                            and allocation_row["position_side"] == intent.position_side
+                            and allocation_row["position_bucket"] == intent.position_bucket
+                        ):
+                            pending_used += child_quantity
+
+                    requested = Fraction(intent.quantity)
+                    if lifetime_used + requested > Fraction(
+                        source_proof.parent_filled_quantity
+                    ):
+                        raise RiskDeniedError(
+                            "RECOVERY_PARENT_QUANTITY_EXHAUSTED",
+                            "cumulative recovery closes exceed the original attributable fill",
+                        )
+                    if pending_used + requested > Fraction(
+                        source_proof.attributable_position_quantity
+                    ):
+                        raise RiskDeniedError(
+                            "RECOVERY_POSITION_QUANTITY_EXHAUSTED",
+                            "active recovery closes exceed the current attributable position",
+                        )
+
+                    generation = self._next_generation(connection, intent.scope.key)
+                    permit = RiskPermit(
+                        permit_id=str(uuid.uuid4()),
+                        intent_id=intent.intent_id,
+                        scope=intent.scope,
+                        action=intent.action,
+                        notional=intent.notional,
+                        policy_fingerprint=self._policy.fingerprint,
+                        generation=generation,
+                        issued_at=now,
+                        expires_at=now + self._policy.permit_ttl_seconds,
+                        strategy_id=intent.strategy_id,
+                        allocation_version=intent.allocation_version,
+                        instrument=intent.instrument,
+                        quantity=intent.quantity,
+                        quantity_unit=intent.quantity_unit,
+                        notional_unit=intent.notional_unit,
+                        position_side=intent.position_side,
+                        position_bucket=intent.position_bucket,
+                    )
+                    connection.execute(
+                        """INSERT INTO risk_reservations (
+                            permit_id, intent_id, intent_hash, scope_key, provider,
+                            account_id, environment, action, notional, policy_hash,
+                            generation, issued_at, expires_at, status, reason,
+                            strategy_id, allocation_version, instrument, quantity,
+                            quantity_unit, position_side, position_bucket, notional_unit,
+                            group_id, group_fingerprint, group_leg_id, group_deadline_ns,
+                            group_expires_at_ns, group_leg_count,
+                            group_exposure_profile_fingerprint, resource_product_type,
+                            resource_margin_pool, close_position_version,
+                            shared_collateral_domain_id, shared_collateral_domain_revision
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL,
+                            ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, NULL, NULL, NULL,
+                            NULL, ?, ?, ?, ?, ?)""",
+                        (
+                            permit.permit_id,
+                            permit.intent_id,
+                            intent.fingerprint,
+                            intent.scope.key,
+                            intent.scope.provider,
+                            intent.scope.account_id,
+                            intent.scope.environment,
+                            intent.action.value,
+                            _decimal_text(intent.notional),
+                            permit.policy_fingerprint,
+                            permit.generation,
+                            permit.issued_at,
+                            permit.expires_at,
+                            self._ACTIVE,
+                            permit.strategy_id,
+                            permit.allocation_version,
+                            permit.instrument,
+                            _decimal_text(permit.quantity),
+                            permit.quantity_unit,
+                            permit.position_side,
+                            permit.position_bucket,
+                            permit.notional_unit,
+                            None if intent.resource is None else intent.resource.product_type,
+                            None if intent.resource is None else intent.resource.margin_pool,
+                            _recovery_close_position_version(
+                                source_proof.source_revision,
+                                source_proof.source_evidence_sha256,
+                            ),
+                            None if shared_domain is None else shared_domain["domain_id"],
+                            None if shared_domain is None else shared_domain["revision"],
+                        ),
+                    )
+                    self._assert_current_instrument_facts(intent)
+                    allocation = self._recovery_allocation_from_values(
+                        permit=permit,
+                        proof=source_proof,
+                        verified=verified,
+                    )
+                    connection.execute(
+                        """INSERT INTO risk_recovery_reduction_allocations (
+                            child_permit_id, parent_permit_id, scope_key,
+                            parent_intent_id, parent_intent_hash,
+                            recovery_intent_id, recovery_intent_hash, book_id,
+                            instrument, strategy_id, allocation_version,
+                            parent_order_side, order_side, position_side,
+                            position_bucket, quantity, quantity_unit,
+                            parent_filled_quantity, attributable_position_quantity,
+                            source_revision, source_evidence_sha256,
+                            source_proof_sha256, writer_fence_sha256,
+                            observed_at_ns, valid_until_ns, allocation_sha256, created_at
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+                            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                        (
+                            permit.permit_id,
+                            parent_permit_id,
+                            intent.scope.key,
+                            source_proof.parent_intent_id,
+                            source_proof.parent_intent_hash,
+                            intent.intent_id,
+                            intent.fingerprint,
+                            source_proof.book_id,
+                            intent.instrument,
+                            intent.strategy_id,
+                            intent.allocation_version,
+                            source_proof.parent_order_side,
+                            source_proof.recovery_order_side,
+                            intent.position_side,
+                            intent.position_bucket,
+                            _decimal_text(intent.quantity),
+                            intent.quantity_unit,
+                            _decimal_text(source_proof.parent_filled_quantity),
+                            _decimal_text(source_proof.attributable_position_quantity),
+                            source_proof.source_revision,
+                            source_proof.source_evidence_sha256,
+                            source_proof.fingerprint,
+                            verified.writer_fence_sha256,
+                            source_proof.observed_at_ns,
+                            source_proof.valid_until_ns,
+                            allocation.fingerprint,
+                            now,
+                        ),
+                    )
+                    commit_now_ns = self._now_ns()
+                    if not (
+                        source_proof.observed_at_ns
+                        <= commit_now_ns
+                        < source_proof.valid_until_ns
+                    ):
+                        raise RiskDeniedError(
+                            "RECOVERY_SOURCE_STALE",
+                            "the attributable position source proof expired before commit",
+                        )
+                    return allocation
+        except (PermitInvalidError, RiskDeniedError):
+            raise
+        except Exception as error:
+            raise PermitInvalidError(
+                "RECOVERY_SOURCE_PROOF_REJECTED",
+                "the execution journal authority could not verify this recovery source",
+            ) from error
+
+    def verify_recovery_reduction_allocation(
+        self,
+        allocation: RecoveryReductionAllocation,
+        *,
+        intent: RiskIntent,
+    ) -> RecoveryReductionAllocation:
+        """Return the canonical stored receipt only while its child permit is active."""
+
+        if (
+            type(allocation) is not RecoveryReductionAllocation
+            or type(intent) is not RiskIntent
+        ):
+            raise PermitInvalidError(
+                "RECOVERY_ALLOCATION_REQUIRED",
+                "a typed allocation and exact child intent are required",
+            )
+        with self._transaction() as connection:
+            now = self._clock()
+            self._ensure_policy_binding(connection, intent.scope.key)
+            row = connection.execute(
+                "SELECT * FROM risk_recovery_reduction_allocations "
+                "WHERE child_permit_id = ?",
+                (allocation.permit_id,),
+            ).fetchone()
+            if row is None:
+                raise PermitInvalidError(
+                    "RECOVERY_ALLOCATION_UNKNOWN", "the allocation is not in this Risk ledger"
+                )
+            child = connection.execute(
+                "SELECT * FROM risk_reservations WHERE permit_id = ?",
+                (allocation.permit_id,),
+            ).fetchone()
+            if child is None:
+                raise PermitInvalidError(
+                    "RECOVERY_ALLOCATION_STATE_CONFLICT", "the child permit is missing"
+                )
+            canonical = self._recovery_allocation_from_row(connection, row, child)
+            if canonical != allocation:
+                raise PermitInvalidError(
+                    "RECOVERY_ALLOCATION_MISMATCH",
+                    "the supplied allocation differs from the durable Risk receipt",
+                )
+            if (
+                intent.intent_id != child["intent_id"]
+                or intent.fingerprint != child["intent_hash"]
+                or intent.scope.key != child["scope_key"]
+                or child["action"] != IntentAction.REDUCE.value
+                or child["status"] != self._ACTIVE
+                or float(child["expires_at"]) <= now
+                or child["group_id"] is not None
+            ):
+                raise PermitInvalidError(
+                    "RECOVERY_PERMIT_NOT_ACTIVE",
+                    "the allocated recovery permit is expired or no longer active",
+                )
+            parent = connection.execute(
+                "SELECT * FROM risk_reservations WHERE permit_id = ?",
+                (canonical.parent_permit_id,),
+            ).fetchone()
+            if (
+                parent is None
+                or parent["action"] != IntentAction.INCREASE.value
+                or parent["status"] != self._SETTLED
+                or parent["intent_id"] != canonical.parent_intent_id
+                or parent["intent_hash"] != canonical.parent_intent_hash
+            ):
+                raise PermitInvalidError(
+                    "RECOVERY_PARENT_STATE_CONFLICT",
+                    "the original tracked increase changed after allocation",
+                )
+            parent_receipt = self._dispatch_resolution_receipt_in_transaction(
+                connection, canonical.parent_permit_id
+            )
+            if (
+                parent_receipt.status
+                is not DispatchResolutionReceiptStatus.ACKED_TRACKED_RESOLVED
+                or parent_receipt.claim.intent_hash != canonical.parent_intent_hash
+            ):
+                raise PermitInvalidError(
+                    "RECOVERY_PARENT_NOT_TRACKED",
+                    "the original increase no longer has exact ACKED_TRACKED evidence",
+                )
+            now_ns = self._now_ns()
+            if not canonical.observed_at_ns <= now_ns < canonical.valid_until_ns:
+                raise PermitInvalidError(
+                    "RECOVERY_ALLOCATION_STALE",
+                    "the recovery source allocation expired before dispatch",
+                )
+            return canonical
+
+    @staticmethod
+    def _recovery_allocation_from_values(
+        *,
+        permit: RiskPermit,
+        proof: RecoveryCloseSourceProof,
+        verified: VerifiedRecoveryCloseSource,
+    ) -> RecoveryReductionAllocation:
+        return RecoveryReductionAllocation(
+            permit=permit,
+            parent_permit_id=proof.parent_permit_id,
+            parent_intent_id=proof.parent_intent_id,
+            parent_intent_hash=proof.parent_intent_hash,
+            recovery_intent_id=proof.recovery_intent_id,
+            recovery_intent_hash=proof.recovery_intent_hash,
+            book_id=proof.book_id,
+            instrument=proof.instrument,
+            strategy_id=proof.strategy_id,
+            allocation_version=proof.allocation_version,
+            parent_order_side=proof.parent_order_side,
+            parent_position_side=proof.parent_position_side,
+            parent_position_bucket=proof.parent_position_bucket,
+            position_side=proof.position_side,
+            position_bucket=proof.position_bucket,
+            order_side=proof.recovery_order_side,
+            quantity=permit.quantity if permit.quantity is not None else Decimal(0),
+            quantity_unit=proof.quantity_unit,
+            parent_filled_quantity=proof.parent_filled_quantity,
+            attributable_position_quantity=proof.attributable_position_quantity,
+            source_revision=proof.source_revision,
+            source_evidence_sha256=proof.source_evidence_sha256,
+            source_proof_sha256=proof.fingerprint,
+            writer_fence_sha256=verified.writer_fence_sha256,
+            observed_at_ns=proof.observed_at_ns,
+            valid_until_ns=proof.valid_until_ns,
+        )
+
+    def _recovery_allocation_from_row(
+        self,
+        connection: sqlite3.Connection,
+        allocation_row: sqlite3.Row,
+        child_row: sqlite3.Row,
+    ) -> RecoveryReductionAllocation:
+        try:
+            permit = self._permit_from_row(child_row)
+            parent_row = connection.execute(
+                "SELECT position_side, position_bucket FROM risk_reservations "
+                "WHERE permit_id = ?",
+                (allocation_row["parent_permit_id"],),
+            ).fetchone()
+            if parent_row is None:
+                raise ValueError("recovery allocation parent permit is missing")
+            allocation = RecoveryReductionAllocation(
+                permit=permit,
+                parent_permit_id=str(allocation_row["parent_permit_id"]),
+                parent_intent_id=str(allocation_row["parent_intent_id"]),
+                parent_intent_hash=_require_sha256(
+                    allocation_row["parent_intent_hash"], "parent_intent_hash"
+                ),
+                recovery_intent_id=str(allocation_row["recovery_intent_id"]),
+                recovery_intent_hash=_require_sha256(
+                    allocation_row["recovery_intent_hash"], "recovery_intent_hash"
+                ),
+                book_id=str(allocation_row["book_id"]),
+                instrument=str(allocation_row["instrument"]),
+                strategy_id=str(allocation_row["strategy_id"]),
+                allocation_version=str(allocation_row["allocation_version"]),
+                parent_order_side=str(allocation_row["parent_order_side"]),
+                parent_position_side=str(parent_row["position_side"]),
+                parent_position_bucket=str(parent_row["position_bucket"]),
+                position_side=str(allocation_row["position_side"]),
+                position_bucket=str(allocation_row["position_bucket"]),
+                order_side=str(allocation_row["order_side"]),
+                quantity=_as_decimal(allocation_row["quantity"]),
+                quantity_unit=str(allocation_row["quantity_unit"]),
+                parent_filled_quantity=_as_decimal(
+                    allocation_row["parent_filled_quantity"]
+                ),
+                attributable_position_quantity=_as_decimal(
+                    allocation_row["attributable_position_quantity"]
+                ),
+                source_revision=int(allocation_row["source_revision"]),
+                source_evidence_sha256=_require_sha256(
+                    allocation_row["source_evidence_sha256"], "source_evidence_sha256"
+                ),
+                source_proof_sha256=_require_sha256(
+                    allocation_row["source_proof_sha256"], "source_proof_sha256"
+                ),
+                writer_fence_sha256=_require_sha256(
+                    allocation_row["writer_fence_sha256"], "writer_fence_sha256"
+                ),
+                observed_at_ns=int(allocation_row["observed_at_ns"]),
+                valid_until_ns=int(allocation_row["valid_until_ns"]),
+            )
+            if not (
+                allocation_row["child_permit_id"] == permit.permit_id
+                and allocation_row["scope_key"] == permit.scope.key
+                and allocation_row["recovery_intent_id"] == permit.intent_id
+                and allocation_row["recovery_intent_hash"] == child_row["intent_hash"]
+                and allocation_row["instrument"] == permit.instrument
+                and allocation_row["strategy_id"] == permit.strategy_id
+                and allocation_row["allocation_version"] == permit.allocation_version
+                and parent_row["position_side"] == allocation.parent_position_side
+                and parent_row["position_bucket"] == allocation.parent_position_bucket
+                and allocation_row["position_side"] == permit.position_side
+                and allocation_row["position_bucket"] == permit.position_bucket
+                and child_row["close_position_version"] == allocation.close_position_version
+                and allocation_row["quantity"] == _decimal_text(permit.quantity)
+                and allocation_row["quantity_unit"] == permit.quantity_unit
+                and allocation_row["parent_permit_id"] != permit.permit_id
+                and allocation_row["allocation_sha256"] == allocation.fingerprint
+            ):
+                raise ValueError("recovery allocation row differs from its child permit")
+        except (KeyError, TypeError, InvalidOperation, ValueError) as error:
+            raise PermitInvalidError(
+                "RECOVERY_ALLOCATION_STATE_CONFLICT",
+                "the durable recovery allocation is malformed",
+            ) from error
+        return allocation
+
+    def _assert_recovery_allocation_fresh_for_claim_in_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        permit: RiskPermit,
+        intent: RiskIntent,
+    ) -> Optional[tuple[RecoveryReductionAllocation, float, int]]:  # noqa: UP045 -- Python 3.9 is supported.
+        allocation_row = connection.execute(
+            "SELECT * FROM risk_recovery_reduction_allocations "
+            "WHERE child_permit_id = ?",
+            (permit.permit_id,),
+        ).fetchone()
+        if allocation_row is None:
+            return None
+        child_row = connection.execute(
+            "SELECT * FROM risk_reservations WHERE permit_id = ?",
+            (permit.permit_id,),
+        ).fetchone()
+        if child_row is None:
+            raise PermitInvalidError(
+                "RECOVERY_ALLOCATION_STATE_CONFLICT",
+                "the recovery child permit disappeared before dispatch claim",
+            )
+        if child_row["status"] != self._ACTIVE or child_row["group_id"] is not None:
+            raise PermitInvalidError(
+                "PERMIT_NOT_ACTIVE",
+                "the recovery child permit is no longer active for dispatch",
+            )
+        allocation = self._recovery_allocation_from_row(
+            connection, allocation_row, child_row
+        )
+        parent_row = connection.execute(
+            "SELECT * FROM risk_reservations WHERE permit_id = ?",
+            (allocation.parent_permit_id,),
+        ).fetchone()
+        if not (
+            allocation.permit == permit
+            and allocation.recovery_intent_id == intent.intent_id
+            and allocation.recovery_intent_hash == intent.fingerprint
+            and allocation.permit.scope == intent.scope
+            and parent_row is not None
+            and parent_row["action"] == IntentAction.INCREASE.value
+            and parent_row["status"] == self._SETTLED
+            and parent_row["intent_id"] == allocation.parent_intent_id
+            and parent_row["intent_hash"] == allocation.parent_intent_hash
+            and parent_row["scope_key"] == intent.scope.key
+            and parent_row["instrument"] == allocation.instrument == intent.instrument
+            and parent_row["strategy_id"] == allocation.strategy_id == intent.strategy_id
+            and parent_row["allocation_version"] == allocation.allocation_version
+            == intent.allocation_version
+            and parent_row["quantity_unit"] == allocation.quantity_unit == intent.quantity_unit
+            and parent_row["position_side"] == allocation.parent_position_side
+            and parent_row["position_bucket"] == allocation.parent_position_bucket
+            and allocation.parent_order_side != allocation.order_side
+            and _recovery_position_slice_matches_parent(
+                parent_position_side=allocation.parent_position_side,
+                parent_position_bucket=allocation.parent_position_bucket,
+                parent_order_side=allocation.parent_order_side,
+                position_side=allocation.position_side,
+                position_bucket=allocation.position_bucket,
+            )
+            and parent_row["quantity"] is not None
+            and allocation.parent_filled_quantity <= _as_decimal(parent_row["quantity"])
+        ):
+            raise PermitInvalidError(
+                "RECOVERY_ALLOCATION_MISMATCH",
+                "the dispatch claim does not match its durable recovery allocation",
+            )
+        parent_receipt = self._dispatch_resolution_receipt_in_transaction(
+            connection, allocation.parent_permit_id
+        )
+        if (
+            parent_receipt.status
+            is not DispatchResolutionReceiptStatus.ACKED_TRACKED_RESOLVED
+            or parent_receipt.claim.intent_id != allocation.parent_intent_id
+            or parent_receipt.claim.intent_hash != allocation.parent_intent_hash
+        ):
+            raise PermitInvalidError(
+                "RECOVERY_PARENT_NOT_TRACKED",
+                "the original increase no longer has exact ACKED_TRACKED evidence",
+            )
+        # Sample both clocks after the durable binding and parent receipt reads.
+        # The caller performs this check again immediately before INSERT; the
+        # returned wall-clock value is also the persisted claim timestamp.
+        now = self._clock()
+        if permit.expires_at <= now:
+            raise PermitInvalidError(
+                "PERMIT_NOT_ACTIVE",
+                "the recovery child permit expired before dispatch claim",
+            )
+        now_ns = self._now_ns()
+        if not allocation.observed_at_ns <= now_ns < allocation.valid_until_ns:
+            raise PermitInvalidError(
+                "RECOVERY_SOURCE_STALE",
+                "the recovery source authorization expired before dispatch claim",
+            )
+        return allocation, now, now_ns
 
     def reserve_group_vector(
         self,
@@ -6154,6 +7334,14 @@ class DurableRiskGate:
                 )
 
             permit = self._validate_active_permit(connection, permit_id, intent)
+            has_recovery_allocation = (
+                self._assert_recovery_allocation_fresh_for_claim_in_transaction(
+                    connection,
+                    permit=permit,
+                    intent=intent,
+                )
+                is not None
+            )
 
             if permit.action is IntentAction.INCREASE:
                 self._assert_not_frozen(connection, permit.scope)
@@ -6185,6 +7373,23 @@ class DurableRiskGate:
                     raise PermitInvalidError(
                         "PERMIT_NOT_ACTIVE", "cancel permit expired before dispatch claim"
                     )
+            if has_recovery_allocation:
+                final_recovery_check = (
+                    self._assert_recovery_allocation_fresh_for_claim_in_transaction(
+                        connection,
+                        permit=permit,
+                        intent=intent,
+                    )
+                )
+                if final_recovery_check is None:
+                    raise PermitInvalidError(
+                        "RECOVERY_ALLOCATION_STATE_CONFLICT",
+                        "the recovery allocation disappeared before dispatch claim",
+                    )
+                # This timestamp was sampled after checking the child and
+                # parent bindings plus both freshness windows. Persist the
+                # same instant with the single-use claim.
+                now = final_recovery_check[1]
             connection.execute(
                 """
                 INSERT INTO risk_dispatch_claims (
@@ -6659,10 +7864,13 @@ class DurableRiskGate:
             raise PermitInvalidError(
                 policy_error, "risk database is bound to another or unknown policy"
             )
-        if reservation["action"] != IntentAction.INCREASE.value:
+        if reservation["action"] not in {
+            IntentAction.INCREASE.value,
+            IntentAction.REDUCE.value,
+        }:
             raise PermitInvalidError(
                 "DISPATCH_TERMINAL_STATE_CONFLICT",
-                "no-fill terminal evidence requires an INCREASE reservation",
+                "no-fill terminal evidence requires an eligible order reservation",
             )
         claim_row = connection.execute(
             "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?", (permit_id,)
@@ -12220,6 +13428,50 @@ class DurableRiskGate:
                     resolved_at REAL NOT NULL,
                     FOREIGN KEY(permit_id) REFERENCES risk_reservations(permit_id)
                 );
+                CREATE TABLE IF NOT EXISTS risk_recovery_reduction_allocations (
+                    child_permit_id TEXT PRIMARY KEY,
+                    parent_permit_id TEXT NOT NULL,
+                    scope_key TEXT NOT NULL,
+                    parent_intent_id TEXT NOT NULL,
+                    parent_intent_hash TEXT NOT NULL,
+                    recovery_intent_id TEXT NOT NULL,
+                    recovery_intent_hash TEXT NOT NULL,
+                    book_id TEXT NOT NULL,
+                    instrument TEXT NOT NULL,
+                    strategy_id TEXT NOT NULL,
+                    allocation_version TEXT NOT NULL,
+                    parent_order_side TEXT NOT NULL CHECK(parent_order_side IN ('BUY', 'SELL')),
+                    order_side TEXT NOT NULL CHECK(order_side IN ('BUY', 'SELL')),
+                    position_side TEXT NOT NULL CHECK(position_side IN ('NET', 'LONG', 'SHORT')),
+                    position_bucket TEXT NOT NULL CHECK(position_bucket IN ('ALL', 'TODAY', 'YESTERDAY')),
+                    quantity TEXT NOT NULL,
+                    quantity_unit TEXT NOT NULL,
+                    parent_filled_quantity TEXT NOT NULL,
+                    attributable_position_quantity TEXT NOT NULL,
+                    source_revision INTEGER NOT NULL CHECK(source_revision > 0),
+                    source_evidence_sha256 TEXT NOT NULL,
+                    source_proof_sha256 TEXT NOT NULL UNIQUE,
+                    writer_fence_sha256 TEXT NOT NULL,
+                    observed_at_ns INTEGER NOT NULL CHECK(observed_at_ns > 0),
+                    valid_until_ns INTEGER NOT NULL CHECK(valid_until_ns > observed_at_ns),
+                    allocation_sha256 TEXT NOT NULL,
+                    created_at REAL NOT NULL,
+                    UNIQUE(parent_permit_id, recovery_intent_id),
+                    FOREIGN KEY(child_permit_id) REFERENCES risk_reservations(permit_id),
+                    FOREIGN KEY(parent_permit_id) REFERENCES risk_reservations(permit_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_risk_recovery_allocations_parent
+                    ON risk_recovery_reduction_allocations(parent_permit_id, child_permit_id);
+                CREATE TRIGGER IF NOT EXISTS risk_recovery_reduction_allocation_immutable_update
+                BEFORE UPDATE ON risk_recovery_reduction_allocations
+                BEGIN
+                    SELECT RAISE(ABORT, 'recovery reduction allocations are immutable');
+                END;
+                CREATE TRIGGER IF NOT EXISTS risk_recovery_reduction_allocation_immutable_delete
+                BEFORE DELETE ON risk_recovery_reduction_allocations
+                BEGIN
+                    SELECT RAISE(ABORT, 'recovery reduction allocations are immutable');
+                END;
                 CREATE TABLE IF NOT EXISTS risk_dispatch_recovery_audits (
                     permit_id TEXT PRIMARY KEY,
                     scope_key TEXT NOT NULL,
