@@ -5,6 +5,12 @@
 
 Intelligent risk management and compliance monitoring system for 73+ exchanges. Provides real-time risk assessment, ML-driven anomaly detection, and regulatory compliance support.
 
+## Role in the trading-system architecture
+
+`bt_api_risk` implements risk policy and limit evaluation, exposure accounting, and durable permit/admission primitives for a trusted account-owner or runtime composition. Its gate governs its own ledger under the configured policy; it does not source or independently verify account, position, or instrument facts, and it is not an external writer fence. A local or fake permit alone is not live-account approval.
+
+[Trading system architecture overview](https://github.com/cloudQuant/backtrader/blob/dev/docs/TRADING_SYSTEM_ARCHITECTURE.md).
+
 ## Features
 
 ### Core Risk Management
