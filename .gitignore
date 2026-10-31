@@ -55,3 +55,6 @@ site/
 
 # Local config
 *.local
+
+# Codex scratch
+.codex-tmp/
