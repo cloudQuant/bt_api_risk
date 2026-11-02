@@ -40,6 +40,7 @@ analytics = [
 ]
 # Machine-learning models (AnomalyDetector / RiskEnsembleModel).
 ml = [
+    "numpy>=1.26.0",
     "scikit-learn>=1.0.0",
 ]
 dev = [

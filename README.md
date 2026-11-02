@@ -1,5 +1,11 @@
 ﻿# bt_api_risk
 
+The working-tree Risk journal uses only v6 provider-scoped order provenance; the v1–v4 contracts have been removed and v5 is not accepted for Risk/group proofs. All 13 providers declare their own native aliases and neutral fields; Bybit, dYdX and Kraken currently have no native fill aliases and their field coverage requires review. This source work, binding and recovery are not behavior-validated.
+
+The working-tree Risk package owns the risk-only order journal, its SQLite/OS-lock storage, record types, event chain and account writer fence. The SDK journal subclass composes provider evidence selection and Gateway receipt verification. Optional Execution cancellation-source binding and projections are composed in the SDK; the Risk journal has no direct Execution imports and rejects those paths when the bridge is absent. Type module names, serialization, Python versions, installation, existing-data and concurrency behavior remain unvalidated. The working-tree Risk package also owns CLOSE proof payload encoding/decoding and position-dimension parsing; Journal source checks and writer fencing remain separate. Old-data compatibility and behavior remain unvalidated.
+
+The working-tree order valuation projection constructs valuation digests and compares FX fields. SDK journal source binding and fencing remain separate; behavior remains unvalidated.
+
 [![Python 3.9-3.14](https://img.shields.io/badge/python-3.9--3.14-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
@@ -7,9 +13,17 @@ Intelligent risk management and compliance monitoring system for 73+ exchanges. 
 
 ## Role in the trading-system architecture
 
+The working-tree `position_baseline` owns position-risk revaluation and strategy/account aggregation. The SDK composes external source verification; the Risk journal owns the event chain and writer fencing. Source and distribution remain unaccepted.
+
 `bt_api_risk` implements risk policy and limit evaluation, exposure accounting, and durable permit/admission primitives for a trusted account-owner or runtime composition. Its gate governs its own ledger under the configured policy; it does not source or independently verify account, position, or instrument facts, and it is not an external writer fence. A local or fake permit alone is not live-account approval.
 
 [Trading system architecture overview](https://github.com/cloudQuant/backtrader/blob/dev/docs/TRADING_SYSTEM_ARCHITECTURE.md).
+
+The working tree consolidates the former SDK risk analytics, limits, policy, containers and ML implementation here. It replaces the older analytical copies with the SDK split implementation while retaining the separate durable admission components. The merge, supported imports and distribution have not been behavior-accepted.
+
+`bt_api_risk.position_payload` decodes Risk position facts, instrument metadata, FX, Greeks and coverage payloads. The SDK composition verifies Gateway receipts while the Risk journal checks its fences; decoding does not establish provenance. This source migration is not behavior- or distribution-accepted.
+
+`bt_api_risk.ctp_budget` owns the working-tree CTP path-budget policy and limit arithmetic; `ctp_budget_journal_projection` owns budget journal value/row-state projections and transition rules without I/O or authority. SDK sessions retain reservation seals and durable state; explicitly selecting this budget requires Risk. This source migration is not behavior or account acceptance.
 
 ## Features
 
