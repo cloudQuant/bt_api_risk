@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -375,7 +374,7 @@ class TestRiskEnsembleModel:
         assert len(predictions) == 10
         assert proba.shape[0] == 10
 
-    def test_save_and_load_model(self):
+    def test_save_and_load_model(self, tmp_path, monkeypatch):
         """Test model save and load - sklearn models need refitting after load."""
         model = RiskEnsembleModel()
 
@@ -385,8 +384,8 @@ class TestRiskEnsembleModel:
 
         model.train(X, y)
 
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-            model_path = f.name
+        monkeypatch.setattr("bt_api_risk.ml_models.ml_base._MODELS_DIR", tmp_path.resolve())
+        model_path = str(tmp_path / "model.pkl")
 
         try:
             assert model.save_model(model_path) is True

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -123,7 +122,7 @@ class TestBaseMLModel:
         assert "recall" in metrics
         assert "f1_score" in metrics
 
-    def test_save_and_load_model(self):
+    def test_save_and_load_model(self, tmp_path, monkeypatch):
         """Test model save and load roundtrip."""
         model = DummyMLModel("test", config={"key": "value"})
         model.feature_names = ["f1", "f2"]
@@ -133,8 +132,8 @@ class TestBaseMLModel:
         y = np.array([0, 1])
         model.train(X, y)
 
-        with tempfile.NamedTemporaryFile(suffix=".pkl", delete=False) as f:
-            model_path = f.name
+        monkeypatch.setattr("bt_api_risk.ml_models.ml_base._MODELS_DIR", tmp_path.resolve())
+        model_path = str(tmp_path / "model.pkl")
 
         try:
             # Save
@@ -159,12 +158,16 @@ class TestBaseMLModel:
         # Invalid path should return False
         assert model.save_model("/nonexistent/path/model.pkl") is False
 
-    def test_load_model_error_handling(self):
-        """Test load_model handles errors gracefully."""
+    def test_load_model_error_handling(self, tmp_path, monkeypatch):
+        """Missing permitted files fail gracefully; outside paths are rejected."""
         model = DummyMLModel("test")
+        allowed = tmp_path / "models"
+        allowed.mkdir()
+        monkeypatch.setattr("bt_api_risk.ml_models.ml_base._MODELS_DIR", allowed.resolve())
 
-        # Non-existent file should return False
-        assert model.load_model("/nonexistent/path/model.pkl") is False
+        assert model.load_model(str(allowed / "missing.pkl")) is False
+        with pytest.raises(ValueError, match="Refusing to load model"):
+            model.load_model(str(tmp_path / "outside.pkl"))
 
     def test_get_feature_importance(self):
         """Test getting feature importance."""

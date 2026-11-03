@@ -506,6 +506,7 @@ def test_expired_baseline_allows_order_reconciliation_only_until_clean_refresh(l
 
     clock = type("MutableClock", (), {"value": _NOW + 3601.0})()
     gate._clock = lambda: clock.value
+    gate._clock_ns = lambda: int(clock.value * 1_000_000_000)
     observed_at_ns = int(clock.value * 1_000_000_000)
     cancel = _observation(
         scope,
@@ -589,6 +590,7 @@ def test_admission_rechecks_each_persisted_valuation_fact_age(live_risk, stale_f
     gate.apply_order_exposure_observation(observation)
 
     gate._clock = lambda: _NOW + 200.0
+    gate._clock_ns = lambda: int((_NOW + 200.0) * 1_000_000_000)
     with pytest.raises(RiskDeniedError) as stale_admission:
         gate.reserve(_intent(scope, "denied-by-stale-" + stale_fact, "1"))
 
@@ -651,6 +653,7 @@ def test_order_observation_expiring_while_waiting_for_fence_is_not_committed(liv
     _, tracked = _tracked_order(gate, scope, intent)
     clock = type("MutableClock", (), {"value": _NOW})()
     gate._clock = lambda: clock.value
+    gate._clock_ns = lambda: int(clock.value * 1_000_000_000)
     gate._gross_exposure_authority = AdvancingJournalAuthority(clock, 2.0)
     proof = _observation(
         scope,
@@ -1050,6 +1053,7 @@ def _call_after_sqlite_writer_wait(gate, operation, *, advance_seconds):
 
     clock = _MutableObservedClock(_NOW)
     gate._clock = clock
+    gate._clock_ns = lambda: int(clock() * 1_000_000_000)
     outcome = {}
 
     def invoke_operation():

@@ -361,18 +361,29 @@ def test_mapper_requires_digest_and_proven_position_effect() -> None:
     assert unknown_effect.value.code == "INSTRUMENT_POSITION_EFFECT_UNPROVEN"
 
 
-def test_mapper_keeps_a_proven_reduce_available_when_entry_metadata_is_stale() -> None:
-    metadata = _metadata()
+def test_mapper_keeps_a_proven_reduce_available_when_entry_metadata_is_stale(tmp_path) -> None:
+    metadata = _metadata(valuation_unit="USD", quantity_unit="contract")
     scope = AccountScope("fixture", "account", "sandbox")
+    execution_scope = SimpleNamespace(
+        provider="fixture", environment="sandbox", account_ref="account", strategy_id="strategy-1"
+    )
+    gate = DurableRiskGate(
+        tmp_path / "allocation.db", RiskPolicy("test", Decimal("1000"), 5, notional_unit="USD")
+    )
+    gate.set_strategy_allocation(
+        scope, "strategy-1", "revision-1", max_notional=Decimal("1000"), notional_unit="USD"
+    )
     mapper = InstrumentRiskAdmissionMapper(
         scope,
         InstrumentRiskRegistry((metadata,)),
         clock_ns=lambda: 2_001,
+        allocation_reader=lambda requested: gate.get_strategy_allocation(scope, requested.strategy_id),
     )
     close = _execution_shape(
         metadata,
         price=None,
         position_effect=SimpleNamespace(value="CLOSE"),
+        scope=execution_scope,
     )
 
     mapped = mapper(close)
