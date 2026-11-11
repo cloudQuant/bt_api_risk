@@ -49,12 +49,14 @@ def _call(
 
 
 def _assert_fixed_source_origins() -> None:
+    # The classes must come from this checkout (bt_api_risk) and its sibling
+    # bt_api_base checkout, not from some other installed copy.
     root = Path(__file__).resolve().parents[1]
     assert Path(inspect.getsourcefile(PolicyCatalogService)).resolve() == (
-        root / "risk" / "src" / "bt_api_risk" / "service_component.py"
+        root / "src" / "bt_api_risk" / "service_component.py"
     )
     assert Path(inspect.getsourcefile(WireScope)).resolve() == (
-        root / "base" / "src" / "bt_api_base" / "service_protocol.py"
+        root.parent / "bt_api_base" / "src" / "bt_api_base" / "service_protocol.py"
     )
 
 
