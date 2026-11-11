@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import importlib
 import importlib.util
 import json
 import subprocess
@@ -41,8 +42,9 @@ def no_external_io(event, args):
         raise AssertionError("admission performed socket I/O")
 sys.addaudithook(no_external_io)
 module = importlib.import_module(sys.argv[2])
-assert "RiskManager" in dir(module)
-assert "RiskManager" not in vars(module)
+assert "RiskAssessor" in dir(module)
+assert "RiskAssessor" not in vars(module)
+assert "RiskManager" not in dir(module)
 scope = module.AccountScope(provider="fake", account_id="import-test", environment="sandbox")
 policy = module.RiskPolicy(
     policy_id="import-test", max_increase_notional=Decimal("100"), max_increase_count=3,
@@ -71,19 +73,39 @@ assert not (blocked & {name.split(".")[0] for name in sys.modules})
 
 
 def test_lazy_exports_keep_established_types_and_missing_attribute_errors():
-    from bt_api_risk import AnomalyDetector, RiskAssessor, RiskEnsembleModel, RiskManager
-    from bt_api_risk.core import LimitsManager, PolicyEngine, RiskCalculator
-    from bt_api_risk.core.risk_manager import RiskManager as Implementation
+    from bt_api_risk import AnomalyDetector, RiskAssessor, RiskEnsembleModel
+    from bt_api_risk.core import PolicyEngine, RiskCalculator
 
-    assert RiskManager is Implementation
     for exported in (
         AnomalyDetector,
         RiskAssessor,
         RiskEnsembleModel,
-        LimitsManager,
         PolicyEngine,
         RiskCalculator,
     ):
         assert isinstance(exported, type)
     with pytest.raises(AttributeError, match="unknown_public_name"):
         _ = bt_api_risk.unknown_public_name
+
+
+def test_deleted_legacy_risk_manager_names_are_gone():
+    """D64-06: the fail-open ``RiskManager`` and its limit facade were deleted."""
+
+    import bt_api_risk.core
+
+    for module, name in (
+        (bt_api_risk, "RiskManager"),
+        (bt_api_risk.core, "RiskManager"),
+        (bt_api_risk.core, "LimitsManager"),
+    ):
+        assert name not in module.__all__
+        assert name not in dir(module)
+        with pytest.raises(AttributeError):
+            getattr(module, name)
+    for path in (
+        "bt_api_risk.core.risk_manager",
+        "bt_api_risk.core.limits_manager",
+        "bt_api_risk.core.order_limits",
+    ):
+        with pytest.raises(ImportError):
+            importlib.import_module(path)

@@ -574,7 +574,7 @@ def _assert_persisted_state(
             snapshot = reopened.snapshot(scope)
             assert snapshot["increase_count"] == expected_count_per_account
             assert snapshot["increase_notional"] == expected_notional_per_account
-            assert snapshot["active_freeze_reasons"] == []
+            assert snapshot["active_entry_block_reasons"] == []
 
             strategy_total = Decimal("0")
             for strategy_index in range(_STRATEGIES_PER_ACCOUNT):

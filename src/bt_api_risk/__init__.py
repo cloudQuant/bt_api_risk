@@ -1,29 +1,18 @@
-"""智能风控和合规监控系统
+"""bt_api_risk: durable pre-trade admission primitives plus optional analytics.
 
-Intelligent Risk Management and Compliance Monitoring System for 73+ exchanges.
+Three parts (see README.md for the evidence level of each):
 
-核心功能:
-1. 实时风险监控 - 交易前、交易中、交易后全流程风控
-2. 智能风险评估 - 机器学习驱动的风险评分和预测
-3. 合规监控 - 市场操纵检测、内幕交易监控、反洗钱
-4. 动态限制管理 - 基于风险等级的动态调整和自动限制
-5. 异常检测 - 行为分析、模式识别、异常交易检测
-6. 实时监控仪表板 - 风险指标可视化、告警系统、决策支持
+1. Admission primitives: ``DurableRiskGate`` (SQLite ledger of reservations,
+   dispatch claims, STOP_NEW causes and dispatch in-flight latches) and the
+   iteration-60 managed adapters built on it.
+2. Pre-trade service catalog ``bt_api_risk.pretrade`` (iteration 64, R-01..R-11;
+   REVIEW_PENDING).
+3. Analytics and ML helpers (``RiskAssessor``, ``RiskCalculator``,
+   ``AnomalyDetector``, ``RiskEnsembleModel``). They are not admission controls
+   and never gate an order.
 
-技术特性:
-- 机器学习模型 (随机森林、神经网络、异常检测算法)
-- 实时流处理 (异步事件处理)
-- 复杂事件处理 (CEP) 引擎
-- 图计算 (关系网络分析)
-- 时间序列数据库 (风险指标存储)
-- 规则引擎 (基于事件和模式的规则系统)
-
-合规标准:
-- 市场操纵检测 (spoofing、layering、front running)
-- 反洗钱 (AML) 和了解你的客户 (KYC)
-- 交易报告 (MiFID II、SEC Rule 606)
-- 仓位限制和集中度限制
-- 信用风险和保证金管理
+The package performs no provider or network I/O and makes no regulatory
+compliance claim.
 """
 
 from __future__ import annotations
@@ -56,10 +45,6 @@ from .core.admission import (
     DispatchTrackedOrderProof,
     DurableRiskGate,
     DurableRiskPolicyBinding,
-    FreezeActivationResult,
-    FreezeActivationStatus,
-    FreezeResolution,
-    FreezeResolutionStatus,
     IntentAction,
     PermitInvalidError,
     RecoveryCloseSourceProof,
@@ -75,8 +60,13 @@ from .core.admission import (
     RiskGroupReservationReceipt,
     RiskGroupReservationState,
     RiskIntent,
+    RiskLedgerSchemaError,
     RiskPermit,
     RiskPolicy,
+    StopNewActivationResult,
+    StopNewActivationStatus,
+    StopNewResolution,
+    StopNewResolutionStatus,
     StrategyAllocationSnapshot,
     VerifiedCancelDispatchResolution,
     VerifiedCancellationJournalAuthority,
@@ -121,7 +111,6 @@ from .core.instrument import (
 
 _ANALYSIS_EXPORTS = {
     "RiskAssessor": ".core.risk_assessor",
-    "RiskManager": ".core.risk_manager",
     "AnomalyDetector": ".ml_models.anomaly_detector",
     "RiskEnsembleModel": ".ml_models.ensemble_model",
 }
@@ -137,7 +126,6 @@ _ADMISSION_EXPORTS = {
 # dependency set. Requesting them without the extra must fail explicitly
 # instead of surfacing a bare module-not-found from deep inside the package.
 _OPTIONAL_EXTRAS = {
-    "RiskManager": "analytics",
     "AnomalyDetector": "ml",
     "RiskEnsembleModel": "ml",
 }
@@ -168,8 +156,7 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
-    # Core Risk Management
-    "RiskManager",
+    # Analytics (not admission)
     "RiskAssessor",
     # ML Models
     "RiskEnsembleModel",
@@ -203,10 +190,10 @@ __all__ = [
     "DispatchTerminalResolutionReceiptStatus",
     "DispatchTerminalState",
     "DispatchTrackedOrderProof",
-    "FreezeActivationResult",
-    "FreezeActivationStatus",
-    "FreezeResolution",
-    "FreezeResolutionStatus",
+    "StopNewActivationResult",
+    "StopNewActivationStatus",
+    "StopNewResolution",
+    "StopNewResolutionStatus",
     "ExposureAccountingMode",
     "GrossExposureAuthority",
     "GrossExposureBaselineProof",
@@ -234,6 +221,7 @@ __all__ = [
     "RiskExposureKind",
     "RiskExposureLimit",
     "RiskGateError",
+    "RiskLedgerSchemaError",
     "RiskGroupLegClaimReceipt",
     "RiskGroupLegIntent",
     "RiskGroupReservationLeg",

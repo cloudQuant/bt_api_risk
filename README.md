@@ -1,180 +1,121 @@
 ﻿# bt_api_risk
 
-The working-tree Risk journal uses only v6 provider-scoped order provenance; the v1–v4 contracts have been removed and v5 is not accepted for Risk/group proofs. All 13 providers declare their own native aliases and neutral fields; Bybit, dYdX and Kraken currently have no native fill aliases and their field coverage requires review. This source work, binding and recovery are not behavior-validated.
-
-The working-tree Risk package owns the risk-only order journal, its SQLite/OS-lock storage, record types, event chain and account writer fence. The SDK journal subclass composes provider evidence selection and Gateway receipt verification. Optional Execution cancellation-source binding and projections are composed in the SDK; the Risk journal has no direct Execution imports and rejects those paths when the bridge is absent. Type module names, serialization, Python versions, installation, existing-data and concurrency behavior remain unvalidated. The working-tree Risk package also owns CLOSE proof payload encoding/decoding and position-dimension parsing; Journal source checks and writer fencing remain separate. Old-data compatibility and behavior remain unvalidated.
-
-The working-tree order valuation projection constructs valuation digests and compares FX fields. SDK journal source binding and fencing remain separate; behavior remains unvalidated.
-
-[![Python 3.9-3.14](https://img.shields.io/badge/python-3.9--3.14-blue.svg)](https://www.python.org/downloads/)
+[![Python 3.9-3.13](https://img.shields.io/badge/python-3.9--3.13-blue.svg)](https://www.python.org/downloads/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](https://opensource.org/licenses/MIT)
 
-Intelligent risk management and compliance monitoring system for 73+ exchanges. Provides real-time risk assessment, ML-driven anomaly detection, and regulatory compliance support.
+`bt_api_risk` holds three separate things: durable pre-trade admission
+primitives, the iteration-64 pre-trade service catalog, and optional analytics.
+Only the first two take part in order admission. The package performs no
+provider or network I/O, does not source or independently verify account,
+position or instrument facts, and makes no regulatory-compliance claim. A local
+or fake permit is not a live-account approval and enables no provider write
+route.
 
-## Role in the trading-system architecture
+Evidence levels used below: **UNIT/FAKE** (local tests with synthetic data),
+**INTEGRATION_SIM** (local multi-process simulation with fake providers),
+**PACKAGE** (installed wheel), **real** (a venue account). Nothing in this
+package is accepted at the real level; source existence is not acceptance.
 
-The working-tree `position_baseline` owns position-risk revaluation and strategy/account aggregation. The SDK composes external source verification; the Risk journal owns the event chain and writer fencing. Source and distribution remain unaccepted.
-
-`bt_api_risk` implements risk policy and limit evaluation, exposure accounting, and durable permit/admission primitives for a trusted account-owner or runtime composition. Its gate governs its own ledger under the configured policy; it does not source or independently verify account, position, or instrument facts, and it is not an external writer fence. A local or fake permit alone is not live-account approval.
+Base dependencies are `bt_api_base`, `pydantic` and `typing-extensions`.
+`numpy` is only needed by the optional `analytics` extra, and `numpy` plus
+`scikit-learn` by the optional `ml` extra.
 
 [Trading system architecture overview](https://github.com/cloudQuant/backtrader/blob/dev/docs/TRADING_SYSTEM_ARCHITECTURE.md).
 
-The working tree consolidates the former SDK risk analytics, limits, policy, containers and ML implementation here. It replaces the older analytical copies with the SDK split implementation while retaining the separate durable admission components. The merge, supported imports and distribution have not been behavior-accepted.
+## 1. Admission primitives (iteration-60 managed path)
 
-`bt_api_risk.position_payload` decodes Risk position facts, instrument metadata, FX, Greeks and coverage payloads. The SDK composition verifies Gateway receipts while the Risk journal checks its fences; decoding does not establish provenance. This source migration is not behavior- or distribution-accepted.
+`DurableRiskGate` (`core/admission.py`) is a SQLite ledger of reservations,
+dispatch claims, STOP_NEW causes and dispatch in-flight latches for one trusted
+account owner. The iteration-60 in-process managed path (`RiskOrderEntryService`,
+the Execution facade and the SDK registry) keeps using it as a compatibility
+core; the iteration-64 Risk service does not (section 2).
 
-`bt_api_risk.ctp_budget` owns the working-tree CTP path-budget policy and limit arithmetic; `ctp_budget_journal_projection` owns budget journal value/row-state projections and transition rules without I/O or authority. SDK sessions retain reservation seals and durable state; explicitly selecting this budget requires Risk. This source migration is not behavior or account acceptance.
+- **STOP_NEW causes.** `stop_new`, `activate_stop_new_once`, `resolve_stop_new`
+  and `resolve_stop_new_exact` record and clear independent account-scope
+  causes. While one is active, new risk-increasing reservations and claims are
+  refused with `STOP_NEW_ACTIVE`; reductions, cancels and settlement continue.
+- **Dispatch in-flight latch.** A successful dispatch claim leaves a
+  `dispatch-inflight:<intent_id>` latch, which also blocks new increases of the
+  account. `settle` and `ensure_settled` do not clear it, and the generic
+  `resolve_stop_new` refuses it (`DISPATCH_INFLIGHT_REQUIRES_RECONCILIATION`).
+  `resolve_dispatch_inflight`, `resolve_cancel_dispatch_inflight` and
+  `resolve_dispatch_inflight_recovered` require an injected journal authority
+  that holds the account-wide writer fence while it verifies an exact current
+  journal row, the single dispatch attempt and the account/intent/permit/claim
+  binding. The allowed resolutions are a rejected or canceled zero-fill
+  terminal, or an `ACKED_TRACKED` transfer to an exact durable order exposure
+  reservation. No authority is installed by default; a verifier that cannot
+  prove those facts must keep the latch active.
+- **Ledger table.** STOP_NEW causes and in-flight latches share the table
+  `risk_entry_blocks`. A ledger written before iteration 64 has `risk_freezes`;
+  opening it renames the table in one write transaction (rows, indexes and
+  triggers move with it). A ledger that holds both names refuses to open with
+  `RISK_ENTRY_BLOCK_TABLE_CONFLICT`; any other migration failure rolls back and
+  refuses with `RISK_ENTRY_BLOCK_MIGRATION_FAILED` (`RiskLedgerSchemaError`).
+- **Increase limits.** `RiskPolicy.max_increase_notional/count` count ACTIVE and
+  SETTLED reservations over the ledger's lifetime, not per trading day.
+- The result field `has_other_active_freezes` and the receipt fields
+  `dispatch_latch_active` keep their historical names because Execution and
+  Monitor receipts persisted them.
 
-## Features
+Supporting modules owned here (source migrations; behavior, old-data and
+distribution acceptance remain open): the risk-only order journal and its
+SQLite/OS-lock storage (`risk_order_journal*`; v6 provider-scoped order
+provenance only), CLOSE proof payloads (`order_proof_payload`), position and
+instrument payload decoding (`position_payload`), order valuation digests
+(`order_valuation`), position-risk revaluation (`position_baseline`), and the
+CTP path budget (`ctp_budget`, `ctp_budget_journal_projection`; historical
+SimNow budget path, its CNY constants are not used by section 2). The SDK
+composes provider evidence, Gateway receipt verification and writer fencing
+around them.
 
-### Core Risk Management
-- **RiskManager** — Central risk management orchestrator for pre-trade, in-trade, and post-trade risk controls
-- **RiskAssessor** — Real-time risk scoring and limit enforcement
+Evidence: UNIT/FAKE in this package and INTEGRATION_SIM in the SDK host tests;
+no real-account acceptance.
 
-### Machine Learning Models
-- **RiskEnsembleModel** — Ensemble model combining Random Forest, Neural Network, and XGBoost for risk prediction
-- **AnomalyDetector** — Behavioral pattern recognition and outlier detection for suspicious trading activity
+## 2. Pre-trade service catalog (`bt_api_risk.pretrade`, iteration 64)
 
-### Risk Containers
-- **RiskEvent** — Structured event type for risk-triggered incidents
-- **RiskEventType** — Enum of event types (POSITION_LIMIT, MARGIN_CALL, etc.)
-- **RiskLevel** — Enum of risk levels (LOW, MEDIUM, HIGH, CRITICAL)
-- **RiskMetrics** — Container for aggregated risk metrics
+The independent Risk service (one process per account, hosted by the SDK)
+uses a new pre-trade ledger and rule engine implemented in
+`bt_api_risk.pretrade`. Status: **REVIEW_PENDING**; evidence: **UNIT/FAKE**.
 
-### Provider-independent admission primitives
+| ID | Control |
+| --- | --- |
+| R-01 | Single-order quantity cap per writing principal x instrument, required, OPEN and CLOSE |
+| R-01b | Optional single-order notional cap (quantity x price x multiplier) |
+| R-02 | Optional price band against a reference price; when enabled, market orders are refused |
+| R-03 | Optional worst-case position limits (filled plus in flight, UNKNOWN counted) |
+| R-03b | Close capacity: this close <= account closable - other in-flight closes |
+| R-04 | Order/cancel counts per account x instrument x trading day |
+| R-05 | Self-trade prevention against the account's own active opposite orders |
+| R-06 | Duplicate-order window |
+| R-07 | Optional daily loss and drawdown limits |
+| R-08 | Optional margin pre-check (off unless configured) |
+| R-09 | No new control: trading-permission facts stay with iteration 62 checks |
+| R-10 | Emergency-control requests through the Gateway control port |
+| R-11 | Single-account exchange-rule file limits |
 
-`DurableRiskGate` and the instrument admission types provide deterministic,
-local contracts for offline fake-client smoke tests. They do not source trusted
-account, position, exchange metadata, or policy facts, and do not constitute a
-real-account risk approval or enable a provider write route. A production
-composition must independently supply and verify those authorities.
+The authoritative semantics, finite refusal codes and open gaps are in the
+iteration-64 plan and design-freeze documents; a control listed here is not
+accepted until those documents say so.
 
-A successful dispatch claim leaves a `dispatch-inflight:<intent_id>` account
-freeze. `settle` and `ensure_settled` require the matching durable claim and do
-not clear that latch. The generic `resolve_freeze` method refuses dispatch
-latches. `resolve_dispatch_freeze` requires an injected journal authority that
-holds the account-wide writer fence while it verifies an exact current journal
-row, the single dispatch attempt, and the account/intent/permit/claim binding,
-then yields a typed `VerifiedDispatchResolution` bound to the proof digest. A
-bare boolean cannot clear the latch; the receipt itself is not a signature or
-proof of provider truth outside that injected authority.
-The allowed resolutions are a rejected or canceled zero-fill terminal, or an
-`ACKED_TRACKED` transfer to an exact durable order exposure reservation. The
-tracked order's settled notional remains counted as risk capacity; this API
-does not clear positions, margins, fills, or later order lifecycle state.
-No authority is installed by default. The Iteration 41 CTP reconciliation
-observation alone is not sufficient: its independent native queries do not
-prove a common atomic snapshot or an account-wide writer fence. A verifier
-that cannot prove those facts must keep the latch active. Fake simulation
-evidence is restricted to `fake`/`fixture` scopes and cannot bind a native CTP
-scope.
+## 3. Analytics and ML (not admission)
 
-### Compliance Standards
-- Market Manipulation Detection (spoofing, layering, front-running)
-- Anti-Money Laundering (AML) and Know Your Customer (KYC)
-- MiFID II and SEC Rule 606 trade reporting
-- Position limits and concentration risk limits
-- Credit risk and margin management
+`RiskAssessor`, `RiskCalculator` and `PolicyEngine` (`core/`), and the
+`AnomalyDetector` / `RiskEnsembleModel` models (`ml_models/`, `ml` extra) are
+analysis helpers. They never gate an order and are not part of sections 1 or 2.
+`RiskEvent`, `RiskEventType`, `RiskLevel` and `RiskMetrics` are their data
+containers. The former `RiskManager` and its `LimitsManager` facade were
+deleted in iteration 64 (D64-06) because they defaulted to allowing orders.
+
+Evidence: UNIT/FAKE only.
 
 ## Installation
 
 ```bash
-pip install bt_api_risk
+pip install bt_api_risk                # admission primitives and service catalog
+pip install "bt_api_risk[analytics]"   # adds numpy for RiskCalculator
+pip install "bt_api_risk[ml]"          # adds numpy and scikit-learn for the ML models
 ```
-
-## Requirements
-
-- Python >= 3.9
-- numpy >= 1.26.0
-- pydantic >= 2.0.0
-
-## Quick Start
-
-```python
-from bt_api_risk import RiskManager, RiskAssessor, RiskLevel, RiskEvent, RiskEventType
-
-# Initialize the risk manager
-risk_mgr = RiskManager()
-
-# Create a risk assessment
-assessor = RiskAssessor()
-risk_score = assessor.assess_position(
-    exchange="BINANCE___SPOT",
-    symbol="BTCUSDT",
-    position_value=100000.0,
-    account_equity=500000.0,
-)
-print(f"Risk level: {risk_score.level}")  # RiskLevel.MEDIUM
-
-# Emit a risk event
-event = RiskEvent(
-    event_type=RiskEventType.POSITION_LIMIT,
-    level=RiskLevel.HIGH,
-    exchange="BINANCE___SPOT",
-    symbol="BTCUSDT",
-    message="Position exceeds single-symbol limit",
-)
-risk_mgr.emit(event)
-```
-
-### Anomaly Detection
-
-```python
-from bt_api_risk import AnomalyDetector
-
-detector = AnomalyDetector(threshold=0.8)
-is_anomalous = detector.is_anomalous(
-    features={
-        "trade_frequency": 150,
-        "order_size_ratio": 0.95,
-        "price_impact": 0.12,
-    }
-)
-```
-
-### ML Ensemble Risk Model
-
-```python
-from bt_api_risk import RiskEnsembleModel
-
-model = RiskEnsembleModel()
-risk_prob = model.predict_risk(
-    features={
-        "position_concentration": 0.75,
-        "leverage_ratio": 2.5,
-        "daily_volatility": 0.04,
-        "liquidity_score": 0.6,
-    }
-)
-print(f"Risk probability: {risk_prob:.3f}")
-```
-
-## API Reference
-
-| Class | Description |
-|--------|-------------|
-| `RiskManager` | Central orchestrator for risk controls |
-| `RiskAssessor` | Real-time risk scoring engine |
-| `RiskEnsembleModel` | ML ensemble for risk prediction |
-| `AnomalyDetector` | Behavioral anomaly detection |
-| `RiskEvent` | Risk incident event container |
-| `RiskEventType` | Enum of risk event types |
-| `RiskLevel` | Enum of risk severity levels |
-| `RiskMetrics` | Aggregated risk metrics container |
-
-## Compliance Standards
-
-| Standard | Description |
-|----------|-------------|
-| MiFID II | EU markets instrument directive |
-| SEC Rule 606 | US trade reporting |
-| AML/KYC | Anti-money laundering / Know your customer |
-| Basel III | Banking capital requirements |
-| MAR | EU market abuse regulation |
-
-## Documentation
-
-Full documentation available at [bt_api_py documentation](https://cloudquant.github.io/bt_api_py/).
 
 ## License
 

@@ -17,11 +17,13 @@ no network, and no monkeypatching of gate internals.
 from __future__ import annotations
 
 import importlib.util
+import io
 import json
 import os
 import shutil
 import subprocess
 import sys
+import tarfile
 from decimal import Decimal
 from hashlib import sha256
 from pathlib import Path
@@ -42,7 +44,12 @@ from bt_api_risk.core.admission import ClosablePositionSnapshot
 
 _FACTS_OBSERVED_NS = 100_000_000_000
 _FACTS_VALID_UNTIL_NS = 1_000_000_000_000
-_HEAD_REVISION = "e2bedb3"
+# Reference revision for the legacy REDUCE parity check: the last commit before
+# iteration 64 renamed the freeze vocabulary (the older pin e2bedb3 predates later
+# additive columns, so a byte-level comparison against it could never pass).
+_HEAD_REVISION = "e156994"
+# Iteration 64 renamed this snapshot key and nothing else in the probe output.
+_RENAMED_SNAPSHOT_KEYS = {"active_freeze_reasons": "active_entry_block_reasons"}
 
 
 class _Clock:
@@ -621,28 +628,32 @@ def test_legacy_reduce_without_binding_matches_head_revision(tmp_path):
         pytest.skip("git is not available; the head-parity comparison cannot run")
     if located.returncode != 0:
         pytest.skip("not a git checkout; the head-parity comparison cannot run")
-    head_show = subprocess.run(
+    # Run the whole package of the pinned revision, not the pinned admission.py
+    # inside today's package: later releases renamed modules that the pinned
+    # admission.py imports (iteration 64: core/freeze_activation.py ->
+    # core/stop_new_activation.py), so a mixed tree cannot import at all.
+    head_archive = subprocess.run(
         [
             "git",
             "-C",
             located.stdout.strip(),
-            "show",
-            _HEAD_REVISION + ":src/bt_api_risk/core/admission.py",
+            "archive",
+            "--format=tar",
+            _HEAD_REVISION,
+            "src/bt_api_risk",
         ],
         capture_output=True,
     )
-    if head_show.returncode != 0:
-        pytest.skip("the head revision of admission.py is unavailable")
+    if head_archive.returncode != 0:
+        pytest.skip("the head revision of bt_api_risk is unavailable")
 
     head_source = tmp_path / "head-source"
     if head_source.exists():
         shutil.rmtree(head_source)
-    shutil.copytree(
-        package_dir,
-        head_source / "bt_api_risk",
-        ignore=shutil.ignore_patterns("__pycache__"),
-    )
-    (head_source / "bt_api_risk" / "core" / "admission.py").write_bytes(head_show.stdout)
+    head_source.mkdir()
+    with tarfile.open(fileobj=io.BytesIO(head_archive.stdout)) as archive:
+        archive.extractall(head_source, filter="data")
+    head_source = head_source / "src"
 
     environment = dict(os.environ)
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
@@ -666,9 +677,14 @@ def test_legacy_reduce_without_binding_matches_head_revision(tmp_path):
     spec.loader.exec_module(probe)
     worktree_result = probe.run(str(tmp_path / "worktree-parity.sqlite3"))
     canonical = json.dumps(worktree_result, sort_keys=True, separators=(",", ":"), default=str)
-    assert completed.stdout.strip() == canonical
-
     head_result = json.loads(completed.stdout)
+    snapshot = head_result.get("snapshot")
+    if isinstance(snapshot, dict):
+        head_result["snapshot"] = {
+            _RENAMED_SNAPSHOT_KEYS.get(key, key): value for key, value in snapshot.items()
+        }
+    assert json.dumps(head_result, sort_keys=True, separators=(",", ":")) == canonical
+
     assert head_result["replay_same_permit"] is True
     assert head_result["reduce_permit_intent"] == "parity-reduce"
     legacy_rows = [row for row in worktree_result["rows"] if row["intent_id"] == "parity-reduce"]

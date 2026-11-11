@@ -248,7 +248,7 @@ def _acked_tracked(gate, scope, intent_id: str, *, instrument: str = "venue/cont
         filled_quantity=0,
         trade_count=0,
     )
-    gate.resolve_dispatch_freeze(tracked)
+    gate.resolve_dispatch_inflight(tracked)
     return intent, tracked
 
 
@@ -825,7 +825,7 @@ def test_incremental_cross_permit_conflict_rolls_back_and_keeps_latch(risk):
     with pytest.raises(RiskDeniedError) as gated:
         gate.reserve(_intent(scope, "identity-incremental-c", instrument="venue/contract-a"))
     assert gated.value.code == "ORDER_EXPOSURE_RECONCILIATION_REQUIRED"
-    assert "dispatch-inflight:" + tracked_b.intent_id not in gate.active_freeze_reasons(scope)
+    assert "dispatch-inflight:" + tracked_b.intent_id not in gate.active_entry_block_reasons(scope)
     gate.close()
 
 

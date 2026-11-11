@@ -253,13 +253,13 @@ def test_actual_order_contract_maps_to_durable_permit_and_recovers_settlement(tm
     snapshot = recovered_gate.snapshot(account_scope)
     assert snapshot["increase_count"] == 1
     assert snapshot["increase_notional"] == Decimal("20")
-    assert snapshot["active_freeze_reasons"] == ["dispatch-inflight:intent-1"]
+    assert snapshot["active_entry_block_reasons"] == ["dispatch-inflight:intent-1"]
 
     blocked_order = _order(execution, metadata, intent_id="intent-blocked", quantity="0.25")
     with pytest.raises(RiskAdmissionDeniedError) as frozen:
         recovered_adapter.reserve(blocked_order)
     assert isinstance(frozen.value, PermissionError)
-    assert frozen.value.code == "FROZEN"
+    assert frozen.value.code == "STOP_NEW_ACTIVE"
 
     release_scope = AccountScope("fake", "account-2", "sandbox")
     release_policy = RiskPolicy(
@@ -284,7 +284,7 @@ def test_actual_order_contract_maps_to_durable_permit_and_recovers_settlement(tm
     assert inactive.value.code == "PERMIT_NOT_ACTIVE"
 
     # A separate pre-dispatch release cannot clear the claimed order's latch.
-    assert recovered_gate.snapshot(account_scope)["active_freeze_reasons"] == [
+    assert recovered_gate.snapshot(account_scope)["active_entry_block_reasons"] == [
         "dispatch-inflight:intent-1"
     ]
     release_gate.close()

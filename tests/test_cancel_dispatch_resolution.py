@@ -202,7 +202,7 @@ def test_cancel_action_terminal_proof_settles_permit_and_clears_only_cancel_latc
     gate, _intent, permit, binding, execution_scope_key, cancel_id, fingerprint = _claimed_cancel(
         tmp_path, scope, policy, authority=authority, track_open_order=True
     )
-    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+    assert gate.active_entry_block_reasons(scope) == [binding.cause_id]
 
     proof = _cancel_proof(
         binding,
@@ -211,9 +211,9 @@ def test_cancel_action_terminal_proof_settles_permit_and_clears_only_cancel_latc
         cancel_fingerprint=fingerprint,
     )
     authority.register(proof)
-    gate.resolve_cancel_dispatch_freeze(proof)
+    gate.resolve_cancel_dispatch_inflight(proof)
 
-    assert gate.active_freeze_reasons(scope) == []
+    assert gate.active_entry_block_reasons(scope) == []
     assert gate.snapshot(scope)["increase_count"] == 1
     assert gate.snapshot(scope)["increase_notional"] == Decimal("40")
     assert _read_rows(gate._database_path, "risk_dispatch_resolutions") == []
@@ -228,7 +228,7 @@ def test_cancel_action_terminal_proof_settles_permit_and_clears_only_cancel_latc
     assert tracked_order["notional"] == "40"
 
     # Exact replay is idempotent and the separate action proof stays immutable.
-    gate.resolve_cancel_dispatch_freeze(proof)
+    gate.resolve_cancel_dispatch_inflight(proof)
     assert len(_read_rows(gate._database_path, "risk_cancel_dispatch_resolutions")) == 1
     assert authority.guard_calls == 1
     with sqlite3.connect(gate._database_path) as connection:
@@ -252,7 +252,7 @@ def test_cancel_dispatch_resolution_receipt_projects_unresolved_active_latch(
     assert receipt.proof is None
     assert receipt.proof_sha256 is None
     assert receipt.dispatch_latch_active is True
-    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+    assert gate.active_entry_block_reasons(scope) == [binding.cause_id]
 
 
 def test_cancel_dispatch_resolution_receipt_rejects_scope_key_mismatch(
@@ -271,7 +271,7 @@ def test_cancel_dispatch_resolution_receipt_rejects_scope_key_mismatch(
         gate.cancel_dispatch_resolution_receipt(permit.permit_id)
 
     assert exc_info.value.code == "CANCEL_DISPATCH_RESOLUTION_STATE_CONFLICT"
-    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+    assert gate.active_entry_block_reasons(scope) == [binding.cause_id]
 
 
 def test_cancel_dispatch_resolution_receipt_reads_exact_persisted_terminal_proof(
@@ -288,7 +288,7 @@ def test_cancel_dispatch_resolution_receipt_reads_exact_persisted_terminal_proof
         cancel_fingerprint=fingerprint,
     )
     authority.register(proof)
-    gate.resolve_cancel_dispatch_freeze(proof)
+    gate.resolve_cancel_dispatch_inflight(proof)
 
     receipt = gate.cancel_dispatch_resolution_receipt(permit.permit_id)
 
@@ -297,7 +297,7 @@ def test_cancel_dispatch_resolution_receipt_reads_exact_persisted_terminal_proof
     assert receipt.proof == proof
     assert receipt.proof_sha256 == proof.fingerprint
     assert receipt.dispatch_latch_active is False
-    assert gate.active_freeze_reasons(scope) == []
+    assert gate.active_entry_block_reasons(scope) == []
     assert gate.snapshot(scope)["increase_count"] == 1
     assert gate.snapshot(scope)["increase_notional"] == Decimal("40")
 
@@ -315,14 +315,14 @@ def test_rejected_cancel_action_resolution_preserves_open_target_fact(tmp_path, 
         terminal_state=CancelDispatchTerminalState.REJECTED,
     )
     authority.register(proof)
-    gate.resolve_cancel_dispatch_freeze(proof)
+    gate.resolve_cancel_dispatch_inflight(proof)
 
     row = _read_rows(gate._database_path, "risk_cancel_dispatch_resolutions")[0]
     assert row["terminal_state"] == "REJECTED"
     assert row["target_postcondition"] == "TARGET_REMAINS_OPEN"
     assert row["target_state"] == "PARTIALLY_FILLED"
     assert row["target_filled_quantity"] == "2"
-    assert gate.active_freeze_reasons(scope) == []
+    assert gate.active_entry_block_reasons(scope) == []
 
 
 def test_generic_order_no_fill_proof_cannot_clear_cancel_action_latch(tmp_path, scope, policy):
@@ -349,8 +349,8 @@ def test_generic_order_no_fill_proof_cannot_clear_cancel_action_latch(tmp_path, 
     )
 
     with pytest.raises(PermitInvalidError, match="cancellation-action evidence"):
-        gate.resolve_dispatch_freeze(old_order_proof)
-    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+        gate.resolve_dispatch_inflight(old_order_proof)
+    assert gate.active_entry_block_reasons(scope) == [binding.cause_id]
     assert _read_rows(gate._database_path, "risk_dispatch_resolutions") == []
     assert _read_rows(gate._database_path, "risk_cancel_dispatch_resolutions") == []
 
@@ -390,8 +390,8 @@ def test_unattested_cancel_proof_mismatch_keeps_latch(tmp_path, scope, policy, c
     authority.register(accepted)
 
     with pytest.raises(PermitInvalidError, match="did not attest"):
-        gate.resolve_cancel_dispatch_freeze(changed)
-    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+        gate.resolve_cancel_dispatch_inflight(changed)
+    assert gate.active_entry_block_reasons(scope) == [binding.cause_id]
     assert _read_rows(gate._database_path, "risk_cancel_dispatch_resolutions") == []
 
 
@@ -407,8 +407,8 @@ def test_cancel_resolution_requires_exact_typed_journal_attestation(tmp_path, sc
     )
 
     with pytest.raises(PermitInvalidError, match="did not attest"):
-        gate.resolve_cancel_dispatch_freeze(proof)
-    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+        gate.resolve_cancel_dispatch_inflight(proof)
+    assert gate.active_entry_block_reasons(scope) == [binding.cause_id]
 
 
 @pytest.mark.parametrize(
@@ -433,4 +433,4 @@ def test_cancel_proof_constructor_rejects_nonterminal_or_contradictory_facts(
             cancel_fingerprint=fingerprint,
             **proof_changes,
         )
-    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+    assert gate.active_entry_block_reasons(scope) == [binding.cause_id]

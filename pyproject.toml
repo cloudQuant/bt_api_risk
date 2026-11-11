@@ -32,7 +32,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Analytics-only numerics (RiskManager / RiskCalculator). The account
+# Analytics-only numerics (RiskCalculator). The account
 # admission path, the risk service component and RiskAssessor never import
 # these modules, so base installs keep serving admission and policy roles.
 analytics = [

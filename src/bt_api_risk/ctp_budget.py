@@ -5,6 +5,11 @@ execution session is the only owner of a reservation's durable state.  This
 split lets tests exercise the arithmetic with synthetic evidence while keeping
 the authority to reserve or dispatch behind the session's existing writer
 lease.
+
+The CNY constants below (``BUDGET_MAX_CNY``, ``BUDGET_ORDINARY_MAX_CNY``,
+``BUDGET_RECOVERY_HEADROOM_CNY``) belong to the historical SimNow budget path
+only. The iteration-64 pre-trade service (``bt_api_risk.pretrade``) does not use
+them; its limits come from the operator's policy file with no defaults.
 """
 
 from __future__ import annotations

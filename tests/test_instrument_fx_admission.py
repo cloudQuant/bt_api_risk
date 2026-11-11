@@ -437,7 +437,7 @@ def test_expiry_after_dispatch_claim_and_freeze_writes_rolls_back_them(tmp_path)
         gate_clock.phase = "claim"
         mapper_now_ns[0] = 1_799
         claim_intent = mapper(_execution_shape(metadata, fx_rate))
-        original_freeze = gate._freeze_in_transaction
+        original_freeze = gate._block_entry_in_transaction
 
         def observe_claim_and_freeze_writes(
             connection,
@@ -459,7 +459,7 @@ def test_expiry_after_dispatch_claim_and_freeze_writes_rolls_back_them(tmp_path)
             assert claim["scope_key"] == scope.key
             assert claim["cause_id"] == cause_id
             freeze = connection.execute(
-                "SELECT active, reason FROM risk_freezes "
+                "SELECT active, reason FROM risk_entry_blocks "
                 "WHERE scope_key = ? AND cause_id = ?",
                 (scope.key, cause_id),
             ).fetchone()
@@ -468,7 +468,7 @@ def test_expiry_after_dispatch_claim_and_freeze_writes_rolls_back_them(tmp_path)
             assert freeze["reason"] == reason
             gate_clock.writes_observed = True
 
-        gate._freeze_in_transaction = observe_claim_and_freeze_writes
+        gate._block_entry_in_transaction = observe_claim_and_freeze_writes
 
         with pytest.raises(PermitInvalidError) as stale:
             gate.claim_for_dispatch(permit.permit_id, claim_intent)
@@ -483,13 +483,13 @@ def test_expiry_after_dispatch_claim_and_freeze_writes_rolls_back_them(tmp_path)
                 (permit.permit_id,),
             ).fetchone()[0]
             freeze_count = connection.execute(
-                "SELECT COUNT(*) FROM risk_freezes "
+                "SELECT COUNT(*) FROM risk_entry_blocks "
                 "WHERE scope_key = ? AND cause_id = ?",
-                (scope.key, gate._dispatch_freeze_cause(claim_intent.intent_id)),
+                (scope.key, gate._dispatch_inflight_cause(claim_intent.intent_id)),
             ).fetchone()[0]
         assert claim_count == 0
         assert freeze_count == 0
-        assert gate.active_freeze_reasons(scope) == []
+        assert gate.active_entry_block_reasons(scope) == []
         with pytest.raises(PermitInvalidError) as no_claim:
             gate.dispatch_claim_binding(permit.permit_id)
         assert no_claim.value.code == "PERMIT_NOT_DISPATCH_CLAIMED"
@@ -597,7 +597,7 @@ def test_live_gross_claim_rechecks_fx_after_final_exposure_scan(tmp_path) -> Non
         assert stale.value.code == "INSTRUMENT_FACTS_STALE"
         assert scan_state.calls == 5
         assert clock.now_ns == 1_800
-        assert gate.active_freeze_reasons(scope) == []
+        assert gate.active_entry_block_reasons(scope) == []
         with pytest.raises(PermitInvalidError) as no_claim:
             gate.dispatch_claim_binding(permit.permit_id)
         assert no_claim.value.code == "PERMIT_NOT_DISPATCH_CLAIMED"

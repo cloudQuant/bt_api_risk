@@ -394,14 +394,14 @@ class RiskReadService:
 
 def _json_snapshot(snapshot: object) -> Mapping[str, object]:
     expected = {
-        "active_freeze_reasons",
+        "active_entry_block_reasons",
         "increase_count",
         "increase_notional",
         "policy_fingerprint",
     }
     if type(snapshot) is not dict or set(snapshot) != expected:
         raise RiskServiceError("INVALID_RISK_SNAPSHOT")
-    reasons = snapshot["active_freeze_reasons"]
+    reasons = snapshot["active_entry_block_reasons"]
     count = snapshot["increase_count"]
     notional = snapshot["increase_notional"]
     fingerprint = snapshot["policy_fingerprint"]
@@ -418,7 +418,7 @@ def _json_snapshot(snapshot: object) -> Mapping[str, object]:
     return MappingProxyType(
         {
             "source": "local_risk_reservation_ledger",
-            "active_freeze_reasons": tuple(reasons),
+            "active_entry_block_reasons": tuple(reasons),
             "increase_count": count,
             "increase_notional": format(notional, "f"),
             "policy_fingerprint": fingerprint,

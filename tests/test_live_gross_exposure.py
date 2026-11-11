@@ -214,7 +214,7 @@ def _tracked_order(gate: DurableRiskGate, scope: AccountScope, intent: RiskInten
         filled_quantity=0,
         trade_count=0,
     )
-    gate.resolve_dispatch_freeze(tracked)
+    gate.resolve_dispatch_inflight(tracked)
     return permit, tracked
 
 
@@ -442,10 +442,10 @@ def test_fill_and_leaves_gross_are_derived_from_price_multiplier_and_fx(live_ris
     assert snapshot.filled_gross_notional == Decimal("600")
     assert snapshot.open_gross_notional == Decimal("180")
     assert snapshot.total_gross_notional == Decimal("780")
-    assert "gross_exposure_limit_exceeded" in gate.active_freeze_reasons(scope)
+    assert "gross_exposure_limit_exceeded" in gate.active_entry_block_reasons(scope)
     with pytest.raises(RiskDeniedError) as blocked:
         gate.reserve(_intent(scope, "must-not-slip-under-cap", "1"))
-    assert blocked.value.code == "FROZEN"
+    assert blocked.value.code == "STOP_NEW_ACTIVE"
 
 
 def test_new_journal_revision_refreshes_valuation_without_order_revision_or_release(live_risk):
@@ -524,10 +524,10 @@ def test_expired_baseline_allows_order_reconciliation_only_until_clean_refresh(l
 
     snapshot = gate.apply_order_exposure_observation(cancel)
     assert snapshot.open_gross_notional == 0
-    assert "gross_exposure_baseline_stale" in gate.active_freeze_reasons(scope)
+    assert "gross_exposure_baseline_stale" in gate.active_entry_block_reasons(scope)
     with pytest.raises(RiskDeniedError) as stale_admission:
         gate.reserve(_intent(scope, "still-read-only", "10"))
-    assert stale_admission.value.code == "FROZEN"
+    assert stale_admission.value.code == "STOP_NEW_ACTIVE"
 
     refreshed_baseline = GrossExposureBaselineProof(
         scope=scope,
@@ -552,7 +552,7 @@ def test_expired_baseline_allows_order_reconciliation_only_until_clean_refresh(l
     )
     gate.install_gross_exposure_baseline(refreshed_baseline)
 
-    assert "gross_exposure_baseline_stale" not in gate.active_freeze_reasons(scope)
+    assert "gross_exposure_baseline_stale" not in gate.active_entry_block_reasons(scope)
     assert gate.reserve(_intent(scope, "after-clean-baseline-refresh", "10")).notional == 10
 
 
@@ -699,12 +699,12 @@ def test_unknown_or_incomplete_observation_retains_occupancy_and_freezes_after_r
     assert retained.state is OrderExposureState.UNKNOWN
     assert retained.filled_gross_notional == 0
     assert retained.open_gross_notional == Decimal("100")
-    assert "order_exposure_unknown" in gate.active_freeze_reasons(scope)
+    assert "order_exposure_unknown" in gate.active_entry_block_reasons(scope)
 
     reopened = open_gate()
     with pytest.raises(RiskDeniedError) as blocked:
         reopened.reserve(_intent(scope, "must-stay-blocked", "10"))
-    assert blocked.value.code == "FROZEN"
+    assert blocked.value.code == "STOP_NEW_ACTIVE"
     with reopened._connection() as connection:
         rows = connection.execute(
             "SELECT status FROM risk_reservations WHERE intent_id IN (?, ?)",
@@ -729,7 +729,7 @@ def test_unknown_or_incomplete_observation_retains_occupancy_and_freezes_after_r
     recovered = reopened.apply_order_exposure_observation(recovered_ack)
     assert recovered.state is OrderExposureState.ACKED
     assert recovered.total_gross_notional == Decimal("100")
-    assert "order_exposure_unknown" not in reopened.active_freeze_reasons(scope)
+    assert "order_exposure_unknown" not in reopened.active_entry_block_reasons(scope)
 
 
 def test_complete_fill_set_is_reconciled_and_immutable(tmp_path, live_risk):

@@ -381,12 +381,12 @@ def test_first_terminal_positive_fill_resolves_group_leg_and_seeds_once(
 def test_resolver_preserves_other_freezes_and_reports_them_in_transaction(tmp_path):
     gate, scope, _, _ = _risk(tmp_path, live_gross=True)
     vector, first, _, claim = _prepare_claim(gate, scope)
-    gate.freeze(scope, "manual-review", "manual review remains required")
+    gate.stop_new(scope, "manual-review", "manual review remains required")
 
     receipt = gate.resolve_dispatch_exposure(_proof(claim, _observation(claim)))
     assert receipt.dispatch_latch_active is False
     assert receipt.has_other_active_freezes is True
-    assert "manual review remains required" in gate.active_freeze_reasons(scope)
+    assert "manual review remains required" in gate.active_entry_block_reasons(scope)
     assert gate.query_group_vector(scope, vector.group_id).legs[0].resolved is True
     gate.close()
 
@@ -543,6 +543,6 @@ def test_partial_resolution_rolls_back_seed_fills_resolution_and_latch_together(
         DispatchExposureResolutionReceiptStatus.UNRESOLVED_ACTIVE
     )
     assert gate.gross_exposure_snapshot(scope)["orders"] == []
-    assert "dispatch-inflight:first-intent" in gate.active_freeze_reasons(scope)
+    assert "dispatch-inflight:first-intent" in gate.active_entry_block_reasons(scope)
     gate.close()
 

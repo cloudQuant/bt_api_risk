@@ -204,7 +204,7 @@ def _parent(gate: DurableRiskGate, scope: AccountScope, *, position_side="LONG")
         exposure_reservation_id="paper-parent-exposure",
         exposure_reservation_sha256=_sha("parent-exposure-row"),
     )
-    gate.resolve_dispatch_freeze(proof)
+    gate.resolve_dispatch_inflight(proof)
     return intent, permit
 
 
@@ -301,7 +301,7 @@ def _terminal_no_fill(gate, intent, allocation):
         filled_quantity=0,
         trade_count=0,
     )
-    return gate.resolve_dispatch_freeze(proof)
+    return gate.resolve_dispatch_inflight(proof)
 
 
 def _terminal_close_proof(gate, intent, allocation):
@@ -616,7 +616,7 @@ def test_regular_reduce_keeps_existing_zero_fill_dispatch_resolution(tmp_path):
         trade_count=0,
     )
 
-    receipt = gate.resolve_dispatch_freeze(proof)
+    receipt = gate.resolve_dispatch_inflight(proof)
 
     assert receipt is not None
     assert receipt.status is DispatchTerminalResolutionReceiptStatus.NO_FILL_TERMINAL_RESOLVED

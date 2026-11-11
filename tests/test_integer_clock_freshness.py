@@ -246,7 +246,7 @@ def _prepare_tracked_order(gate: DurableRiskGate, scope: AccountScope):
         exposure_reservation_id="risk-exposure-integer-clock",
         exposure_reservation_sha256=_sha("risk-exposure-digest"),
     )
-    gate.resolve_dispatch_freeze(tracked)
+    gate.resolve_dispatch_inflight(tracked)
     return intent, claim, tracked
 
 

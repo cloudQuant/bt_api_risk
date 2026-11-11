@@ -132,7 +132,7 @@ def _durable_counts(gate) -> tuple[int, int, int, int]:
             connection.execute("SELECT COUNT(*) FROM risk_reservations").fetchone()[0],
             connection.execute("SELECT COUNT(*) FROM risk_dispatch_claims").fetchone()[0],
             connection.execute("SELECT COUNT(*) FROM risk_dispatch_resolutions").fetchone()[0],
-            connection.execute("SELECT COUNT(*) FROM risk_freezes").fetchone()[0],
+            connection.execute("SELECT COUNT(*) FROM risk_entry_blocks").fetchone()[0],
         )
 
 

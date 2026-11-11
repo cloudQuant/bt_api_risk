@@ -370,7 +370,7 @@ def test_group_claim_query_is_read_only_and_requires_a_durable_terminal_proof(tm
     assert unresolved.fee_record_count is None and unresolved.fee_history_complete is False
     assert unresolved.group_claim == pending
 
-    gate.freeze(scope, "operator-hold", "operator hold")
+    gate.stop_new(scope, "operator-hold", "operator hold")
     proof = DispatchTerminalProof(
         scope=scope,
         permit_id=leg.permit_id,
@@ -389,7 +389,7 @@ def test_group_claim_query_is_read_only_and_requires_a_durable_terminal_proof(tm
         fee_history_complete=True,
     )
     authority.register(proof)
-    committed = adapter.resolve_dispatch_freeze(proof)
+    committed = adapter.resolve_dispatch_inflight(proof)
     assert committed is not None
     assert committed.status is DispatchTerminalResolutionReceiptStatus.NO_FILL_TERMINAL_RESOLVED
     assert committed.group_claim == replace(pending, resolved=True)
@@ -426,7 +426,7 @@ def _group_claim_storage(gate):
                 "SELECT * FROM risk_reservations ORDER BY permit_id",
                 "SELECT * FROM risk_dispatch_claims ORDER BY permit_id",
                 "SELECT * FROM risk_dispatch_resolutions ORDER BY permit_id",
-                "SELECT * FROM risk_freezes ORDER BY scope_key, cause_id",
+                "SELECT * FROM risk_entry_blocks ORDER BY scope_key, cause_id",
                 "SELECT * FROM risk_policy_bindings ORDER BY scope_key",
             )
         )

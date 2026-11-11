@@ -226,7 +226,7 @@ def test_snapshot_reads_real_gate_and_returns_json_safe_owner_ledger_projection(
     assert result["source"] == "local_risk_reservation_ledger"
     assert result["increase_count"] == 1
     assert result["increase_notional"] == "12.5"
-    assert result["active_freeze_reasons"] == ()
+    assert result["active_entry_block_reasons"] == ()
     assert type(result["policy_fingerprint"]) is str
     assert len(result["policy_fingerprint"]) == 64
     assert isinstance(result, MappingProxyType)

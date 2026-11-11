@@ -271,7 +271,7 @@ def _dispatch_rows(gate):
                 "SELECT * FROM risk_reservations ORDER BY permit_id",
                 "SELECT * FROM risk_dispatch_claims ORDER BY permit_id",
                 "SELECT * FROM risk_dispatch_resolutions ORDER BY permit_id",
-                "SELECT * FROM risk_freezes ORDER BY scope_key, cause_id",
+                "SELECT * FROM risk_entry_blocks ORDER BY scope_key, cause_id",
             )
         )
 
@@ -306,40 +306,40 @@ def test_reused_id_with_different_payload_is_rejected(
     assert error.value.code == "INTENT_ID_REUSED"
 
 
-def test_freeze_blocks_increase_but_not_cancel_or_reduce(
+def test_stop_new_blocks_increase_but_not_cancel_or_reduce(
     tmp_path, scope: AccountScope, policy: RiskPolicy
 ) -> None:
     gate = DurableRiskGate(tmp_path / "risk.db", policy)
-    gate.freeze(scope, "market-data-stale", "market data is stale")
+    gate.stop_new(scope, "market-data-stale", "market data is stale")
 
     with pytest.raises(RiskDeniedError) as error:
         gate.reserve(make_intent(scope, "open", IntentAction.INCREASE))
-    assert error.value.code == "FROZEN"
+    assert error.value.code == "STOP_NEW_ACTIVE"
 
     cancel = gate.reserve(make_intent(scope, "cancel", IntentAction.CANCEL, notional="0"))
     reduce = gate.reserve(make_intent(scope, "reduce", IntentAction.REDUCE, notional="0"))
     assert cancel.action is IntentAction.CANCEL
     assert reduce.action is IntentAction.REDUCE
 
-    gate.resolve_freeze(scope, "market-data-stale")
-    assert gate.active_freeze_reasons(scope) == []
+    gate.resolve_stop_new(scope, "market-data-stale")
+    assert gate.active_entry_block_reasons(scope) == []
     assert (
         gate.reserve(make_intent(scope, "open-after", IntentAction.INCREASE)).intent_id
         == "open-after"
     )
 
 
-def test_freeze_after_reservation_invalidates_increase_at_dispatch(
+def test_stop_new_after_reservation_invalidates_increase_at_dispatch(
     tmp_path, scope: AccountScope, policy: RiskPolicy
 ) -> None:
     gate = DurableRiskGate(tmp_path / "risk.db", policy)
     intent = make_intent(scope, "open")
     permit = gate.reserve(intent)
-    gate.freeze(scope, "operator", "operator freeze")
+    gate.stop_new(scope, "operator", "operator freeze")
 
     with pytest.raises(RiskDeniedError) as error:
         gate.validate_permit(permit.permit_id, intent)
-    assert error.value.code == "FROZEN"
+    assert error.value.code == "STOP_NEW_ACTIVE"
 
 
 def test_expired_and_policy_changed_permits_cannot_dispatch(
@@ -414,10 +414,10 @@ def test_ensure_settled_requires_exact_dispatch_claim_and_keeps_latch(tmp_path, 
     second = gate.ensure_settled(permit.permit_id)
 
     assert first.permit_id == second.permit_id == permit.permit_id
-    assert gate.active_freeze_reasons(scope) == ["dispatch-inflight:ensure-settled"]
+    assert gate.active_entry_block_reasons(scope) == ["dispatch-inflight:ensure-settled"]
     with pytest.raises(PermitInvalidError) as blocked:
-        gate.resolve_freeze(scope, "dispatch-inflight:ensure-settled")
-    assert blocked.value.code == "DISPATCH_FREEZE_REQUIRES_RECONCILIATION"
+        gate.resolve_stop_new(scope, "dispatch-inflight:ensure-settled")
+    assert blocked.value.code == "DISPATCH_INFLIGHT_REQUIRES_RECONCILIATION"
 
 
 def test_dispatch_claim_is_single_use_and_duplicate_does_not_create_permission(
@@ -432,7 +432,7 @@ def test_dispatch_claim_is_single_use_and_duplicate_does_not_create_permission(
         gate.claim_for_dispatch(permit.permit_id, intent)
 
     assert duplicate.value.code == "DISPATCH_CLAIM_ALREADY_ISSUED"
-    assert gate.active_freeze_reasons(scope) == ["dispatch-inflight:single-claim"]
+    assert gate.active_entry_block_reasons(scope) == ["dispatch-inflight:single-claim"]
     assert gate.snapshot(scope)["increase_count"] == 1
 
 
@@ -443,9 +443,9 @@ def test_dispatch_resolution_requires_injected_authority_and_exact_no_fill_proof
     proof = _terminal_proof(binding)
 
     with pytest.raises(PermitInvalidError) as missing:
-        gate.resolve_dispatch_freeze(proof)
+        gate.resolve_dispatch_inflight(proof)
     assert missing.value.code == "DISPATCH_RESOLUTION_AUTHORITY_REQUIRED"
-    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+    assert gate.active_entry_block_reasons(scope) == [binding.cause_id]
     assert gate.snapshot(scope)["increase_notional"] == permit.notional
 
 
@@ -456,10 +456,10 @@ def test_bare_boolean_authority_is_not_a_dispatch_attestation(tmp_path, scope, p
     proof = _terminal_proof(binding)
 
     with pytest.raises(PermitInvalidError) as rejected:
-        gate.resolve_dispatch_freeze(proof)
+        gate.resolve_dispatch_inflight(proof)
 
     assert rejected.value.code == "DISPATCH_RESOLUTION_PROOF_REJECTED"
-    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+    assert gate.active_entry_block_reasons(scope) == [binding.cause_id]
 
 
 @pytest.mark.parametrize(
@@ -478,10 +478,10 @@ def test_well_typed_but_mismatched_resolution_receipt_keeps_dispatch_latch(
     journal.register(proof)
 
     with pytest.raises(PermitInvalidError) as rejected:
-        gate.resolve_dispatch_freeze(proof)
+        gate.resolve_dispatch_inflight(proof)
 
     assert rejected.value.code == "DISPATCH_RESOLUTION_PROOF_REJECTED"
-    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+    assert gate.active_entry_block_reasons(scope) == [binding.cause_id]
     assert gate.snapshot(scope)["increase_count"] == 1
     assert gate.snapshot(scope)["increase_notional"] == Decimal("40")
 
@@ -508,9 +508,9 @@ def test_exact_terminal_proof_clears_only_matching_latch_and_releases_no_fill_ca
     )
     authority.register(proof)
 
-    receipt = gate.resolve_dispatch_freeze(proof)
+    receipt = gate.resolve_dispatch_inflight(proof)
 
-    assert gate.active_freeze_reasons(scope) == []
+    assert gate.active_entry_block_reasons(scope) == []
     assert gate.snapshot(scope)["increase_count"] == 0
     assert gate.snapshot(scope)["increase_notional"] == Decimal("0")
     assert gate.reserve(make_intent(scope, "after-no-fill", notional="100")).notional == Decimal(
@@ -547,9 +547,9 @@ def test_acked_tracked_proof_clears_uncertainty_but_keeps_risk_capacity_reserved
     proof = _tracked_proof(binding)
     authority.register(proof)
 
-    gate.resolve_dispatch_freeze(proof)
+    gate.resolve_dispatch_inflight(proof)
 
-    assert gate.active_freeze_reasons(scope) == []
+    assert gate.active_entry_block_reasons(scope) == []
     assert gate.snapshot(scope)["increase_count"] == 1
     assert gate.snapshot(scope)["increase_notional"] == permit.notional
     with pytest.raises(RiskDeniedError) as over_limit:
@@ -570,10 +570,10 @@ def test_acked_tracked_transfer_requires_exact_durable_exposure_and_no_synthetic
     authority.register(proof, durable_exposure=False)
 
     with pytest.raises(PermitInvalidError) as rejected:
-        gate.resolve_dispatch_freeze(proof)
+        gate.resolve_dispatch_inflight(proof)
 
     assert rejected.value.code == "DISPATCH_RESOLUTION_PROOF_REJECTED"
-    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+    assert gate.active_entry_block_reasons(scope) == [binding.cause_id]
     assert gate.snapshot(scope)["increase_notional"] == Decimal("40")
 
 
@@ -599,11 +599,11 @@ def test_dispatch_proof_wrong_account_or_intent_is_rejected_before_authority(
         )
 
     with pytest.raises(PermitInvalidError) as caught:
-        gate.resolve_dispatch_freeze(proof)
+        gate.resolve_dispatch_inflight(proof)
 
     assert caught.value.code == "DISPATCH_RESOLUTION_PROOF_SCOPE_MISMATCH"
     assert authority.guard_calls == 0
-    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+    assert gate.active_entry_block_reasons(scope) == [binding.cause_id]
 
 
 @pytest.mark.parametrize("case", ["unknown-row", "stale-revision", "duplicate-attempt"])
@@ -623,10 +623,10 @@ def test_dispatch_proof_unknown_stale_or_duplicate_attempt_stays_frozen(
             authority.register(proof, current_revision=proof.journal_revision + 1)
 
     with pytest.raises(PermitInvalidError) as rejected:
-        gate.resolve_dispatch_freeze(proof)
+        gate.resolve_dispatch_inflight(proof)
 
     assert rejected.value.code == "DISPATCH_RESOLUTION_PROOF_REJECTED"
-    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+    assert gate.active_entry_block_reasons(scope) == [binding.cause_id]
 
 
 def test_dispatch_proof_rejects_fills_unknown_state_and_simulation_ctp_scope(
@@ -653,9 +653,9 @@ def test_dispatch_proof_rejects_fills_unknown_state_and_simulation_ctp_scope(
 
     proof = _terminal_proof(binding)
     with pytest.raises(PermitInvalidError) as unknown:
-        gate.resolve_dispatch_freeze(proof)
+        gate.resolve_dispatch_inflight(proof)
     assert unknown.value.code == "DISPATCH_RESOLUTION_PROOF_REJECTED"
-    assert gate.active_freeze_reasons(scope) == [binding.cause_id]
+    assert gate.active_entry_block_reasons(scope) == [binding.cause_id]
 
 
 def test_dispatch_proof_replay_is_rejected_after_restart(tmp_path, scope, policy):
@@ -663,7 +663,7 @@ def test_dispatch_proof_replay_is_rejected_after_restart(tmp_path, scope, policy
     gate, _, _, binding = _claimed_gate(tmp_path, scope, policy, authority, name="proof-restart")
     proof = _terminal_proof(binding)
     authority.register(proof)
-    gate.resolve_dispatch_freeze(proof)
+    gate.resolve_dispatch_inflight(proof)
 
     # `_claimed_gate` owns this path by convention; a fresh gate instance
     # models process restart while the proof row remains durable.
@@ -671,7 +671,7 @@ def test_dispatch_proof_replay_is_rejected_after_restart(tmp_path, scope, policy
         tmp_path / "proof-restart.db", policy, execution_journal_authority=authority
     )
     with pytest.raises(PermitInvalidError) as replay:
-        restarted.resolve_dispatch_freeze(proof)
+        restarted.resolve_dispatch_inflight(proof)
     assert replay.value.code == "DISPATCH_PROOF_REPLAYED"
 
 
@@ -684,7 +684,7 @@ def test_terminal_resolution_readback_rejects_incomplete_persisted_fee_history(
     )
     proof = _terminal_proof(binding)
     authority.register(proof)
-    gate.resolve_dispatch_freeze(proof)
+    gate.resolve_dispatch_inflight(proof)
     with gate._transaction() as connection:
         connection.execute("DROP TRIGGER risk_dispatch_resolution_immutable_update")
         connection.execute(
@@ -697,7 +697,7 @@ def test_terminal_resolution_readback_rejects_incomplete_persisted_fee_history(
         gate.dispatch_terminal_resolution_receipt(permit.permit_id)
 
     assert incomplete.value.code == "DISPATCH_TERMINAL_STATE_CONFLICT"
-    assert gate.active_freeze_reasons(scope) == []
+    assert gate.active_entry_block_reasons(scope) == []
 
 
 def test_concurrent_duplicate_dispatch_proofs_commit_only_once(tmp_path, scope, policy):
@@ -713,7 +713,7 @@ def test_concurrent_duplicate_dispatch_proofs_commit_only_once(tmp_path, scope, 
     def resolve(candidate_gate):
         barrier.wait()
         try:
-            candidate_gate.resolve_dispatch_freeze(proof)
+            candidate_gate.resolve_dispatch_inflight(proof)
             return "resolved"
         except PermitInvalidError as error:
             return error.code
@@ -729,7 +729,7 @@ def test_concurrent_duplicate_dispatch_proofs_commit_only_once(tmp_path, scope, 
         )
         == 1
     )
-    assert gate.active_freeze_reasons(scope) == []
+    assert gate.active_entry_block_reasons(scope) == []
     with gate._connection() as connection:
         count = connection.execute("SELECT COUNT(*) FROM risk_dispatch_resolutions").fetchone()[0]
     assert count == 1
@@ -738,10 +738,10 @@ def test_concurrent_duplicate_dispatch_proofs_commit_only_once(tmp_path, scope, 
 def test_dispatch_latch_namespace_cannot_be_created_or_cleared_generically(tmp_path, scope, policy):
     gate = DurableRiskGate(tmp_path / "risk.db", policy)
     with pytest.raises(ValueError, match="reserved"):
-        gate.freeze(scope, "dispatch-inflight:forged", "forged reason")
+        gate.stop_new(scope, "dispatch-inflight:forged", "forged reason")
     with pytest.raises(PermitInvalidError) as blocked:
-        gate.resolve_freeze(scope, "dispatch-inflight:forged")
-    assert blocked.value.code == "DISPATCH_FREEZE_REQUIRES_RECONCILIATION"
+        gate.resolve_stop_new(scope, "dispatch-inflight:forged")
+    assert blocked.value.code == "DISPATCH_INFLIGHT_REQUIRES_RECONCILIATION"
 
 
 def test_dispatch_claim_rolls_back_claim_and_latch_after_partial_failure(
@@ -750,20 +750,20 @@ def test_dispatch_claim_rolls_back_claim_and_latch_after_partial_failure(
     gate = DurableRiskGate(tmp_path / "risk.db", policy)
     intent = make_intent(scope, "rollback-claim")
     permit = gate.reserve(intent)
-    freeze = gate._freeze_in_transaction
+    freeze = gate._block_entry_in_transaction
 
     def fail_after_freeze(connection, claim_scope, cause_id, reason, updated_at):
         freeze(connection, claim_scope, cause_id, reason, updated_at)
         raise RuntimeError("injected failure after both claim mutations")
 
-    monkeypatch.setattr(gate, "_freeze_in_transaction", fail_after_freeze)
+    monkeypatch.setattr(gate, "_block_entry_in_transaction", fail_after_freeze)
     with pytest.raises(RuntimeError, match="injected failure"):
         gate.claim_for_dispatch(permit.permit_id, intent)
-    assert gate.active_freeze_reasons(scope) == []
+    assert gate.active_entry_block_reasons(scope) == []
 
-    monkeypatch.setattr(gate, "_freeze_in_transaction", freeze)
+    monkeypatch.setattr(gate, "_block_entry_in_transaction", freeze)
     gate.claim_for_dispatch(permit.permit_id, intent)
-    assert gate.active_freeze_reasons(scope) == ["dispatch-inflight:rollback-claim"]
+    assert gate.active_entry_block_reasons(scope) == ["dispatch-inflight:rollback-claim"]
 
 
 def test_foreign_keys_are_enabled_on_every_connection(tmp_path, scope, policy):
@@ -805,13 +805,13 @@ def test_exact_retry_after_freeze_does_not_return_an_admitted_increase(tmp_path,
     gate = DurableRiskGate(tmp_path / "risk.db", policy)
     intent = make_intent(scope, "same")
     gate.reserve(intent)
-    gate.freeze(scope, "disconnect", "connection lost")
-    gate.freeze(scope, "operator", "operator hold")
-    gate.resolve_freeze(scope, "disconnect")
+    gate.stop_new(scope, "disconnect", "connection lost")
+    gate.stop_new(scope, "operator", "operator hold")
+    gate.resolve_stop_new(scope, "disconnect")
     with pytest.raises(RiskDeniedError) as denied:
         gate.reserve(intent)
-    assert denied.value.code == "FROZEN"
-    assert gate.active_freeze_reasons(scope) == ["operator hold"]
+    assert denied.value.code == "STOP_NEW_ACTIVE"
+    assert gate.active_entry_block_reasons(scope) == ["operator hold"]
 
 
 def test_concurrent_connections_cannot_oversubscribe_account_budget(tmp_path, scope, policy):
@@ -966,8 +966,8 @@ else:
         )
 
     assert results.count("claimed") == 1
-    assert results.count("FROZEN") == 1
-    active = gate.active_freeze_reasons(scope)
+    assert results.count("STOP_NEW_ACTIVE") == 1
+    active = gate.active_entry_block_reasons(scope)
     assert len(active) == 1
     assert active[0] in {
         "dispatch-inflight:dispatch-process-1",

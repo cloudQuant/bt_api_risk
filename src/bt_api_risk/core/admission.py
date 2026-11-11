@@ -48,9 +48,9 @@ from .exposure import (
     verified_baseline_matches,
     verified_observation_matches,
 )
-from .freeze_activation import (
-    FreezeActivationResult,
-    FreezeActivationStatus,
+from .stop_new_activation import (
+    StopNewActivationResult,
+    StopNewActivationStatus,
 )
 
 if TYPE_CHECKING:
@@ -58,8 +58,8 @@ if TYPE_CHECKING:
         ClosablePositionCloseReceiptV1,
         ClosablePositionRebaseV1,
     )
-from .freeze_activation import (
-    activate_freeze_once as _activate_freeze_once,
+from .stop_new_activation import (
+    activate_stop_new_once as _activate_stop_new_once,
 )
 
 
@@ -81,6 +81,25 @@ class PermitInvalidError(RiskGateError):
     def __init__(self, code: str, message: str) -> None:
         super().__init__(message)
         self.code = code
+
+
+class RiskLedgerSchemaError(RiskGateError):
+    """The ledger schema cannot be opened or migrated; the gate refuses to open."""
+
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
+# Iteration 64 (design freeze section 9/15): the table that holds STOP_NEW
+# causes and dispatch in-flight latches was named ``risk_freezes`` before.
+_LEGACY_ENTRY_BLOCK_TABLE = "risk_freezes"
+_ENTRY_BLOCK_TABLE = "risk_entry_blocks"
+_ENTRY_BLOCK_REQUIRED_COLUMNS = frozenset(
+    {"scope_key", "cause_id", "reason", "active", "updated_at"}
+)
+# ``blocking`` was added by a later in-place ALTER; older ledgers may lack it.
+_ENTRY_BLOCK_OPTIONAL_COLUMNS = frozenset({"blocking"})
 
 
 _SHA256_HEX = re.compile(r"^[0-9a-f]{64}$")
@@ -1064,8 +1083,8 @@ class ClosablePositionSnapshot:
     position_bucket: str = "ALL"
 
 
-class FreezeResolutionStatus(str, Enum):
-    """Result of resolving one exact ordinary freeze cause."""
+class StopNewResolutionStatus(str, Enum):
+    """Result of resolving one exact ordinary STOP_NEW cause."""
 
     CLEARED = "CLEARED"
     ALREADY_RESOLVED = "ALREADY_RESOLVED"
@@ -1073,15 +1092,19 @@ class FreezeResolutionStatus(str, Enum):
 
 
 @dataclass(frozen=True)
-class FreezeResolution:
-    """Typed outcome and same-scope postcondition for exact freeze resolution."""
+class StopNewResolution:
+    """Typed outcome and same-scope postcondition for exact STOP_NEW resolution.
 
-    status: FreezeResolutionStatus
+    ``has_other_active_freezes`` keeps its historical name because Monitor
+    ``effect_result`` records persisted it (iteration 64 design freeze, section 15).
+    """
+
+    status: StopNewResolutionStatus
     has_other_active_freezes: bool
 
     def __post_init__(self) -> None:
-        if type(self.status) is not FreezeResolutionStatus:
-            raise ValueError("status must be a FreezeResolutionStatus")
+        if type(self.status) is not StopNewResolutionStatus:
+            raise ValueError("status must be a StopNewResolutionStatus")
         if type(self.has_other_active_freezes) is not bool:
             raise ValueError("has_other_active_freezes must be a boolean")
 
@@ -1836,7 +1859,7 @@ class DispatchRecoveryAttestation:
 
     This value carries identities only. It authorizes nothing by itself; the
     injected journal authority must verify the old event chain and the new
-    account-wide writer fence while :meth:`DurableRiskGate.resolve_dispatch_freeze_recovered`
+    account-wide writer fence while :meth:`DurableRiskGate.resolve_dispatch_inflight_recovered`
     commits the matching resolution.
     """
 
@@ -4776,7 +4799,7 @@ class DurableRiskGate:
                 permit = self._existing_permit_or_raise(existing, intent, now)
                 self._assert_reservation_allocation_current(connection, existing)
                 if permit.action is IntentAction.INCREASE:
-                    self._assert_not_frozen(connection, permit.scope)
+                    self._assert_entry_not_blocked(connection, permit.scope)
                     if live_gross:
                         self._assert_live_gross_limits(connection, intent, include_intent=False)
                         final_now = self._clock()
@@ -4793,7 +4816,7 @@ class DurableRiskGate:
                 )
             close_position_version = None
             if intent.action is IntentAction.INCREASE:
-                self._assert_not_frozen(connection, intent.scope)
+                self._assert_entry_not_blocked(connection, intent.scope)
                 self._assert_intent_notional_unit(intent)
                 self._assert_increase_limit(connection, intent)
                 self._assert_strategy_allocation_limit(connection, intent)
@@ -5802,7 +5825,7 @@ class DurableRiskGate:
             for leg in ordered_legs:
                 intent = leg.intent
                 self._assert_group_exposure_facts(intent, now_ns)
-                self._assert_not_frozen(connection, scope)
+                self._assert_entry_not_blocked(connection, scope)
                 self._assert_intent_notional_unit(intent)
                 self._assert_increase_limit(connection, intent)
                 self._assert_strategy_allocation_limit(connection, intent)
@@ -6031,12 +6054,12 @@ class DurableRiskGate:
                         """SELECT
                                (SELECT COUNT(*) FROM risk_dispatch_resolutions
                                 WHERE permit_id = ?) AS resolutions,
-                               (SELECT COUNT(*) FROM risk_freezes
+                               (SELECT COUNT(*) FROM risk_entry_blocks
                                 WHERE scope_key = ? AND cause_id = ?) AS latches""",
                         (
                             leg.permit_id,
                             scope.key,
-                            self._dispatch_freeze_cause(leg.intent_id),
+                            self._dispatch_inflight_cause(leg.intent_id),
                         ),
                     ).fetchone()
                     if (
@@ -6325,7 +6348,7 @@ class DurableRiskGate:
             self._assert_group_exposure_facts(actual_intent, now_ns, invalid=True)
             self._assert_reservation_allocation_current(connection, reservation, invalid=True)
             self._assert_intent_notional_unit(actual_intent)
-            self._assert_not_frozen(connection, scope)
+            self._assert_entry_not_blocked(connection, scope)
             shared_domain = self._assert_shared_collateral_admission(
                 connection,
                 actual_intent.scope,
@@ -6339,7 +6362,7 @@ class DurableRiskGate:
             if live_gross:
                 self._assert_live_gross_limits(connection, actual_intent, include_intent=False)
 
-            cause_id = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+            cause_id = self._dispatch_inflight_cause(str(reservation["intent_id"]))
             connection.execute(
                 """INSERT INTO risk_dispatch_claims (
                        permit_id, intent_id, intent_hash, scope_key, cause_id, claimed_at,
@@ -6370,7 +6393,7 @@ class DurableRiskGate:
                     actual_intent.instrument_facts_valid_until_ns,
                 ),
             )
-            self._freeze_in_transaction(connection, scope, cause_id, cause_id, now_ns / 1e9)
+            self._block_entry_in_transaction(connection, scope, cause_id, cause_id, now_ns / 1e9)
 
             commit_now_ns = self._now_ns()
             self._assert_group_exposure_facts(actual_intent, commit_now_ns, invalid=True)
@@ -6789,7 +6812,7 @@ class DurableRiskGate:
                             "account baseline expired before the Risk transaction committed",
                         )
                     connection.execute(
-                        "UPDATE risk_freezes SET active = 0, updated_at = ? "
+                        "UPDATE risk_entry_blocks SET active = 0, updated_at = ? "
                         "WHERE scope_key = ? AND cause_id IN "
                         "('gross-exposure-baseline-stale', 'gross-exposure-over-cap') AND active = 1",
                         (self._clock(), proof.scope.key),
@@ -6903,7 +6926,7 @@ class DurableRiskGate:
                                 int(baseline["valid_until_ns"]),
                                 replay_at_ns,
                             ):
-                                self._freeze_in_transaction(
+                                self._block_entry_in_transaction(
                                     connection,
                                     proof.scope,
                                     "gross-exposure-baseline-stale",
@@ -6912,7 +6935,7 @@ class DurableRiskGate:
                                 )
                             else:
                                 connection.execute(
-                                    "UPDATE risk_freezes SET active = 0, updated_at = ? "
+                                    "UPDATE risk_entry_blocks SET active = 0, updated_at = ? "
                                     "WHERE scope_key = ? AND cause_id = "
                                     "'gross-exposure-baseline-stale' AND active = 1",
                                     (self._clock(), proof.scope.key),
@@ -7033,7 +7056,7 @@ class DurableRiskGate:
                     )
                     unknown_cause = self._gross_unknown_cause(proof.permit_id)
                     if proof.state is OrderExposureState.UNKNOWN:
-                        self._freeze_in_transaction(
+                        self._block_entry_in_transaction(
                             connection,
                             proof.scope,
                             unknown_cause,
@@ -7042,12 +7065,12 @@ class DurableRiskGate:
                         )
                     else:
                         connection.execute(
-                            """UPDATE risk_freezes SET active = 0, updated_at = ?
+                            """UPDATE risk_entry_blocks SET active = 0, updated_at = ?
                                WHERE scope_key = ? AND cause_id = ? AND active = 1""",
                             (self._clock(), proof.scope.key, unknown_cause),
                         )
                     if self._gross_scope_over_limit(connection, proof.scope):
-                        self._freeze_in_transaction(
+                        self._block_entry_in_transaction(
                             connection,
                             proof.scope,
                             "gross-exposure-over-cap",
@@ -7056,7 +7079,7 @@ class DurableRiskGate:
                         )
                     elif baseline_fresh:
                         connection.execute(
-                            "UPDATE risk_freezes SET active = 0, updated_at = ? "
+                            "UPDATE risk_entry_blocks SET active = 0, updated_at = ? "
                             "WHERE scope_key = ? AND cause_id = 'gross-exposure-over-cap' AND active = 1",
                             (self._clock(), proof.scope.key),
                         )
@@ -7069,13 +7092,13 @@ class DurableRiskGate:
                     )
                     if baseline_fresh_at_commit:
                         connection.execute(
-                            "UPDATE risk_freezes SET active = 0, updated_at = ? "
+                            "UPDATE risk_entry_blocks SET active = 0, updated_at = ? "
                             "WHERE scope_key = ? AND cause_id = 'gross-exposure-baseline-stale' "
                             "AND active = 1",
                             (self._clock(), proof.scope.key),
                         )
                     else:
-                        self._freeze_in_transaction(
+                        self._block_entry_in_transaction(
                             connection,
                             proof.scope,
                             "gross-exposure-baseline-stale",
@@ -7089,7 +7112,7 @@ class DurableRiskGate:
                         int(baseline["valid_until_ns"]),
                         linearized_at_ns,
                     ):
-                        self._freeze_in_transaction(
+                        self._block_entry_in_transaction(
                             connection,
                             proof.scope,
                             "gross-exposure-baseline-stale",
@@ -7150,7 +7173,7 @@ class DurableRiskGate:
                 for row in strategies
             },
             "orders": [self._order_exposure_snapshot(row, scope) for row in rows],
-            "active_freeze_reasons": self.active_freeze_reasons(scope),
+            "active_entry_block_reasons": self.active_entry_block_reasons(scope),
         }
 
     def validate_permit(
@@ -7222,7 +7245,7 @@ class DurableRiskGate:
                         "PERMIT_INTENT_MISMATCH", "permit does not match intent payload"
                     )
             if permit.action is IntentAction.INCREASE:
-                self._assert_not_frozen(connection, permit.scope)
+                self._assert_entry_not_blocked(connection, permit.scope)
                 if live_gross:
                     live_intent = intent or RiskIntent(
                         intent_id=permit.intent_id,
@@ -7249,7 +7272,7 @@ class DurableRiskGate:
                 if current["status"] != self._ACTIVE:
                     raise PermitInvalidError("PERMIT_NOT_ACTIVE", "permit is no longer active")
                 self._assert_reservation_allocation_current(connection, current, invalid=True)
-                self._assert_not_frozen(connection, permit.scope)
+                self._assert_entry_not_blocked(connection, permit.scope)
                 final_intent = intent or RiskIntent(
                     intent_id=permit.intent_id,
                     scope=permit.scope,
@@ -7289,7 +7312,7 @@ class DurableRiskGate:
 
         if not isinstance(intent, RiskIntent):
             raise ValueError("intent must be a RiskIntent")
-        cause_id = self._dispatch_freeze_cause(intent.intent_id)
+        cause_id = self._dispatch_inflight_cause(intent.intent_id)
         now = self._clock()
         live_gross = self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS
         with self._transaction() as connection:
@@ -7344,7 +7367,7 @@ class DurableRiskGate:
             )
 
             if permit.action is IntentAction.INCREASE:
-                self._assert_not_frozen(connection, permit.scope)
+                self._assert_entry_not_blocked(connection, permit.scope)
                 if live_gross:
                     self._assert_live_gross_limits(connection, intent, include_intent=False)
                     # The permit, baseline, and prior order valuations may
@@ -7358,7 +7381,7 @@ class DurableRiskGate:
                         raise PermitInvalidError(
                             "PERMIT_NOT_ACTIVE", "permit expired before dispatch claim"
                         )
-                    self._assert_not_frozen(connection, permit.scope)
+                    self._assert_entry_not_blocked(connection, permit.scope)
                     self._assert_live_gross_limits(connection, intent, include_intent=False)
             self._assert_current_instrument_facts(intent, invalid=True)
             if permit.action is IntentAction.CANCEL:
@@ -7405,7 +7428,7 @@ class DurableRiskGate:
                     now,
                 ),
             )
-            self._freeze_in_transaction(connection, permit.scope, cause_id, cause_id, now)
+            self._block_entry_in_transaction(connection, permit.scope, cause_id, cause_id, now)
             self._assert_current_instrument_facts(intent, invalid=True)
             if permit.action is IntentAction.CANCEL or (
                 live_gross and permit.action is IntentAction.INCREASE
@@ -7529,7 +7552,7 @@ class DurableRiskGate:
                 "PERMIT_NOT_DISPATCH_CLAIMED",
                 "cancellation receipt requires an exact durable claim",
             )
-        expected_cause = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+        expected_cause = self._dispatch_inflight_cause(str(reservation["intent_id"]))
         if (
             claim_row["scope_key"] != reservation["scope_key"]
             or claim_row["intent_id"] != reservation["intent_id"]
@@ -7558,7 +7581,7 @@ class DurableRiskGate:
             )
 
         freeze = connection.execute(
-            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+            "SELECT active FROM risk_entry_blocks WHERE scope_key = ? AND cause_id = ?",
             (reservation["scope_key"], expected_cause),
         ).fetchone()
         if freeze is None or type(freeze["active"]) is not int or freeze["active"] not in (0, 1):
@@ -7579,7 +7602,7 @@ class DurableRiskGate:
             (permit_id,),
         ).fetchone()
         other_freezes = connection.execute(
-            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id <> ?",
+            "SELECT active FROM risk_entry_blocks WHERE scope_key = ? AND cause_id <> ?",
             (reservation["scope_key"], expected_cause),
         ).fetchall()
         if any(type(row["active"]) is not int or row["active"] not in (0, 1) for row in other_freezes):
@@ -7707,7 +7730,7 @@ class DurableRiskGate:
             raise PermitInvalidError(
                 "PERMIT_NOT_DISPATCH_CLAIMED", "dispatch receipt requires an exact durable claim"
             )
-        expected_cause = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+        expected_cause = self._dispatch_inflight_cause(str(reservation["intent_id"]))
         if (
             claim_row["intent_id"] != reservation["intent_id"]
             or claim_row["intent_hash"] != reservation["intent_hash"]
@@ -7725,7 +7748,7 @@ class DurableRiskGate:
                 "DISPATCH_CLAIM_CONFLICT", "the durable dispatch claim is invalid"
             ) from exc
         freeze = connection.execute(
-            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+            "SELECT active FROM risk_entry_blocks WHERE scope_key = ? AND cause_id = ?",
             (reservation["scope_key"], expected_cause),
         ).fetchone()
         if freeze is None or type(freeze["active"]) is not int or freeze["active"] not in (0, 1):
@@ -7739,7 +7762,7 @@ class DurableRiskGate:
             "SELECT * FROM risk_dispatch_recovery_audits WHERE permit_id = ?", (permit_id,)
         ).fetchone()
         other_freezes = connection.execute(
-            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id <> ?",
+            "SELECT active FROM risk_entry_blocks WHERE scope_key = ? AND cause_id <> ?",
             (reservation["scope_key"], expected_cause),
         ).fetchall()
         if any(
@@ -7879,7 +7902,7 @@ class DurableRiskGate:
             raise PermitInvalidError(
                 "PERMIT_NOT_DISPATCH_CLAIMED", "terminal receipt requires an exact durable claim"
             )
-        expected_cause = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+        expected_cause = self._dispatch_inflight_cause(str(reservation["intent_id"]))
         if (
             claim_row["intent_id"] != reservation["intent_id"]
             or claim_row["intent_hash"] != reservation["intent_hash"]
@@ -7901,7 +7924,7 @@ class DurableRiskGate:
             ) from exc
 
         freeze = connection.execute(
-            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+            "SELECT active FROM risk_entry_blocks WHERE scope_key = ? AND cause_id = ?",
             (reservation["scope_key"], expected_cause),
         ).fetchone()
         if freeze is None or type(freeze["active"]) is not int or freeze["active"] not in (0, 1):
@@ -7919,7 +7942,7 @@ class DurableRiskGate:
             "SELECT permit_id FROM risk_order_exposures WHERE permit_id = ?", (permit_id,)
         ).fetchone()
         other_freezes = connection.execute(
-            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id <> ?",
+            "SELECT active FROM risk_entry_blocks WHERE scope_key = ? AND cause_id <> ?",
             (reservation["scope_key"], expected_cause),
         ).fetchall()
         if any(
@@ -8233,49 +8256,54 @@ class DurableRiskGate:
                 (self._RELEASED, reason, permit_id),
             )
 
-    def freeze(self, scope: AccountScope, cause_id: str, reason: str) -> None:
-        """Persist one independent freeze cause for a scope."""
+    def stop_new(self, scope: AccountScope, cause_id: str, reason: str) -> None:
+        """Persist one independent STOP_NEW cause for a scope.
+
+        An active cause blocks new risk-increasing reservations and claims for
+        the account scope (refusal code ``STOP_NEW_ACTIVE``); reductions,
+        cancels and settlement are unaffected.
+        """
         if not cause_id.strip() or not reason.strip():
-            raise ValueError("freeze cause_id and reason are required")
-        if self._is_dispatch_freeze_cause(cause_id):
-            raise ValueError("dispatch-inflight freeze causes are reserved for dispatch claims")
+            raise ValueError("stop-new cause_id and reason are required")
+        if self._is_dispatch_inflight_cause(cause_id):
+            raise ValueError("dispatch-inflight causes are reserved for dispatch claims")
         with self._transaction() as connection:
             self._ensure_policy_binding(connection, scope.key)
-            self._freeze_in_transaction(connection, scope, cause_id, reason, self._clock())
+            self._block_entry_in_transaction(connection, scope, cause_id, reason, self._clock())
 
-    def activate_freeze_once(
+    def activate_stop_new_once(
         self, scope: AccountScope, cause_id: str, reason: str
-    ) -> FreezeActivationResult:
+    ) -> StopNewActivationResult:
         """Apply one exact cause once and report other active causes atomically.
 
         This API never reactivates a row on its own retries.  The legacy
-        :meth:`freeze` method retains its existing explicit-upsert behavior.
+        :meth:`stop_new` method retains its existing explicit-upsert behavior.
         """
-        return _activate_freeze_once(self, scope, cause_id, reason)
+        return _activate_stop_new_once(self, scope, cause_id, reason)
 
-    def resolve_freeze(self, scope: AccountScope, cause_id: str) -> None:
-        """Resolve an ordinary freeze; dispatch latches need reconciliation."""
-        if self._is_dispatch_freeze_cause(cause_id):
+    def resolve_stop_new(self, scope: AccountScope, cause_id: str) -> None:
+        """Resolve an ordinary STOP_NEW cause; in-flight latches need reconciliation."""
+        if self._is_dispatch_inflight_cause(cause_id):
             raise PermitInvalidError(
-                "DISPATCH_FREEZE_REQUIRES_RECONCILIATION",
-                "a dispatch-inflight freeze cannot be cleared by the generic resolver",
+                "DISPATCH_INFLIGHT_REQUIRES_RECONCILIATION",
+                "a dispatch-inflight latch cannot be cleared by the generic resolver",
             )
         with self._transaction() as connection:
             self._ensure_policy_binding(connection, scope.key)
             connection.execute(
                 """
-                UPDATE risk_freezes SET active = 0, updated_at = ?
+                UPDATE risk_entry_blocks SET active = 0, updated_at = ?
                 WHERE scope_key = ? AND cause_id = ?
                 """,
                 (self._clock(), scope.key, cause_id),
             )
 
-    def resolve_freeze_exact(self, scope: AccountScope, cause_id: str) -> FreezeResolution:
-        """Resolve one exact ordinary cause and report remaining scope freezes.
+    def resolve_stop_new_exact(self, scope: AccountScope, cause_id: str) -> StopNewResolution:
+        """Resolve one exact ordinary cause and report remaining scope entry blocks.
 
-        Unlike :meth:`resolve_freeze`, this method distinguishes an active
+        Unlike :meth:`resolve_stop_new`, this method distinguishes an active
         cause, an existing already-resolved cause, and a cause that was never
-        recorded. The transition and remaining-freeze check share one write
+        recorded. The transition and remaining-block check share one write
         transaction, so callers can reconcile a lost acknowledgement without
         inferring identity from a reason string or a separate read.
         Dispatch-inflight causes remain reserved for typed journal proofs.
@@ -8284,40 +8312,40 @@ class DurableRiskGate:
             raise ValueError("scope must be an AccountScope")
         if not isinstance(cause_id, str) or not cause_id.strip():
             raise ValueError("cause_id is required")
-        if self._is_dispatch_freeze_cause(cause_id):
+        if self._is_dispatch_inflight_cause(cause_id):
             raise PermitInvalidError(
-                "DISPATCH_FREEZE_REQUIRES_RECONCILIATION",
-                "a dispatch-inflight freeze cannot be cleared by the generic resolver",
+                "DISPATCH_INFLIGHT_REQUIRES_RECONCILIATION",
+                "a dispatch-inflight latch cannot be cleared by the generic resolver",
             )
 
         with self._transaction() as connection:
             self._ensure_policy_binding(connection, scope.key)
             row = connection.execute(
-                "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+                "SELECT active FROM risk_entry_blocks WHERE scope_key = ? AND cause_id = ?",
                 (scope.key, cause_id),
             ).fetchone()
             if row is None:
-                status = FreezeResolutionStatus.NOT_FOUND
+                status = StopNewResolutionStatus.NOT_FOUND
             elif row["active"] == 1:
                 updated = connection.execute(
-                    """UPDATE risk_freezes SET active = 0, updated_at = ?
+                    """UPDATE risk_entry_blocks SET active = 0, updated_at = ?
                        WHERE scope_key = ? AND cause_id = ? AND active = 1""",
                     (self._clock(), scope.key, cause_id),
                 )
                 if updated.rowcount != 1:
-                    raise RiskGateError("exact freeze resolution did not update one row")
-                status = FreezeResolutionStatus.CLEARED
+                    raise RiskGateError("exact stop-new resolution did not update one row")
+                status = StopNewResolutionStatus.CLEARED
             elif row["active"] == 0:
-                status = FreezeResolutionStatus.ALREADY_RESOLVED
+                status = StopNewResolutionStatus.ALREADY_RESOLVED
             else:
-                raise RiskGateError("persisted freeze active state is invalid")
+                raise RiskGateError("persisted entry-block active state is invalid")
 
             other_active = connection.execute(
-                """SELECT 1 FROM risk_freezes
+                """SELECT 1 FROM risk_entry_blocks
                    WHERE scope_key = ? AND cause_id <> ? AND active = 1 LIMIT 1""",
                 (scope.key, cause_id),
             ).fetchone()
-            return FreezeResolution(
+            return StopNewResolution(
                 status=status,
                 has_other_active_freezes=other_active is not None,
             )
@@ -8346,7 +8374,7 @@ class DurableRiskGate:
             self._ensure_policy_binding(connection, str(claim["scope_key"]))
             updated = connection.execute(
                 """
-                UPDATE risk_freezes SET blocking = 0, updated_at = ?
+                UPDATE risk_entry_blocks SET blocking = 0, updated_at = ?
                 WHERE scope_key = ? AND cause_id = ? AND active = 1 AND blocking = 1
                 """,
                 (self._clock(), str(claim["scope_key"]), str(claim["cause_id"])),
@@ -8440,7 +8468,7 @@ class DurableRiskGate:
                     (proof.permit_id,),
                 ).fetchone()
                 freeze = connection.execute(
-                    "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+                    "SELECT active FROM risk_entry_blocks WHERE scope_key = ? AND cause_id = ?",
                     (proof.scope.key, proof.cause_id),
                 ).fetchone()
                 if (
@@ -8507,7 +8535,7 @@ class DurableRiskGate:
             self._assert_cancel_dispatch_proof_matches_claim(proof, binding)
             return binding
 
-    def resolve_cancel_dispatch_freeze(self, proof: CancelDispatchResolutionProof) -> None:
+    def resolve_cancel_dispatch_inflight(self, proof: CancelDispatchResolutionProof) -> None:
         """Resolve one cancel-action latch using an exact terminal cancel record.
 
         This path never uses order-level ``CANCELED_NO_FILL`` evidence. A
@@ -8578,7 +8606,7 @@ class DurableRiskGate:
                             (proof.permit_id,),
                         ).fetchone()
                         freeze = connection.execute(
-                            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+                            "SELECT active FROM risk_entry_blocks WHERE scope_key = ? AND cause_id = ?",
                             (proof.scope.key, proof.cause_id),
                         ).fetchone()
                         if (
@@ -8694,13 +8722,13 @@ class DurableRiskGate:
                         ),
                     )
                     resolved = connection.execute(
-                        "UPDATE risk_freezes SET active = 0, updated_at = ? "
+                        "UPDATE risk_entry_blocks SET active = 0, updated_at = ? "
                         "WHERE scope_key = ? AND cause_id = ? AND active = 1",
                         (self._clock(), current_binding.scope.key, proof.cause_id),
                     )
                     if resolved.rowcount != 1:
                         raise PermitInvalidError(
-                            "DISPATCH_FREEZE_MISSING",
+                            "DISPATCH_INFLIGHT_MISSING",
                             "the exact cancellation dispatch latch was not active",
                         )
         except PermitInvalidError:
@@ -8910,13 +8938,13 @@ class DurableRiskGate:
                         ),
                     )
                     cleared = connection.execute(
-                        "UPDATE risk_freezes SET active = 0, updated_at = ? "
+                        "UPDATE risk_entry_blocks SET active = 0, updated_at = ? "
                         "WHERE scope_key = ? AND cause_id = ? AND active = 1",
                         (self._clock(), proof.scope.key, proof.cause_id),
                     )
                     if cleared.rowcount != 1:
                         raise PermitInvalidError(
-                            "DISPATCH_FREEZE_MISSING",
+                            "DISPATCH_INFLIGHT_MISSING",
                             "the exact dispatch latch was not active at terminal commit",
                         )
                     if self._policy.exposure_accounting_mode is ExposureAccountingMode.LIVE_GROSS:
@@ -8931,7 +8959,7 @@ class DurableRiskGate:
                                 "the account journal revision cursor is unavailable",
                             )
                         if self._gross_scope_over_limit(connection, proof.scope):
-                            self._freeze_in_transaction(
+                            self._block_entry_in_transaction(
                                 connection,
                                 proof.scope,
                                 "gross-exposure-over-cap",
@@ -8940,7 +8968,7 @@ class DurableRiskGate:
                             )
                         elif baseline_fresh:
                             connection.execute(
-                                "UPDATE risk_freezes SET active = 0, updated_at = ? "
+                                "UPDATE risk_entry_blocks SET active = 0, updated_at = ? "
                                 "WHERE scope_key = ? AND cause_id = "
                                 "'gross-exposure-over-cap' AND active = 1",
                                 (self._clock(), proof.scope.key),
@@ -9019,13 +9047,13 @@ class DurableRiskGate:
             raise PermitInvalidError(
                 "DISPATCH_EXPOSURE_STATE_CONFLICT", "stored dispatch claim is inconsistent"
             ) from exc
-        cause = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+        cause = self._dispatch_inflight_cause(str(reservation["intent_id"]))
         if claim.cause_id != cause:
             raise PermitInvalidError(
                 "DISPATCH_EXPOSURE_STATE_CONFLICT", "dispatch claim cause is inconsistent"
             )
         freeze = connection.execute(
-            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+            "SELECT active FROM risk_entry_blocks WHERE scope_key = ? AND cause_id = ?",
             (reservation["scope_key"], cause),
         ).fetchone()
         if freeze is None or type(freeze["active"]) is not int or freeze["active"] not in (0, 1):
@@ -9033,7 +9061,7 @@ class DurableRiskGate:
                 "DISPATCH_EXPOSURE_STATE_CONFLICT", "exact dispatch latch is missing or invalid"
             )
         other_freezes = connection.execute(
-            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id <> ?",
+            "SELECT active FROM risk_entry_blocks WHERE scope_key = ? AND cause_id <> ?",
             (reservation["scope_key"], cause),
         ).fetchall()
         if any(type(row["active"]) is not int or row["active"] not in (0, 1) for row in other_freezes):
@@ -9426,14 +9454,14 @@ class DurableRiskGate:
                             "GROUP_CLOSE_UNSUPPORTED",
                             "this net-close path accepts singleton strategy orders only",
                         )
-                    cause = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+                    cause = self._dispatch_inflight_cause(str(reservation["intent_id"]))
                     freeze = connection.execute(
-                        "SELECT active FROM risk_freezes WHERE scope_key=? AND cause_id=?",
+                        "SELECT active FROM risk_entry_blocks WHERE scope_key=? AND cause_id=?",
                         (proof.scope.key, cause),
                     ).fetchone()
                     if freeze is None or int(freeze["active"]) != 1:
                         raise PermitInvalidError(
-                            "DISPATCH_FREEZE_MISSING",
+                            "DISPATCH_INFLIGHT_MISSING",
                             "the exact close dispatch latch was not active at terminal commit",
                         )
                     connection.execute(
@@ -9530,13 +9558,13 @@ class DurableRiskGate:
                         ),
                     )
                     cleared = connection.execute(
-                        "UPDATE risk_freezes SET active=0, updated_at=? "
+                        "UPDATE risk_entry_blocks SET active=0, updated_at=? "
                         "WHERE scope_key=? AND cause_id=? AND active=1",
                         (self._clock(), proof.scope.key, proof.cause_id),
                     )
                     if cleared.rowcount != 1:
                         raise PermitInvalidError(
-                            "DISPATCH_FREEZE_MISSING",
+                            "DISPATCH_INFLIGHT_MISSING",
                             "the exact close dispatch latch was not active at terminal commit",
                         )
                     result = self._dispatch_close_resolution_receipt_in_transaction(
@@ -9598,17 +9626,17 @@ class DurableRiskGate:
         if claim_row is None:
             raise PermitInvalidError("PERMIT_NOT_DISPATCH_CLAIMED", "permit was not claimed")
         claim = self._dispatch_claim_binding(reservation, claim_row)
-        cause = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+        cause = self._dispatch_inflight_cause(str(reservation["intent_id"]))
         if claim.cause_id != cause:
             raise PermitInvalidError("DISPATCH_CLOSE_STATE_CONFLICT", "close claim cause is invalid")
         freeze = connection.execute(
-            "SELECT active FROM risk_freezes WHERE scope_key=? AND cause_id=?",
+            "SELECT active FROM risk_entry_blocks WHERE scope_key=? AND cause_id=?",
             (reservation["scope_key"], cause),
         ).fetchone()
         if freeze is None or type(freeze["active"]) is not int or freeze["active"] not in (0, 1):
             raise PermitInvalidError("DISPATCH_CLOSE_STATE_CONFLICT", "close latch is missing")
         other_freezes = connection.execute(
-            "SELECT active FROM risk_freezes WHERE scope_key=? AND cause_id<>?",
+            "SELECT active FROM risk_entry_blocks WHERE scope_key=? AND cause_id<>?",
             (reservation["scope_key"], cause),
         ).fetchall()
         if any(type(row["active"]) is not int or row["active"] not in (0, 1) for row in other_freezes):
@@ -9726,7 +9754,7 @@ class DurableRiskGate:
             position_bucket=str(close["position_bucket"]),
         )
 
-    def resolve_dispatch_freeze(
+    def resolve_dispatch_inflight(
         self, proof: DispatchResolutionProof
     ) -> Optional[DispatchTerminalResolutionReceipt]:  # noqa: UP045 -- Python 3.9 is supported.
         """Resolve dispatch uncertainty under a verified execution-journal fence.
@@ -9901,14 +9929,14 @@ class DurableRiskGate:
                             )
                     result = connection.execute(
                         """
-                        UPDATE risk_freezes SET active = 0, updated_at = ?
+                        UPDATE risk_entry_blocks SET active = 0, updated_at = ?
                         WHERE scope_key = ? AND cause_id = ? AND active = 1
                         """,
                         (self._clock(), current_binding.scope.key, proof.cause_id),
                     )
                     if result.rowcount != 1:
                         raise PermitInvalidError(
-                            "DISPATCH_FREEZE_MISSING",
+                            "DISPATCH_INFLIGHT_MISSING",
                             "the exact dispatch latch was not active at commit",
                         )
         except PermitInvalidError:
@@ -9933,14 +9961,14 @@ class DurableRiskGate:
             return receipt
         return None
 
-    def resolve_dispatch_freeze_recovered(
+    def resolve_dispatch_inflight_recovered(
         self,
         proof: DispatchTrackedOrderProof,
         attestation: DispatchRecoveryAttestation,
     ) -> None:
         """Consume an original tracked-order proof under a newer journal fence.
 
-        This is deliberately separate from :meth:`resolve_dispatch_freeze`.
+        This is deliberately separate from :meth:`resolve_dispatch_inflight`.
         The authority must validate the immutable original proof-ready record
         and a new append-only recovery event while holding the current account
         fence across this method's Risk transaction. No generic state change,
@@ -10114,22 +10142,22 @@ class DurableRiskGate:
                 )
                 cleared = connection.execute(
                     """
-                    UPDATE risk_freezes SET active = 0, updated_at = ?
+                    UPDATE risk_entry_blocks SET active = 0, updated_at = ?
                     WHERE scope_key = ? AND cause_id = ? AND active = 1
                     """,
                     (self._clock(), current_binding.scope.key, proof.cause_id),
                 )
                 if cleared.rowcount != 1:
                     raise PermitInvalidError(
-                        "DISPATCH_FREEZE_MISSING",
+                        "DISPATCH_INFLIGHT_MISSING",
                         "the exact dispatch latch was not active at recovery commit",
                     )
 
-    def active_freeze_reasons(self, scope: AccountScope) -> list[str]:
-        """Return current independent freeze causes that gate the scope."""
+    def active_entry_block_reasons(self, scope: AccountScope) -> list[str]:
+        """Return the reasons of active blocking entries (STOP_NEW causes and in-flight latches)."""
         with self._connection() as connection:
             rows = connection.execute(
-                "SELECT reason FROM risk_freezes "
+                "SELECT reason FROM risk_entry_blocks "
                 "WHERE scope_key = ? AND active = 1 AND blocking = 1 ORDER BY cause_id",
                 (scope.key,),
             ).fetchall()
@@ -10150,7 +10178,7 @@ class DurableRiskGate:
             ).fetchall()
             increase_rows = [row for row in rows if row["action"] == IntentAction.INCREASE.value]
             return {
-                "active_freeze_reasons": self._freeze_reasons(connection, scope),
+                "active_entry_block_reasons": self._entry_block_reasons(connection, scope),
                 "increase_count": len(increase_rows),
                 "increase_notional": _sum_decimal_exact(
                     _as_decimal(row["notional"]) for row in increase_rows
@@ -10292,7 +10320,7 @@ class DurableRiskGate:
                     raise conflict() from exc
                 permit_id = str(row["permit_id"])
                 intent_id = str(row["intent_id"])
-                cause_id = self._dispatch_freeze_cause(intent_id)
+                cause_id = self._dispatch_inflight_cause(intent_id)
                 claim = connection.execute(
                     "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?", (permit_id,)
                 ).fetchone()
@@ -10300,7 +10328,7 @@ class DurableRiskGate:
                     "SELECT * FROM risk_dispatch_resolutions WHERE permit_id = ?", (permit_id,)
                 ).fetchone()
                 freeze = connection.execute(
-                    "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+                    "SELECT active FROM risk_entry_blocks WHERE scope_key = ? AND cause_id = ?",
                     (scope.key, cause_id),
                 ).fetchone()
                 if claim is None:
@@ -10600,7 +10628,7 @@ class DurableRiskGate:
                 or claim["intent_id"] != reservation["intent_id"]
                 or claim["intent_hash"] != reservation["intent_hash"]
                 or claim["scope_key"] != reservation["scope_key"]
-                or claim["cause_id"] != self._dispatch_freeze_cause(str(reservation["intent_id"]))
+                or claim["cause_id"] != self._dispatch_inflight_cause(str(reservation["intent_id"]))
             ):
                 raise ValueError("claim identity mismatch")
             actual_json = str(claim["actual_intent_json"])
@@ -11625,7 +11653,7 @@ class DurableRiskGate:
         connection: sqlite3.Connection, scope: AccountScope, cause_id: str
     ) -> bool:
         row = connection.execute(
-            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+            "SELECT active FROM risk_entry_blocks WHERE scope_key = ? AND cause_id = ?",
             (scope.key, cause_id),
         ).fetchone()
         return row is not None and int(row["active"]) == 1
@@ -12938,12 +12966,14 @@ class DurableRiskGate:
         )
         raise error(code, "permit allocation version is no longer current")
 
-    def _assert_not_frozen(self, connection: sqlite3.Connection, scope: AccountScope) -> None:
-        reasons = self._freeze_reasons(connection, scope)
+    def _assert_entry_not_blocked(
+        self, connection: sqlite3.Connection, scope: AccountScope
+    ) -> None:
+        reasons = self._entry_block_reasons(connection, scope)
         if reasons:
             raise RiskDeniedError(
-                "FROZEN",
-                "new risk-increasing intents are frozen: " + "; ".join(reasons),
+                "STOP_NEW_ACTIVE",
+                "new risk-increasing intents are blocked: " + "; ".join(reasons),
             )
 
     def _validate_active_permit(
@@ -12980,7 +13010,7 @@ class DurableRiskGate:
         return permit
 
     @staticmethod
-    def _dispatch_freeze_cause(intent_id: str) -> str:
+    def _dispatch_inflight_cause(intent_id: str) -> str:
         return "dispatch-inflight:" + intent_id
 
     @staticmethod
@@ -13027,7 +13057,7 @@ class DurableRiskGate:
         return _sha256(_canonical_json(payload))
 
     @staticmethod
-    def _is_dispatch_freeze_cause(cause_id: str) -> bool:
+    def _is_dispatch_inflight_cause(cause_id: str) -> bool:
         return isinstance(cause_id, str) and cause_id.startswith("dispatch-inflight:")
 
     def _require_dispatch_claim(
@@ -13038,7 +13068,7 @@ class DurableRiskGate:
             "SELECT * FROM risk_dispatch_claims WHERE permit_id = ?",
             (row["permit_id"],),
         ).fetchone()
-        expected_cause = self._dispatch_freeze_cause(str(row["intent_id"]))
+        expected_cause = self._dispatch_inflight_cause(str(row["intent_id"]))
         if (
             claim is None
             or claim["intent_id"] != row["intent_id"]
@@ -13057,12 +13087,12 @@ class DurableRiskGate:
                 "GROUP_STATE_CONFLICT", "singleton reservation has a grouped dispatch claim"
             )
         freeze = connection.execute(
-            "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+            "SELECT active FROM risk_entry_blocks WHERE scope_key = ? AND cause_id = ?",
             (row["scope_key"], expected_cause),
         ).fetchone()
         if freeze is None or freeze["active"] != 1:
             raise PermitInvalidError(
-                "DISPATCH_FREEZE_MISSING",
+                "DISPATCH_INFLIGHT_MISSING",
                 "the dispatch claim is missing its active safety latch",
             )
         return claim
@@ -13145,7 +13175,7 @@ class DurableRiskGate:
                     "PERMIT_NOT_DISPATCH_CLAIMED",
                     "dispatch resolution requires a durable dispatch claim",
                 )
-            expected_cause = self._dispatch_freeze_cause(str(reservation["intent_id"]))
+            expected_cause = self._dispatch_inflight_cause(str(reservation["intent_id"]))
             if (
                 claim["intent_id"] != reservation["intent_id"]
                 or claim["intent_hash"] != reservation["intent_hash"]
@@ -13169,14 +13199,14 @@ class DurableRiskGate:
                     "this dispatch claim already has a terminal resolution",
                 )
             freeze = connection.execute(
-                "SELECT active FROM risk_freezes WHERE scope_key = ? AND cause_id = ?",
+                "SELECT active FROM risk_entry_blocks WHERE scope_key = ? AND cause_id = ?",
                 (reservation["scope_key"], expected_cause),
             ).fetchone()
             if freeze is None or freeze["active"] not in (0, 1) or (
                 freeze["active"] != 1 and not exact_close_replay
             ):
                 raise PermitInvalidError(
-                    "DISPATCH_FREEZE_MISSING",
+                    "DISPATCH_INFLIGHT_MISSING",
                     "the exact dispatch latch is not active for a new resolution",
                 )
             if reservation["status"] != self._SETTLED:
@@ -13204,7 +13234,7 @@ class DurableRiskGate:
             )
 
     @staticmethod
-    def _freeze_in_transaction(
+    def _block_entry_in_transaction(
         connection: sqlite3.Connection,
         scope: AccountScope,
         cause_id: str,
@@ -13213,7 +13243,7 @@ class DurableRiskGate:
     ) -> None:
         connection.execute(
             """
-            INSERT INTO risk_freezes (scope_key, cause_id, reason, active, blocking, updated_at)
+            INSERT INTO risk_entry_blocks (scope_key, cause_id, reason, active, blocking, updated_at)
             VALUES (?, ?, ?, 1, 1, ?)
             ON CONFLICT(scope_key, cause_id) DO UPDATE SET
                 reason = excluded.reason, active = 1, blocking = 1,
@@ -13222,9 +13252,9 @@ class DurableRiskGate:
             (scope.key, cause_id, reason, updated_at),
         )
 
-    def _freeze_reasons(self, connection: sqlite3.Connection, scope: AccountScope) -> list[str]:
+    def _entry_block_reasons(self, connection: sqlite3.Connection, scope: AccountScope) -> list[str]:
         rows = connection.execute(
-            "SELECT reason FROM risk_freezes "
+            "SELECT reason FROM risk_entry_blocks "
             "WHERE scope_key = ? AND active = 1 AND blocking = 1 ORDER BY cause_id",
             (scope.key,),
         ).fetchall()
@@ -13300,9 +13330,72 @@ class DurableRiskGate:
             position_bucket=str(row["position_bucket"]),
         )
 
+    @staticmethod
+    def _migrate_entry_block_table(connection: sqlite3.Connection) -> None:
+        """Rename the legacy ``risk_freezes`` table in one write transaction.
+
+        Legacy table present and new table absent: rename it; rows, indexes and
+        triggers move with the table. Both present: refuse to open, because a
+        writer recreated one name after the other existed and the rows cannot be
+        merged safely. Any other failure rolls back the whole step and refuses
+        to open; a partially migrated ledger is never used.
+        """
+        failed = RiskLedgerSchemaError(
+            "RISK_ENTRY_BLOCK_MIGRATION_FAILED",
+            "the risk entry-block table could not be migrated",
+        )
+        try:
+            connection.execute("BEGIN IMMEDIATE")
+        except sqlite3.Error:
+            raise failed from None
+        try:
+            present = {
+                str(row[0])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN (?, ?)",
+                    (_LEGACY_ENTRY_BLOCK_TABLE, _ENTRY_BLOCK_TABLE),
+                ).fetchall()
+            }
+            if _LEGACY_ENTRY_BLOCK_TABLE in present:
+                if _ENTRY_BLOCK_TABLE in present:
+                    raise RiskLedgerSchemaError(
+                        "RISK_ENTRY_BLOCK_TABLE_CONFLICT",
+                        "both the legacy and the current entry-block tables exist",
+                    )
+                legacy_count = connection.execute(
+                    "SELECT COUNT(*) FROM risk_freezes"
+                ).fetchone()[0]
+                connection.execute("ALTER TABLE risk_freezes RENAME TO risk_entry_blocks")
+                columns = {
+                    str(row[1])
+                    for row in connection.execute(
+                        "PRAGMA table_info(risk_entry_blocks)"
+                    ).fetchall()
+                }
+                migrated_count = connection.execute(
+                    "SELECT COUNT(*) FROM risk_entry_blocks"
+                ).fetchone()[0]
+                allowed = _ENTRY_BLOCK_REQUIRED_COLUMNS | _ENTRY_BLOCK_OPTIONAL_COLUMNS
+                if (
+                    not columns >= _ENTRY_BLOCK_REQUIRED_COLUMNS
+                    or not columns <= allowed
+                    or migrated_count != legacy_count
+                ):
+                    raise failed
+        except BaseException as error:
+            connection.execute("ROLLBACK")
+            if isinstance(error, sqlite3.Error):
+                raise failed from None
+            raise
+        try:
+            connection.execute("COMMIT")
+        except sqlite3.Error:
+            raise failed from None
+
     def _initialize_schema(self) -> None:
         with self._connection() as connection:
             connection.execute("PRAGMA journal_mode = WAL")
+            self._migrate_entry_block_table(connection)
             connection.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS risk_ledger_identity (
@@ -13373,7 +13466,7 @@ class DurableRiskGate:
                 END;
                 CREATE INDEX IF NOT EXISTS idx_risk_reservations_scope_status
                     ON risk_reservations(scope_key, status, action);
-                CREATE TABLE IF NOT EXISTS risk_freezes (
+                CREATE TABLE IF NOT EXISTS risk_entry_blocks (
                     scope_key TEXT NOT NULL,
                     cause_id TEXT NOT NULL,
                     reason TEXT NOT NULL,
@@ -14008,16 +14101,16 @@ class DurableRiskGate:
                     ON risk_order_exposures(scope_key, state, journal_revision);
                 """
             )
-            freeze_columns = {
+            entry_block_columns = {
                 str(row["name"])
-                for row in connection.execute("PRAGMA table_info(risk_freezes)").fetchall()
+                for row in connection.execute("PRAGMA table_info(risk_entry_blocks)").fetchall()
             }
-            if "blocking" not in freeze_columns:
+            if "blocking" not in entry_block_columns:
                 # Existing dispatch latches keep gating new increases; only an
                 # explicit identity-conflict latch converts one to the exact
                 # active-but-non-blocking recovery state.
                 connection.execute(
-                    "ALTER TABLE risk_freezes ADD COLUMN blocking INTEGER NOT NULL DEFAULT 1"
+                    "ALTER TABLE risk_entry_blocks ADD COLUMN blocking INTEGER NOT NULL DEFAULT 1"
                 )
             dispatch_resolution_columns = {
                 str(row["name"])
@@ -14566,8 +14659,8 @@ __all__ = [
     "DispatchClaimBinding",
     "DurableRiskGate",
     "DurableRiskPolicyBinding",
-    "FreezeActivationResult",
-    "FreezeActivationStatus",
+    "StopNewActivationResult",
+    "StopNewActivationStatus",
     "IntentAction",
     "PermitInvalidError",
     "RiskDeniedError",
@@ -14575,6 +14668,7 @@ __all__ = [
     "RiskExposureKind",
     "RiskExposureLimit",
     "RiskGateError",
+    "RiskLedgerSchemaError",
     "RiskGroupLegClaimReceipt",
     "RiskGroupLegIntent",
     "RiskGroupReservationLeg",

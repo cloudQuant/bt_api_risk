@@ -93,5 +93,5 @@ def test_cancel_claim_rechecks_ttl_after_reservations_only_sqlite_wait(tmp_path)
             "SELECT 1 FROM risk_dispatch_claims WHERE permit_id = ?", (permit.permit_id,)
         ).fetchone()
     assert claim_row is None
-    assert gate.active_freeze_reasons(scope) == []
+    assert gate.active_entry_block_reasons(scope) == []
     gate.close()

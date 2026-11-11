@@ -213,7 +213,7 @@ def _durable_state(gate: DurableRiskGate, permit_id: str):
         freezes = [
             tuple(row)
             for row in connection.execute(
-                "SELECT cause_id, active FROM risk_freezes ORDER BY cause_id"
+                "SELECT cause_id, active FROM risk_entry_blocks ORDER BY cause_id"
             ).fetchall()
         ]
         resolutions = [
@@ -235,7 +235,7 @@ def test_unresolved_receipt_binds_exact_claim_and_reports_other_freeze(tmp_path)
     scope = _scope()
     gate = _make_gate(tmp_path)
     _, permit, claim = _claim_and_settle(gate, scope)
-    gate.freeze(scope, "operator-hold", "operator hold")
+    gate.stop_new(scope, "operator-hold", "operator hold")
 
     receipt = gate.dispatch_resolution_receipt(permit.permit_id)
 
@@ -291,7 +291,7 @@ def test_receipt_rejects_absent_unsettled_wrong_cause_and_inactive_without_resol
     )
     with gate2._transaction() as connection:
         connection.execute(
-            "UPDATE risk_freezes SET active = 0 WHERE scope_key = ? AND cause_id = ?",
+            "UPDATE risk_entry_blocks SET active = 0 WHERE scope_key = ? AND cause_id = ?",
             (claim2.scope.key, claim2.cause_id),
         )
     with pytest.raises(PermitInvalidError) as inactive:
@@ -304,7 +304,7 @@ def test_receipt_rejects_unknown_resolution_kind_instead_of_acknowledging(tmp_pa
     gate = _make_gate(tmp_path, FakeOriginalJournalAuthority())
     _, permit, claim = _claim_and_settle(gate, scope, "unknown-resolution")
     proof = _proof(claim)
-    gate.resolve_dispatch_freeze(proof)
+    gate.resolve_dispatch_inflight(proof)
     with gate._transaction() as connection:
         connection.execute("DROP TRIGGER risk_dispatch_resolution_immutable_update")
         connection.execute(
@@ -321,9 +321,9 @@ def test_resolved_receipt_recovers_exact_proof_without_mutation(tmp_path):
     scope = _scope()
     gate = _make_gate(tmp_path, FakeOriginalJournalAuthority(), "resolved-receipt")
     _, permit, claim = _claim_and_settle(gate, scope)
-    gate.freeze(scope, "operator-hold", "operator hold")
+    gate.stop_new(scope, "operator-hold", "operator hold")
     proof = _proof(claim)
-    gate.resolve_dispatch_freeze(proof)
+    gate.resolve_dispatch_inflight(proof)
     before = _durable_state(gate, permit.permit_id)
 
     restarted = _make_gate(tmp_path, name="resolved-receipt")
@@ -343,11 +343,11 @@ def test_recovered_resolution_is_atomic_audited_and_receiptable_after_restart(tm
     authority = FakeRecoveryJournalAuthority()
     gate = _make_gate(tmp_path, authority, "recovered")
     _, permit, claim = _claim_and_settle(gate, scope)
-    gate.freeze(scope, "operator-hold", "unrelated hold")
+    gate.stop_new(scope, "operator-hold", "unrelated hold")
     proof = _proof(claim)
     attestation = _attestation(proof)
 
-    gate.resolve_dispatch_freeze_recovered(proof, attestation)
+    gate.resolve_dispatch_inflight_recovered(proof, attestation)
 
     receipt = gate.dispatch_resolution_receipt(permit.permit_id)
     assert receipt.status is DispatchResolutionReceiptStatus.ACKED_TRACKED_RESOLVED
@@ -355,7 +355,7 @@ def test_recovered_resolution_is_atomic_audited_and_receiptable_after_restart(tm
     assert receipt.proof_sha256 == proof.fingerprint
     assert receipt.recovery_attestation == attestation
     assert receipt.has_other_active_freezes is True
-    assert gate.active_freeze_reasons(scope) == ["unrelated hold"]
+    assert gate.active_entry_block_reasons(scope) == ["unrelated hold"]
     assert gate.snapshot(scope)["increase_count"] == 1
     with gate._connection() as connection:
         reservation = connection.execute(
@@ -416,14 +416,14 @@ def test_recovery_failures_leave_reservation_latch_and_audit_unchanged(tmp_path,
     before = _durable_state(gate, permit.permit_id)
 
     with pytest.raises(PermitInvalidError) as rejected:
-        gate.resolve_dispatch_freeze_recovered(proof, attestation)
+        gate.resolve_dispatch_inflight_recovered(proof, attestation)
 
     if failure == "proof-mismatch":
         assert rejected.value.code == "DISPATCH_RECOVERY_ATTESTATION_MISMATCH"
     else:
         assert rejected.value.code == "DISPATCH_RECOVERY_ATTESTATION_REJECTED"
     assert _durable_state(gate, permit.permit_id) == before
-    assert gate.active_freeze_reasons(scope) == [claim.cause_id]
+    assert gate.active_entry_block_reasons(scope) == [claim.cause_id]
 
 
 def test_recovery_replay_and_old_resolver_remain_rejected(tmp_path):
@@ -433,14 +433,14 @@ def test_recovery_replay_and_old_resolver_remain_rejected(tmp_path):
     _, permit, claim = _claim_and_settle(gate, scope)
     proof = _proof(claim)
     attestation = _attestation(proof)
-    gate.resolve_dispatch_freeze_recovered(proof, attestation)
+    gate.resolve_dispatch_inflight_recovered(proof, attestation)
     committed = _durable_state(gate, permit.permit_id)
 
     with pytest.raises(PermitInvalidError) as recovery_replay:
-        gate.resolve_dispatch_freeze_recovered(proof, attestation)
+        gate.resolve_dispatch_inflight_recovered(proof, attestation)
     assert recovery_replay.value.code == "DISPATCH_PROOF_REPLAYED"
     with pytest.raises(PermitInvalidError) as old_path_replay:
-        gate.resolve_dispatch_freeze(proof)
+        gate.resolve_dispatch_inflight(proof)
     assert old_path_replay.value.code == "DISPATCH_PROOF_REPLAYED"
     assert _durable_state(gate, permit.permit_id) == committed
 
@@ -456,7 +456,7 @@ def test_recovery_commit_failure_rolls_back_resolution_and_audit(tmp_path):
         connection.execute(
             """
             CREATE TRIGGER fail_dispatch_latch_clear
-            BEFORE UPDATE OF active ON risk_freezes
+            BEFORE UPDATE OF active ON risk_entry_blocks
             WHEN OLD.scope_key = NEW.scope_key
                  AND OLD.cause_id = NEW.cause_id
                  AND OLD.cause_id = 'dispatch-inflight:commit-failure'
@@ -469,7 +469,7 @@ def test_recovery_commit_failure_rolls_back_resolution_and_audit(tmp_path):
     before = _durable_state(gate, permit.permit_id)
 
     with pytest.raises(sqlite3.IntegrityError, match="forced recovery transaction failure"):
-        gate.resolve_dispatch_freeze_recovered(proof, attestation)
+        gate.resolve_dispatch_inflight_recovered(proof, attestation)
 
     assert _durable_state(gate, permit.permit_id) == before
-    assert gate.active_freeze_reasons(scope) == [claim.cause_id]
+    assert gate.active_entry_block_reasons(scope) == [claim.cause_id]

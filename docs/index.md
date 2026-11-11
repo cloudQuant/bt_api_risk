@@ -4,105 +4,42 @@ title: Home | bt_api_risk
 
 # bt_api_risk Documentation
 
-Intelligent risk management and compliance monitoring system for 73+ exchanges. Provides real-time risk assessment, ML-driven anomaly detection, and regulatory compliance support.
+`bt_api_risk` holds three separate things. Only the first two take part in
+order admission; the package performs no provider or network I/O and makes no
+regulatory-compliance claim. Evidence levels: UNIT/FAKE (local synthetic tests),
+INTEGRATION_SIM (local multi-process simulation), PACKAGE (installed wheel),
+real (venue account). Nothing here is accepted at the real level.
 
-## Overview
+## 1. Admission primitives (iteration-60 managed path)
 
-`bt_api_risk` provides comprehensive risk management with:
+`DurableRiskGate` keeps reservations, dispatch claims, STOP_NEW causes
+(`stop_new`, `activate_stop_new_once`, `resolve_stop_new`,
+`resolve_stop_new_exact`; refusal `STOP_NEW_ACTIVE`) and dispatch in-flight
+latches (`dispatch-inflight:<intent_id>`; `resolve_dispatch_inflight`,
+`resolve_cancel_dispatch_inflight`, `resolve_dispatch_inflight_recovered`) in
+the SQLite table `risk_entry_blocks`. Ledgers that still have the pre-iteration-64
+table `risk_freezes` are migrated in one transaction when opened; a conflict or
+failure refuses to open (`RISK_ENTRY_BLOCK_TABLE_CONFLICT`,
+`RISK_ENTRY_BLOCK_MIGRATION_FAILED`). Evidence: UNIT/FAKE and INTEGRATION_SIM.
 
-- **RiskManager / RiskAssessor** — Central risk orchestration and real-time scoring
-- **ML Models** — RiskEnsembleModel (RF + NN + XGBoost), AnomalyDetector
-- **Risk Containers** — RiskEvent, RiskEventType, RiskLevel, RiskMetrics
-- **Compliance** — MiFID II, SEC Rule 606, AML/KYC, Basel III, MAR
+## 2. Pre-trade service catalog (`bt_api_risk.pretrade`, iteration 64)
 
-## Key Benefits
+Controls R-01 to R-11 for the independent Risk service, implemented in
+`bt_api_risk.pretrade`. Status REVIEW_PENDING, evidence UNIT/FAKE. See the
+package README for the control list.
 
-- Pre-trade, in-trade, and post-trade risk controls
-- Machine learning-driven risk prediction
-- Behavioral anomaly detection for suspicious activity
-- Support for 10+ regulatory standards
-- Ensemble model combining multiple ML algorithms
+## 3. Analytics and ML (not admission)
 
-## Quick Start
-
-```python
-from bt_api_risk import RiskManager, RiskAssessor, RiskLevel, RiskEvent, RiskEventType
-
-# Initialize the risk manager
-risk_mgr = RiskManager()
-
-# Create a risk assessment
-assessor = RiskAssessor()
-risk_score = assessor.assess_position(
-    exchange="BINANCE___SPOT",
-    symbol="BTCUSDT",
-    position_value=100000.0,
-    account_equity=500000.0,
-)
-print(f"Risk level: {risk_score.level}")
-```
-
-### Anomaly Detection
-
-```python
-from bt_api_risk import AnomalyDetector
-
-detector = AnomalyDetector(threshold=0.8)
-is_anomalous = detector.is_anomalous(
-    features={"trade_frequency": 150, "order_size_ratio": 0.95, "price_impact": 0.12}
-)
-```
-
-### ML Ensemble Risk Model
-
-```python
-from bt_api_risk import RiskEnsembleModel
-
-model = RiskEnsembleModel()
-risk_prob = model.predict_risk(
-    features={
-        "position_concentration": 0.75,
-        "leverage_ratio": 2.5,
-        "daily_volatility": 0.04,
-        "liquidity_score": 0.6,
-    }
-)
-```
+`RiskAssessor`, `RiskCalculator`, `PolicyEngine`, `AnomalyDetector` and
+`RiskEnsembleModel` with the containers `RiskEvent`, `RiskEventType`,
+`RiskLevel` and `RiskMetrics`. They never gate an order. The former
+`RiskManager` and `LimitsManager` were deleted in iteration 64 (D64-06).
+Evidence: UNIT/FAKE only.
 
 ## Installation
 
 ```bash
-pip install bt_api_risk
+pip install bt_api_risk                # base: bt_api_base, pydantic, typing-extensions
+pip install "bt_api_risk[analytics]"   # adds numpy
+pip install "bt_api_risk[ml]"          # adds numpy and scikit-learn
 ```
-
-## Dependencies
-
-- numpy >= 1.26.0
-- pydantic >= 2.0.0
-
-## Compliance Standards
-
-| Standard | Description |
-|----------|-------------|
-| MiFID II | EU markets instrument directive |
-| SEC Rule 606 | US trade reporting |
-| AML/KYC | Anti-money laundering / Know your customer |
-| Basel III | Banking capital requirements |
-| MAR | EU market abuse regulation |
-
-## API Reference
-
-| Class | Description |
-|--------|-------------|
-| `RiskManager` | Central orchestrator for risk controls |
-| `RiskAssessor` | Real-time risk scoring engine |
-| `RiskEnsembleModel` | ML ensemble for risk prediction |
-| `AnomalyDetector` | Behavioral anomaly detection |
-| `RiskEvent` | Risk incident event container |
-| `RiskEventType` | Enum of risk event types |
-| `RiskLevel` | Enum of risk severity levels |
-| `RiskMetrics` | Aggregated risk metrics container |
-
-## Documentation
-
-Full documentation available at [bt_api_py documentation](https://cloudquant.github.io/bt_api_py/).

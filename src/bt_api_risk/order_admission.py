@@ -7,9 +7,9 @@ optional for the execution package: it imports neither execution nor gateway
 and performs no provider or network I/O.
 
 The adapter is admission only.  A successful dispatch claim installs the
-gate's durable account freeze; settlement does not clear that freeze.  Order
-observation and evidence-bound freeze resolution remain the account owner's
-responsibility.
+gate's durable dispatch in-flight latch; settlement does not clear that latch.
+Order observation and evidence-bound in-flight resolution remain the account
+owner's responsibility.
 """
 
 from __future__ import annotations
@@ -198,13 +198,13 @@ class DurableRiskAdmissionAdapter:
         except (RiskDeniedError, PermitInvalidError) as error:
             self._raise_neutral_denial(error)
 
-    def resolve_dispatch_freeze(
+    def resolve_dispatch_inflight(
         self, proof: DispatchResolutionProof
     ) -> Optional[DispatchTerminalResolutionReceipt]:  # noqa: UP045 -- Python 3.9 is supported.
         """Resolve an exact journal proof; no-fill results are durably read back."""
 
         try:
-            return self._gate.resolve_dispatch_freeze(proof)
+            return self._gate.resolve_dispatch_inflight(proof)
         except (RiskDeniedError, PermitInvalidError) as error:
             self._raise_neutral_denial(error)
 

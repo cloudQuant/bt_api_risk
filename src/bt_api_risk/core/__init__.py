@@ -31,10 +31,6 @@ from .admission import (
     DispatchTrackedOrderProof,
     DurableRiskGate,
     DurableRiskPolicyBinding,
-    FreezeActivationResult,
-    FreezeActivationStatus,
-    FreezeResolution,
-    FreezeResolutionStatus,
     IntentAction,
     PermitInvalidError,
     RecoveryCloseSourceProof,
@@ -50,8 +46,13 @@ from .admission import (
     RiskGroupReservationReceipt,
     RiskGroupReservationState,
     RiskIntent,
+    RiskLedgerSchemaError,
     RiskPermit,
     RiskPolicy,
+    StopNewActivationResult,
+    StopNewActivationStatus,
+    StopNewResolution,
+    StopNewResolutionStatus,
     StrategyAllocationSnapshot,
     VerifiedCancelDispatchResolution,
     VerifiedCancellationJournalAuthority,
@@ -95,11 +96,9 @@ from .instrument import (
 )
 
 _ANALYSIS_EXPORTS = {
-    "LimitsManager": ".limits_manager",
     "PolicyEngine": ".policy_engine",
     "RiskAssessor": ".risk_assessor",
     "RiskCalculator": ".risk_calculator",
-    "RiskManager": ".risk_manager",
 }
 
 
@@ -119,7 +118,6 @@ def __dir__() -> list[str]:
 
 
 __all__ = [
-    "RiskManager",
     "RiskAssessor",
     "ExposureAccountingMode",
     "GrossExposureAuthority",
@@ -134,7 +132,6 @@ __all__ = [
     "VerifiedOrderExposureObservation",
     "fill_ids_sha256",
     "RiskCalculator",
-    "LimitsManager",
     "PolicyEngine",
     "AccountScope",
     "ClosablePositionCloseReceiptV1",
@@ -159,10 +156,10 @@ __all__ = [
     "DispatchTerminalResolutionReceiptStatus",
     "DispatchTerminalState",
     "DispatchTrackedOrderProof",
-    "FreezeActivationResult",
-    "FreezeActivationStatus",
-    "FreezeResolution",
-    "FreezeResolutionStatus",
+    "StopNewActivationResult",
+    "StopNewActivationStatus",
+    "StopNewResolution",
+    "StopNewResolutionStatus",
     "VerifiedDispatchResolution",
     "VerifiedDispatchExposureResolution",
     "VerifiedDispatchExposureJournalAuthority",
@@ -178,6 +175,7 @@ __all__ = [
     "RiskExposureKind",
     "RiskExposureLimit",
     "RiskGateError",
+    "RiskLedgerSchemaError",
     "RiskGroupLegClaimReceipt",
     "RiskGroupLegIntent",
     "RiskGroupReservationLeg",
