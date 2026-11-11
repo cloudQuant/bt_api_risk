@@ -7,6 +7,10 @@ from pathlib import Path
 from bt_api_base.service_protocol import WireScope
 from bt_api_risk.service_component import PolicyCatalogService, PolicyCatalogStore
 
+# Approval needs an explicitly trusted approver since 7c3c1a6 (maker publish
+# authorization); without one every approval is APPROVER_NOT_AUTHORIZED.
+_APPROVERS = ("checker-principal",)
+
 
 def _call(
     service: PolicyCatalogService,
@@ -52,7 +56,7 @@ def test_exact_draft_replay_after_restart_preserves_approval_and_publish_state(
         },
     }
 
-    store = PolicyCatalogStore(str(catalog_path))
+    store = PolicyCatalogStore(str(catalog_path), trusted_approver_principals=_APPROVERS)
     service = PolicyCatalogService(store)
     first = _call(
         service,
@@ -70,7 +74,7 @@ def test_exact_draft_replay_after_restart_preserves_approval_and_publish_state(
     store.close()
 
     # A new catalog/service instance models the normal process restart path.
-    store = PolicyCatalogStore(str(catalog_path))
+    store = PolicyCatalogStore(str(catalog_path), trusted_approver_principals=_APPROVERS)
     service = PolicyCatalogService(store)
     try:
         replay = _call(
